@@ -1,0 +1,13 @@
+schema: spec-driven
+
+context: |
+  Odo Tasks is a Tauri 2 desktop application.
+  The frontend uses TypeScript and Vite; the native shell uses Rust.
+  Use npm for JavaScript dependencies and scripts.
+  Changes to main must be submitted through pull requests.
+
+rules:
+  proposal:
+    - State user-visible outcomes and explicit non-goals.
+  tasks:
+    - Include validation steps for affected TypeScript and Rust code.
