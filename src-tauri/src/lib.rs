@@ -53,6 +53,12 @@ struct Workspace {
     todos: Vec<Todo>,
     selected_folder_id: String,
     selected_note_id: String,
+    #[serde(default = "default_sort_mode")]
+    sort_mode: String,
+}
+
+fn default_sort_mode() -> String {
+    "newest".into()
 }
 
 #[derive(Serialize)]
@@ -259,6 +265,13 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
             [&workspace.selected_note_id],
         )
         .map_err(|error| format!("Could not save the selected note: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO app_state (key, value) VALUES ('sortMode', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&workspace.sort_mode],
+        )
+        .map_err(|error| format!("Could not save the note sort mode: {error}"))?;
 
     transaction
         .commit()
@@ -348,6 +361,15 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .optional()
         .map_err(|error| format!("Could not read the selected note: {error}"))?
         .unwrap_or_else(|| notes.first().map(|note| note.id.clone()).unwrap_or_default());
+    let sort_mode = connection
+        .query_row(
+            "SELECT value FROM app_state WHERE key = 'sortMode'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("Could not read the note sort mode: {error}"))?
+        .unwrap_or_else(default_sort_mode);
 
     Ok(Some(Workspace {
         folders,
@@ -355,6 +377,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         todos,
         selected_folder_id,
         selected_note_id,
+        sort_mode,
     }))
 }
 
@@ -605,7 +628,8 @@ mod tests {
           "notes":[{"id":"note-1","folderId":"inbox","title":"Test","content":"Body","updated":"2026-07-15T00:00:00.000Z","status":"active","pinned":true}],
           "todos":[{"id":"todo-1","text":"Ship it","completed":false,"created":"2026-07-15T00:00:00.000Z","updated":"2026-07-15T00:00:00.000Z"}],
           "selectedFolderId":"inbox",
-          "selectedNoteId":"note-1"
+          "selectedNoteId":"note-1",
+          "sortMode":"manual"
         }"#;
 
         write_workspace(&mut connection, input).expect("save workspace");
@@ -619,6 +643,7 @@ mod tests {
         assert_eq!(workspace.notes[0].title, "Test");
         assert_eq!(workspace.todos[0].text, "Ship it");
         assert_eq!(workspace.selected_note_id, "note-1");
+        assert_eq!(workspace.sort_mode, "manual");
     }
 
     #[test]

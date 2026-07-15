@@ -5,10 +5,11 @@ import "./styles.css";
 
 type NoteStatus = "active" | "archived" | "trash";
 type View = "notes" | "tasks" | "settings" | "archived" | "trash";
+type SortMode = "newest" | "oldest" | "manual";
 type Folder = { id: string; name: string; parentId: string | null; open: boolean; icon?: string };
 type Note = { id: string; folderId: string; title: string; content: string; updated: string; status: NoteStatus; pinned?: boolean; revision: number };
 type Todo = { id: string; text: string; completed: boolean; created: string; updated: string };
-type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; selectedFolderId: string; selectedNoteId: string };
+type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; selectedFolderId: string; selectedNoteId: string; sortMode: SortMode };
 type StorageInfo = { databasePath: string; backupDirectory: string };
 type SavePhase = "idle" | "saving" | "saved" | "error";
 type MenuItem = { label?: string; icon?: string; hint?: string; action?: string; disabled?: boolean; danger?: boolean; separator?: boolean };
@@ -36,7 +37,7 @@ const starterFolders: Folder[] = [
 const starterNotes: Note[] = [
   { id: "welcome", folderId: "inbox", title: "Welcome to Odo", updated: now(), status: "active", pinned: true, revision: 0, content: "## A calm place for your work\n\nCapture ideas, organize projects, and keep your day moving.\n\n- Press Ctrl+N for a new note\n- Press Ctrl+2 for Tasks\n- Type / on a new line for blocks" },
 ];
-const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], selectedFolderId: "inbox", selectedNoteId: "welcome" });
+const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest" });
 
 const escapeHtml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#039;");
 const attr = escapeHtml;
@@ -45,7 +46,8 @@ function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Works
   const folders = Array.isArray(input?.folders) ? input.folders : fallback.folders;
   if (!folders.some((folder) => folder.id === "inbox")) folders.unshift({ id: "inbox", name: "Inbox", parentId: null, open: true, icon: "ph-tray" });
   const notes = (Array.isArray(input?.notes) ? input.notes : fallback.notes).map((note) => ({ ...note, revision: note.revision ?? 0 }));
-  return { folders, notes, todos: Array.isArray(input?.todos) ? input.todos : [], selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "" };
+  const sortMode: SortMode = input?.sortMode === "manual" || input?.sortMode === "oldest" ? input.sortMode : "newest";
+  return { folders, notes, todos: Array.isArray(input?.todos) ? input.todos : [], selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "", sortMode };
 }
 function initialState(): Workspace {
   if (!isDesktopApp) try { const saved = localStorage.getItem(STORAGE_KEY); if (saved) return normalizeWorkspace(JSON.parse(saved) as Workspace); } catch { localStorage.removeItem(STORAGE_KEY); }
@@ -55,7 +57,6 @@ function initialState(): Workspace {
 let state = initialState();
 let currentView: View = "notes";
 let searchQuery = "";
-let sortNewest = true;
 let focusMode = false;
 let sidebarCollapsed = false;
 let slashOpen = false;
@@ -75,6 +76,11 @@ let newRowId = "";
 let storageInfo: StorageInfo | null = null;
 let storageError = "";
 let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
+let draggingNoteId = "";
+let suppressRowActivationUntil = 0;
+let sortInsertionTargetId = "";
+let sortInsertionSide: "before" | "after" = "before";
+let dragImage: HTMLElement | null = null;
 
 const commands = [
   { label: "Text", detail: "Just start writing.", icon: "ph-text-t", value: "" },
@@ -95,10 +101,12 @@ function selectedNote(): Note | undefined { return state.notes.find((note) => no
 function statusForView(): NoteStatus { return currentView === "archived" ? "archived" : currentView === "trash" ? "trash" : "active"; }
 function visibleNotes(): Note[] {
   const folderIds = currentView === "notes" ? descendants(state.selectedFolderId) : null;
-  return state.notes.filter((note) => note.status === statusForView()).filter((note) => !folderIds || folderIds.includes(note.folderId)).filter((note) => `${note.title} ${note.content}`.toLowerCase().includes(searchQuery.toLowerCase())).sort((a, b) => {
+  const notes = state.notes.filter((note) => note.status === statusForView()).filter((note) => !folderIds || folderIds.includes(note.folderId)).filter((note) => `${note.title} ${note.content}`.toLowerCase().includes(searchQuery.toLowerCase()));
+  if (state.sortMode === "manual") return notes;
+  return notes.sort((a, b) => {
     if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
     const delta = new Date(b.updated).getTime() - new Date(a.updated).getTime();
-    return sortNewest ? delta : -delta;
+    return state.sortMode === "newest" ? delta : -delta;
   });
 }
 function repairState() {
@@ -151,22 +159,23 @@ async function restoreDesktopWorkspace() {
 function renderFolder(folder: Folder, depth = 0): string {
   const children = state.folders.filter((candidate) => candidate.parentId === folder.id);
   const toggle = children.length ? `<button class="folder-toggle" data-toggle-folder="${attr(folder.id)}" aria-label="${folder.open ? "Collapse" : "Expand"} ${attr(folder.name)}"><i class="ph ph-caret-${folder.open ? "down" : "right"}"></i></button>` : '<span class="folder-toggle-spacer"></span>';
-  return `<div class="folder-branch"><div class="folder-row ${currentView === "notes" && state.selectedFolderId === folder.id ? "is-selected" : ""}" data-folder-id="${attr(folder.id)}" style="--depth:${depth}" role="button" tabindex="0" aria-label="${attr(folder.name)}, ${folderCount(folder.id)} notes">${toggle}<i class="ph ${folder.icon ?? "ph-folder"} folder-icon"></i><span class="folder-name">${escapeHtml(folder.name)}</span><span class="folder-count">${folderCount(folder.id)}</span><button class="row-more" data-folder-menu="${attr(folder.id)}" aria-label="Folder actions"><i class="ph ph-dots-three"></i></button></div>${folder.open ? children.map((child) => renderFolder(child, depth + 1)).join("") : ""}</div>`;
+  return `<div class="folder-branch"><div class="folder-row ${currentView === "notes" && state.selectedFolderId === folder.id ? "is-selected" : ""}" data-folder-id="${attr(folder.id)}" data-drop-kind="folder" data-drop-id="${attr(folder.id)}" style="--depth:${depth}" role="button" tabindex="0" aria-dropeffect="move" aria-label="Move a note to ${attr(folder.name)}. ${folderCount(folder.id)} notes">${toggle}<i class="ph ${folder.icon ?? "ph-folder"} folder-icon"></i><span class="folder-name">${escapeHtml(folder.name)}</span><span class="folder-count">${folderCount(folder.id)}</span><span class="drop-cue" aria-hidden="true">Move here</span><button class="row-more" data-folder-menu="${attr(folder.id)}" aria-label="Folder actions"><i class="ph ph-dots-three"></i></button></div>${folder.open ? children.map((child) => renderFolder(child, depth + 1)).join("") : ""}</div>`;
 }
 function renderSidebar() {
   const remaining = state.todos.filter((todo) => !todo.completed).length;
   return `<aside class="folders-panel" aria-label="Workspace navigation"><header class="brand-row"><button class="wordmark" id="wordmark" title="Go to Inbox">Odo</button><button class="icon-button sidebar-toggle" title="${sidebarCollapsed ? "Show" : "Hide"} sidebar" aria-label="${sidebarCollapsed ? "Show" : "Hide"} sidebar"><i class="ph ph-sidebar-simple"></i></button></header>
-    <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox><i class="ph ph-tray"></i><span>Inbox</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button></nav>
+    <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button></nav>
     <div class="panel-label-row"><span>Folders</span><button class="icon-button" id="new-folder" title="New folder (${modLabel}+Shift+N)"><i class="ph ph-plus"></i></button></div><nav class="folder-tree" id="folder-tree">${state.folders.filter((folder) => folder.parentId === null && folder.id !== "inbox").map((folder) => renderFolder(folder)).join("")}</nav>
-    <div class="library-links"><button class="library-link ${currentView === "archived" ? "is-selected" : ""}" data-view="archived"><i class="ph ph-archive-tray"></i><span>Archive</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link ${currentView === "trash" ? "is-selected" : ""}" data-view="trash"><i class="ph ph-trash"></i><span>Trash</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
+    <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
 }
 function renderNotesPanel() {
-  return `<section class="notes-panel"><div class="global-bar"><label class="search-box"><i class="ph ph-magnifying-glass"></i><input id="search-input" type="search" placeholder="Search notes..." value="${attr(searchQuery)}"><kbd>${modLabel}+K</kbd></label><button class="new-note-button" id="new-note" title="New note (${modLabel}+N)"><i class="ph ph-note-pencil"></i></button></div><header class="notes-header"><div><strong id="note-list-title">${escapeHtml(viewTitle())}</strong><span id="note-count">${visibleNotes().length} notes</span></div><button class="sort-button" id="list-menu" title="List actions" aria-label="List actions"><i class="ph ph-dots-three"></i></button></header><div class="note-list" id="note-list" tabindex="-1">${renderNoteRows()}</div></section>`;
+  const ordering = state.sortMode === "manual" ? "manual order" : state.sortMode === "newest" ? "newest first" : "oldest first";
+  return `<section class="notes-panel"><div class="global-bar"><label class="search-box"><i class="ph ph-magnifying-glass"></i><input id="search-input" type="search" placeholder="Search notes..." value="${attr(searchQuery)}"><kbd>${modLabel}+K</kbd></label><button class="new-note-button" id="new-note" title="New note (${modLabel}+N)"><i class="ph ph-note-pencil"></i></button></div><header class="notes-header"><div><strong id="note-list-title">${escapeHtml(viewTitle())}</strong><span id="note-count">${visibleNotes().length} notes · ${ordering}</span></div><button class="sort-button" id="list-menu" title="Change note order" aria-label="Change note order"><i class="ph ph-dots-three"></i></button></header><div class="note-list" id="note-list" tabindex="-1">${renderNoteRows()}</div></section>`;
 }
 function renderNoteRows() {
   const notes = visibleNotes();
   if (!notes.length) return `<div class="empty-state"><span class="empty-icon"><i class="ph ${currentView === "trash" ? "ph-trash" : currentView === "archived" ? "ph-archive-tray" : "ph-note-blank"}"></i></span><strong>${searchQuery ? "No matching notes" : currentView === "trash" ? "Trash is empty" : currentView === "archived" ? "Nothing archived" : "A clear page awaits"}</strong><p>${searchQuery ? "Try a different search." : "Capture a thought and give it somewhere to grow."}</p>${currentView === "notes" && !searchQuery ? '<button class="primary-button" data-create-note>Create a note</button>' : ""}</div>`;
-  return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""} ${note.id === newRowId ? "is-new" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}"><div class="note-heading"><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${escapeHtml(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
+  return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""} ${note.id === newRowId ? "is-new" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}" draggable="true" aria-label="${attr(note.title || "Untitled")}. Drag to a folder, Archive, or Trash."><div class="note-heading"><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${escapeHtml(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
 }
 function slashMenuHtml() { return `<div class="slash-menu ${slashOpen ? "is-open" : ""}" id="slash-menu" role="listbox">${commands.map((command, index) => `<button class="slash-command ${index === slashIndex ? "is-active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === slashIndex}"><span class="command-icon"><i class="ph ${command.icon}"></i></span><span><strong>${command.label}</strong><small>${command.detail}</small></span>${index === 0 ? "<kbd>Enter</kbd>" : ""}</button>`).join("")}</div>`; }
 type RichBlock = "P" | "H1" | "H2" | "H3" | "BLOCKQUOTE" | "PRE" | "UL" | "OL";
@@ -314,7 +323,7 @@ function renderApp() {
   const app = document.querySelector<HTMLElement>("#app")!;
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}`;
   const content = currentView === "tasks" ? renderTasks() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor();
-  app.innerHTML = `${renderSidebar()}${content}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div>`;
+  app.innerHTML = `${renderSidebar()}${content}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
   updateSaveStatus(); bindEvents(); bindOdoDialog();
   if (newRowId) requestAnimationFrame(() => { document.querySelector(`[data-note-id="${CSS.escape(newRowId)}"]`)?.classList.remove("is-new"); newRowId = ""; });
 }
@@ -322,7 +331,8 @@ function renderApp() {
 function refreshNoteList() {
   const list = document.querySelector<HTMLElement>("#note-list"); if (!list) return;
   const scroll = list.scrollTop; list.innerHTML = renderNoteRows(); list.scrollTop = scroll; bindNoteRows();
-  const count = document.querySelector<HTMLElement>("#note-count"); if (count) count.textContent = `${visibleNotes().length} notes`;
+  const ordering = state.sortMode === "manual" ? "manual order" : state.sortMode === "newest" ? "newest first" : "oldest first";
+  const count = document.querySelector<HTMLElement>("#note-count"); if (count) count.textContent = `${visibleNotes().length} notes · ${ordering}`;
 }
 function updateSelectedRowPreview() {
   const note = selectedNote(); if (!note) return;
@@ -420,7 +430,10 @@ function bindOdoDialog() {
 
 async function performMenuAction(action: string) {
   const [kind, verb, id] = action.split(":");
-  if (kind === "list" && verb === "sort") { sortNewest = !sortNewest; renderApp(); return; }
+  if (kind === "list" && verb === "sort") {
+    if (id === "newest" || id === "oldest" || id === "manual") state.sortMode = id;
+    await saveState(false); renderApp(); return;
+  }
   if (kind === "note") {
     const note = state.notes.find((item) => item.id === id); if (!note) return;
     if (verb === "rename") {
@@ -532,10 +545,176 @@ async function attachDetachedNote(noteId: string) {
   } catch (error) { await noticeOdo("Could not attach note", String(error)); }
 }
 
+function announceDrag(message: string) {
+  const live = document.querySelector<HTMLElement>("#drag-live");
+  if (live) live.textContent = message;
+}
+function clearSortInsertion() {
+  document.querySelectorAll<HTMLElement>(".is-sort-target").forEach((element) => { element.classList.remove("is-sort-target"); delete element.dataset.sortInsertion; });
+  sortInsertionTargetId = "";
+}
+function clearDropTargetVisuals() { document.querySelectorAll<HTMLElement>(".is-drop-target").forEach((element) => element.classList.remove("is-drop-target")); }
+function clearDragVisuals() {
+  document.querySelectorAll<HTMLElement>(".is-dragging").forEach((element) => element.classList.remove("is-dragging"));
+  clearDropTargetVisuals(); clearSortInsertion();
+  dragImage?.remove(); dragImage = null;
+  draggingNoteId = "";
+}
+function createDragImage(note: Note, event: DragEvent) {
+  const card = document.createElement("div"); card.className = "note-drag-image"; card.setAttribute("aria-hidden", "true");
+  const title = document.createElement("strong"); title.textContent = note.title || "Untitled";
+  const excerpt = document.createElement("span"); excerpt.textContent = noteExcerpt(note.content);
+  const mark = document.createElement("i"); mark.className = "ph ph-note-blank";
+  card.append(mark, title, excerpt); document.body.append(card); dragImage = card;
+  if (event.dataTransfer) event.dataTransfer.setDragImage(card, 22, 18);
+}
+function openFolderPath(folderId: string) {
+  let cursor = state.folders.find((folder) => folder.id === folderId);
+  while (cursor) {
+    cursor.open = true;
+    cursor = cursor.parentId ? state.folders.find((folder) => folder.id === cursor?.parentId) : undefined;
+  }
+}
+function dropDestinationLabel(kind: string, id?: string) {
+  if (kind === "folder") return state.folders.find((folder) => folder.id === id)?.name ?? "Inbox";
+  return kind === "archive" ? "Archive" : "Trash";
+}
+async function moveDroppedNote(noteId: string, kind: "folder" | "archive" | "trash", folderId?: string) {
+  // A detached window is the live editor. Close it only after its final SQLite
+  // save has completed so a delayed child-window write can never undo this move.
+  if (detachedNoteIds.has(noteId)) {
+    announceDrag("Saving the detached note before moving it…");
+    await attachDetachedNote(noteId);
+    if (detachedNoteIds.has(noteId)) { announceDrag("The detached note could not be moved."); return; }
+  }
+  const note = state.notes.find((item) => item.id === noteId);
+  if (!note) { announceDrag("That note is no longer available."); return; }
+  const destination = dropDestinationLabel(kind, folderId);
+  const unchanged = (kind === "folder" && note.folderId === folderId && note.status === "active") || (kind === "archive" && note.status === "archived") || (kind === "trash" && note.status === "trash");
+  if (unchanged) { announceDrag(`“${note.title || "Untitled"}” is already in ${destination}.`); return; }
+
+  if (kind === "folder") {
+    const target = state.folders.find((folder) => folder.id === folderId);
+    if (!target) { announceDrag("That folder is no longer available."); return; }
+    note.folderId = target.id;
+    note.status = "active";
+    openFolderPath(target.id);
+    state.selectedFolderId = target.id;
+    currentView = "notes";
+  } else if (kind === "archive") {
+    note.status = "archived";
+    currentView = "archived";
+  } else {
+    note.status = "trash";
+    currentView = "trash";
+  }
+  note.updated = now();
+  state.selectedNoteId = note.id;
+  searchQuery = "";
+  await saveState(false);
+  renderApp();
+  announceDrag(`Moved “${note.title || "Untitled"}” to ${destination}.`);
+}
+
+async function reorderDroppedNote(noteId: string, targetId: string, side: "before" | "after") {
+  if (noteId === targetId) return;
+  if (detachedNoteIds.has(noteId)) {
+    announceDrag("Saving the detached note before arranging it…");
+    await attachDetachedNote(noteId);
+    if (detachedNoteIds.has(noteId)) { announceDrag("The detached note could not be arranged."); return; }
+  }
+  const orderedVisible = visibleNotes();
+  const source = orderedVisible.find((note) => note.id === noteId);
+  const sourceIndex = orderedVisible.findIndex((note) => note.id === noteId);
+  const targetIndex = orderedVisible.findIndex((note) => note.id === targetId);
+  if (!source || sourceIndex < 0 || targetIndex < 0) return;
+  const desired = orderedVisible.filter((note) => note.id !== noteId);
+  // The insertion marker is calculated in the rendered, pre-removal list.
+  // When a note travels downward, removing it shifts the target back one slot.
+  const targetIndexAfterRemoval = targetIndex - (sourceIndex < targetIndex ? 1 : 0);
+  desired.splice(targetIndexAfterRemoval + (side === "after" ? 1 : 0), 0, source);
+  if (desired.map((note) => note.id).join("|") === orderedVisible.map((note) => note.id).join("|")) return;
+
+  // Keep all unrelated views in place. Only replace the slots occupied by the
+  // currently visible note set, so manual order is stable across SQLite reloads.
+  const visibleIds = new Set(orderedVisible.map((note) => note.id)); let next = 0;
+  state.notes = state.notes.map((note) => visibleIds.has(note.id) ? desired[next++] : note);
+  const moved = state.notes.find((note) => note.id === noteId); if (moved) moved.updated = now();
+  state.sortMode = "manual";
+  state.selectedNoteId = noteId;
+  await saveState(false);
+  renderApp();
+  announceDrag(`Placed “${source.title || "Untitled"}” ${side} “${orderedVisible[targetIndex].title || "Untitled"}”. Manual order is on.`);
+}
+
+function bindDropTargets() {
+  document.querySelectorAll<HTMLElement>("[data-drop-kind]").forEach((target) => {
+    const acceptsDrag = (event: DragEvent) => !!draggingNoteId || !!event.dataTransfer?.types.includes("text/plain");
+    target.addEventListener("dragenter", (event) => {
+      if (!acceptsDrag(event)) return;
+      event.preventDefault();
+      clearSortInsertion(); clearDropTargetVisuals();
+      target.classList.add("is-drop-target");
+      const kind = target.dataset.dropKind!;
+      announceDrag(`Move here: ${dropDestinationLabel(kind, target.dataset.dropId)}.`);
+    });
+    target.addEventListener("dragover", (event) => {
+      if (!acceptsDrag(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      target.classList.add("is-drop-target");
+    });
+    target.addEventListener("dragleave", (event) => {
+      if (!target.contains(event.relatedTarget as Node | null)) target.classList.remove("is-drop-target");
+    });
+    target.addEventListener("drop", (event) => {
+      if (!acceptsDrag(event)) return;
+      event.preventDefault();
+      const noteId = draggingNoteId || event.dataTransfer?.getData("application/x-odo-note") || event.dataTransfer?.getData("text/plain");
+      const kind = target.dataset.dropKind as "folder" | "archive" | "trash";
+      const folderId = target.dataset.dropId;
+      clearDragVisuals();
+      if (noteId && kind) void moveDroppedNote(noteId, kind, folderId);
+    });
+  });
+}
+
 function bindNoteRows() {
   document.querySelectorAll<HTMLElement>("[data-note-id]").forEach((row) => {
-    row.addEventListener("click", (event) => { if ((event.target as HTMLElement).closest("[data-note-menu]")) return; const id = row.dataset.noteId!; state.selectedNoteId = id; if (detachedNoteIds.has(id)) void attachDetachedNote(id); else renderApp(); });
-    row.addEventListener("dblclick", (event) => { if ((event.target as HTMLElement).closest("[data-note-menu]")) return; const note = state.notes.find((item) => item.id === row.dataset.noteId); if (note) void openDetachedNote(note); });
+    row.addEventListener("dragstart", (event) => {
+      if ((event.target as HTMLElement).closest("button")) { event.preventDefault(); return; }
+      const id = row.dataset.noteId!;
+      draggingNoteId = id;
+      if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("application/x-odo-note", id); event.dataTransfer.setData("text/plain", id); }
+      row.classList.add("is-dragging");
+      const note = state.notes.find((item) => item.id === id);
+      if (note) createDragImage(note, event);
+      announceDrag(`Moving “${note?.title || "Untitled"}”. Choose a folder, Archive, or Trash.`);
+    });
+    row.addEventListener("dragenter", (event) => {
+      if (!draggingNoteId || draggingNoteId === row.dataset.noteId) return;
+      event.preventDefault(); clearDropTargetVisuals();
+    });
+    row.addEventListener("dragover", (event) => {
+      if (!draggingNoteId || draggingNoteId === row.dataset.noteId) return;
+      event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      const rect = row.getBoundingClientRect(); const side = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+      if (sortInsertionTargetId !== row.dataset.noteId || sortInsertionSide !== side) {
+        clearSortInsertion(); sortInsertionTargetId = row.dataset.noteId!; sortInsertionSide = side;
+        row.classList.add("is-sort-target"); row.dataset.sortInsertion = side;
+        const note = state.notes.find((item) => item.id === row.dataset.noteId);
+        announceDrag(`Place ${side} “${note?.title || "Untitled"}”.`);
+      }
+    });
+    row.addEventListener("dragleave", (event) => { if (!row.contains(event.relatedTarget as Node | null) && sortInsertionTargetId === row.dataset.noteId) clearSortInsertion(); });
+    row.addEventListener("drop", (event) => {
+      if (!draggingNoteId || draggingNoteId === row.dataset.noteId) return;
+      event.preventDefault(); const noteId = draggingNoteId; const targetId = row.dataset.noteId!; const side = sortInsertionSide;
+      clearDragVisuals(); void reorderDroppedNote(noteId, targetId, side);
+    });
+    row.addEventListener("dragend", () => { suppressRowActivationUntil = Date.now() + 260; clearDragVisuals(); announceDrag(""); });
+    row.addEventListener("click", (event) => { if (Date.now() < suppressRowActivationUntil || (event.target as HTMLElement).closest("[data-note-menu]")) return; const id = row.dataset.noteId!; state.selectedNoteId = id; if (detachedNoteIds.has(id)) void attachDetachedNote(id); else renderApp(); });
+    row.addEventListener("dblclick", (event) => { if (Date.now() < suppressRowActivationUntil || (event.target as HTMLElement).closest("[data-note-menu]")) return; const note = state.notes.find((item) => item.id === row.dataset.noteId); if (note) void openDetachedNote(note); });
     row.addEventListener("contextmenu", (event) => { event.preventDefault(); const note = state.notes.find((item) => item.id === row.dataset.noteId); if (note) openMenu(noteMenuItems(note), row, event.clientX, event.clientY); });
     row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); const id = row.dataset.noteId!; state.selectedNoteId = id; if (detachedNoteIds.has(id)) void attachDetachedNote(id); else renderApp(); } if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); const rows = [...document.querySelectorAll<HTMLElement>("[data-note-id]")]; const index = rows.indexOf(row); const next = rows[index + (event.key === "ArrowDown" ? 1 : -1)]; if (next) { state.selectedNoteId = next.dataset.noteId!; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus()); } } });
   });
@@ -543,6 +722,7 @@ function bindNoteRows() {
 }
 function bindEvents() {
   bindNoteRows();
+  bindDropTargets();
   document.querySelectorAll<HTMLElement>("[data-folder-id]").forEach((row) => {
     const activate = () => { currentView = "notes"; state.selectedFolderId = row.dataset.folderId!; repairState(); void saveState(false); renderApp(); };
     row.addEventListener("click", (event) => { if (!(event.target as HTMLElement).closest("[data-toggle-folder],[data-folder-menu]")) activate(); });
@@ -562,7 +742,12 @@ function bindEvents() {
   document.querySelector("#folder-form")?.addEventListener("submit", (event) => { event.preventDefault(); const input = document.querySelector<HTMLInputElement>("#folder-name")!; createFolder(input.value); });
   document.querySelector("#move-form")?.addEventListener("submit", (event) => { event.preventDefault(); const note = selectedNote(); const select = document.querySelector<HTMLSelectElement>("#move-folder"); if (note && select) { note.folderId = select.value; note.status = "active"; note.updated = now(); state.selectedFolderId = select.value; currentView = "notes"; void saveState(false); renderApp(); } });
   document.querySelectorAll<HTMLElement>("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => button.closest("dialog")?.close()));
-  document.querySelector("#list-menu")?.addEventListener("click", (event) => openMenu([{ label: sortNewest ? "Sort oldest first" : "Sort newest first", icon: "ph-sort-ascending", action: "list:sort:" }, { separator: true }, { label: "New note here", icon: "ph-note-pencil", hint: `${modLabel}+N`, action: `folder:new-note:${state.selectedFolderId}` }], event.currentTarget as HTMLElement));
+  document.querySelector("#list-menu")?.addEventListener("click", (event) => openMenu([
+    { label: "Newest first", icon: "ph-clock-counter-clockwise", hint: state.sortMode === "newest" ? "Current" : undefined, action: "list:sort:newest" },
+    { label: "Oldest first", icon: "ph-clock", hint: state.sortMode === "oldest" ? "Current" : undefined, action: "list:sort:oldest" },
+    { label: "Manual order", icon: "ph-arrows-down-up", hint: state.sortMode === "manual" ? "Current" : "Drag notes to arrange" , action: "list:sort:manual" },
+    { separator: true }, { label: "New note here", icon: "ph-note-pencil", hint: `${modLabel}+N`, action: `folder:new-note:${state.selectedFolderId}` }
+  ], event.currentTarget as HTMLElement));
   document.querySelector("#editor-menu")?.addEventListener("click", (event) => { const note = selectedNote(); if (note) openMenu(noteMenuItems(note), event.currentTarget as HTMLElement); });
   document.querySelectorAll<HTMLElement>("[data-note-action]").forEach((button) => button.addEventListener("click", () => { const note = selectedNote(); if (note) void performMenuAction(`note:${button.dataset.noteAction}:${note.id}`); }));
   document.querySelector("#attach-here")?.addEventListener("click", () => { if (state.selectedNoteId) void attachDetachedNote(state.selectedNoteId); });
