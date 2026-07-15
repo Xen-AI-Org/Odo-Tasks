@@ -415,6 +415,36 @@ fn load_note(app: AppHandle, note_id: String) -> Result<Option<Note>, String> {
         .map_err(|error| format!("Could not load the note: {error}"))
 }
 
+fn note_window_label(note_id: &str) -> String {
+    let suffix: String = note_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .collect();
+    format!("note-{suffix}")
+}
+
+#[tauri::command]
+fn list_detached_notes(app: AppHandle) -> Vec<String> {
+    app.webview_windows()
+        .into_keys()
+        .filter_map(|label| label.strip_prefix("note-").map(str::to_owned))
+        .collect()
+}
+
+#[tauri::command]
+fn attach_note_to_main(app: AppHandle, note_id: String) -> Result<Option<Note>, String> {
+    let label = note_window_label(&note_id);
+    if let Some(window) = app.get_webview_window(&label) {
+        window
+            .close()
+            .map_err(|error| format!("Could not close the detached note window: {error}"))?;
+    }
+    let note = load_note(app.clone(), note_id.clone())?;
+    app.emit("note-attached", &note_id)
+        .map_err(|error| format!("Could not notify the main window: {error}"))?;
+    Ok(note)
+}
+
 #[tauri::command]
 fn save_note(app: AppHandle, note: Note) -> Result<i64, String> {
     let connection = open_database(&app)?;
@@ -447,7 +477,8 @@ fn save_note(app: AppHandle, note: Note) -> Result<i64, String> {
         )
         .map_err(|error| format!("Could not read the saved note revision: {error}"))?;
     maybe_create_backup(&app, &connection)?;
-    app.emit("workspace-changed", &note.id)
+    let saved = Note { revision, ..note };
+    app.emit("note-updated", &saved)
         .map_err(|error| format!("Could not notify other windows: {error}"))?;
     Ok(revision)
 }
@@ -458,11 +489,7 @@ async fn open_note_window(
     note_id: String,
     title: String,
 ) -> Result<(), String> {
-    let label_suffix: String = note_id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .collect();
-    let label = format!("note-{label_suffix}");
+    let label = note_window_label(&note_id);
     if let Some(window) = app.get_webview_window(&label) {
         window
             .set_focus()
@@ -470,7 +497,9 @@ async fn open_note_window(
         return Ok(());
     }
 
-    WebviewWindowBuilder::new(
+    let detached_note_id = note_id.clone();
+    let event_app = app.clone();
+    let window = WebviewWindowBuilder::new(
         &app,
         label,
         WebviewUrl::App(format!("index.html?note={note_id}").into()),
@@ -485,6 +514,13 @@ async fn open_note_window(
     .center()
     .build()
     .map_err(|error| format!("Could not open the note window: {error}"))?;
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            let _ = event_app.emit("note-attached", &detached_note_id);
+        }
+    });
+    app.emit("note-detached", &note_id)
+        .map_err(|error| format!("Could not notify the main window: {error}"))?;
     Ok(())
 }
 
@@ -546,6 +582,8 @@ pub fn run() {
             load_note,
             save_note,
             open_note_window,
+            list_detached_notes,
+            attach_note_to_main,
             create_backup,
             get_storage_info,
             export_note

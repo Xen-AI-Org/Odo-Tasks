@@ -70,8 +70,7 @@ let editingTodoId = "";
 let helpOpen = false;
 let dialogState: DialogState = null;
 let workspaceReady = !isDesktopApp;
-let editorDirty = false;
-let externalChangeNoteId = "";
+const detachedNoteIds = new Set<string>();
 let newRowId = "";
 let storageInfo: StorageInfo | null = null;
 let storageError = "";
@@ -173,8 +172,9 @@ function slashMenuHtml() { return `<div class="slash-menu ${slashOpen ? "is-open
 function renderEditor() {
   const note = selectedNote();
   if (!note) return `<main class="editor-panel empty-editor"><div class="app-actions"><span id="save-status"></span></div><div class="editor-empty"><span class="empty-icon"><i class="ph ph-note-pencil"></i></span><h2>No note selected</h2><p>Select a note, or start with a fresh page.</p><button class="primary-button" data-create-note>New note <kbd>${modLabel}+N</kbd></button></div></main>`;
+  if (detachedNoteIds.has(note.id)) return `<main class="editor-panel detached-main-panel"><div class="app-actions"><span id="save-status" class="save-status ${savePhase}"></span><button class="icon-button" id="editor-menu" title="More note actions" aria-label="More note actions"><i class="ph ph-dots-three"></i></button></div><section class="detached-note-card" role="status" aria-live="polite"><div class="detached-window-mark"><i class="ph ph-browser"></i><span class="sync-dot"></span></div><span class="eyebrow">Live sync</span><h2>Editing in its own window</h2><p>Changes arrive here as you type. This page is paused so there is always one clear editor.</p><button class="primary-button attach-here" id="attach-here"><i class="ph ph-arrow-bend-up-left"></i><span>Attach here</span></button><p class="detached-hint"><i class="ph ph-cursor-click"></i>Select this note in the list to attach it here.</p></section></main>`;
   const canEdit = note.status === "active";
-  return `<main class="editor-panel">${externalChangeNoteId === note.id ? '<div class="external-change" role="status"><i class="ph ph-arrows-clockwise"></i><span>This note changed in another window.</span><button data-external-reload>Reload</button><button data-external-keep>Keep mine</button></div>' : ""}<div class="app-actions"><span id="save-status" class="save-status ${savePhase}"></span><button class="action-button" id="focus-mode"><i class="ph ph-book-open-text"></i><span>${focusMode ? "Exit focus" : "Focus"}</span></button><span class="action-separator"></span>${note.status === "active" ? '<button class="icon-button" data-note-action="archive" title="Archive note"><i class="ph ph-archive-tray"></i></button>' : ""}<button class="icon-button" id="editor-menu" title="More note actions" aria-label="More note actions"><i class="ph ph-dots-three"></i></button></div>
+  return `<main class="editor-panel"><div class="app-actions"><span id="save-status" class="save-status ${savePhase}"></span><button class="action-button" id="focus-mode"><i class="ph ph-book-open-text"></i><span>${focusMode ? "Exit focus" : "Focus"}</span></button><span class="action-separator"></span>${note.status === "active" ? '<button class="icon-button" data-note-action="archive" title="Archive note"><i class="ph ph-archive-tray"></i></button>' : ""}<button class="icon-button" id="editor-menu" title="More note actions" aria-label="More note actions"><i class="ph ph-dots-three"></i></button></div>
     ${canEdit ? `<div class="format-bar" role="toolbar" aria-label="Formatting"><button data-insert="## ">H₁</button><button data-insert="### ">H₂</button><button data-insert="#### ">H₃</button><span></span><button data-wrap="**">B</button><button data-wrap="_" class="italic">I</button><button data-wrap="~~" class="strike">S</button><span></span><button class="icon-button" data-insert="- " title="Bulleted list"><i class="ph ph-list-bullets"></i></button><button class="icon-button" data-insert="- [ ] " title="To-do list"><i class="ph ph-check-square"></i></button><span></span><button class="icon-button" data-wrap="[]()" data-link title="Add link"><i class="ph ph-link"></i></button><button class="icon-button" data-wrap="\`" title="Inline code"><i class="ph ph-code"></i></button><span></span><button class="icon-button" id="toolbar-more" title="Block menu"><i class="ph ph-dots-three"></i></button><button class="icon-button expand-editor" id="expand-editor" title="Focus mode"><i class="ph ph-arrows-out"></i></button></div>` : '<div class="readonly-bar"><i class="ph ph-info"></i>This note is read-only here. Restore it to edit.</div>'}
     <article class="editor-page"><input class="title-input" id="title-input" value="${attr(note.title)}" aria-label="Note title" ${canEdit ? "" : "readonly"}><div class="note-meta"><span>${formatEditorDate(note.updated)}</span><span>·</span><span id="word-count">${wordCount(note.content)} words</span></div><div class="editor-wrap"><textarea id="markdown-editor" aria-label="Markdown content" spellcheck="true" ${canEdit ? "" : "readonly"}>${escapeHtml(note.content)}</textarea>${canEdit ? slashMenuHtml() : ""}</div></article></main>`;
 }
@@ -239,7 +239,7 @@ function updateSelectedRowPreview() {
   const title = row.querySelector<HTMLElement>(".note-title"); const excerpt = row.querySelector<HTMLElement>(".note-excerpt"); const time = row.querySelector<HTMLTimeElement>("time");
   if (title) title.textContent = note.title || "Untitled"; if (excerpt) excerpt.textContent = noteExcerpt(note.content); if (time) time.textContent = formatListDate(note.updated);
 }
-function reconcileNoteList() { editorDirty = false; refreshNoteList(); }
+function reconcileNoteList() { refreshNoteList(); }
 function focusTitle() { requestAnimationFrame(() => { const title = document.querySelector<HTMLInputElement>("#title-input"); title?.focus(); title?.select(); }); }
 function createNoteAndFocusTitle(folderId?: string) {
   const target = folderId && state.folders.some((folder) => folder.id === folderId) ? folderId : currentView === "notes" && state.folders.some((folder) => folder.id === state.selectedFolderId) ? state.selectedFolderId : "inbox";
@@ -380,22 +380,41 @@ function insertFormatting(value: string, wrap = false, link = false) { const edi
 function updateNote(editor: HTMLTextAreaElement) {
   const note = selectedNote(); if (!note || note.status !== "active") return;
   const normalized = editor.value.replace(/^(\s*)-\s*\[\](?=\s|$)/gm, "$1- [ ]"); if (normalized !== editor.value) { const cursor = editor.selectionStart + normalized.length - editor.value.length; editor.value = normalized; editor.selectionStart = editor.selectionEnd = cursor; }
-  note.content = editor.value; note.updated = now(); editorDirty = true; const count = document.querySelector<HTMLElement>("#word-count"); if (count) count.textContent = `${wordCount(note.content)} words`; scheduleSave(); updateSelectedRowPreview();
+  note.content = editor.value; note.updated = now(); const count = document.querySelector<HTMLElement>("#word-count"); if (count) count.textContent = `${wordCount(note.content)} words`; scheduleSave(); updateSelectedRowPreview();
   const cursor = editor.selectionStart; const lineStart = editor.value.lastIndexOf("\n", cursor - 1) + 1; slashOpen = /^\/[a-z-]*$/i.test(editor.value.slice(lineStart, cursor)); if (slashOpen) slashIndex = 0; updateSlashMenu();
 }
 
 async function openDetachedNote(note: Note) {
   await saveState(false);
-  if (isDesktopApp) { try { await invoke("open_note_window", { noteId: note.id, title: note.title || "Untitled" }); } catch (error) { await noticeOdo("Could not open note window", String(error)); } return; }
+  if (isDesktopApp) { try { await invoke("open_note_window", { noteId: note.id, title: note.title || "Untitled" }); detachedNoteIds.add(note.id); renderApp(); } catch (error) { await noticeOdo("Could not open note window", String(error)); } return; }
   window.open(`${location.pathname}?note=${encodeURIComponent(note.id)}`, `odo-note-${note.id}`, "width=820,height=720");
+}
+
+function patchLiveNote(note: Note) {
+  const index = state.notes.findIndex((item) => item.id === note.id);
+  if (index < 0) return;
+  state.notes[index] = { ...note, revision: note.revision ?? 0 };
+  if (state.selectedNoteId === note.id && detachedNoteIds.has(note.id)) renderApp();
+  else updateSelectedRowPreview();
+}
+async function attachDetachedNote(noteId: string) {
+  if (!detachedNoteIds.has(noteId) || !isDesktopApp) return;
+  try {
+    const note = await invoke<Note | null>("attach_note_to_main", { noteId });
+    if (note) patchLiveNote(note);
+    detachedNoteIds.delete(noteId);
+    state.selectedNoteId = noteId;
+    renderApp();
+    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#title-input")?.focus());
+  } catch (error) { await noticeOdo("Could not attach note", String(error)); }
 }
 
 function bindNoteRows() {
   document.querySelectorAll<HTMLElement>("[data-note-id]").forEach((row) => {
-    row.addEventListener("click", (event) => { if ((event.target as HTMLElement).closest("[data-note-menu]")) return; state.selectedNoteId = row.dataset.noteId!; renderApp(); });
+    row.addEventListener("click", (event) => { if ((event.target as HTMLElement).closest("[data-note-menu]")) return; const id = row.dataset.noteId!; state.selectedNoteId = id; if (detachedNoteIds.has(id)) void attachDetachedNote(id); else renderApp(); });
     row.addEventListener("dblclick", (event) => { if ((event.target as HTMLElement).closest("[data-note-menu]")) return; const note = state.notes.find((item) => item.id === row.dataset.noteId); if (note) void openDetachedNote(note); });
     row.addEventListener("contextmenu", (event) => { event.preventDefault(); const note = state.notes.find((item) => item.id === row.dataset.noteId); if (note) openMenu(noteMenuItems(note), row, event.clientX, event.clientY); });
-    row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); state.selectedNoteId = row.dataset.noteId!; renderApp(); } if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); const rows = [...document.querySelectorAll<HTMLElement>("[data-note-id]")]; const index = rows.indexOf(row); const next = rows[index + (event.key === "ArrowDown" ? 1 : -1)]; if (next) { state.selectedNoteId = next.dataset.noteId!; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus()); } } });
+    row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); const id = row.dataset.noteId!; state.selectedNoteId = id; if (detachedNoteIds.has(id)) void attachDetachedNote(id); else renderApp(); } if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); const rows = [...document.querySelectorAll<HTMLElement>("[data-note-id]")]; const index = rows.indexOf(row); const next = rows[index + (event.key === "ArrowDown" ? 1 : -1)]; if (next) { state.selectedNoteId = next.dataset.noteId!; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus()); } } });
   });
   document.querySelectorAll<HTMLElement>("[data-note-menu]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); const note = state.notes.find((item) => item.id === button.dataset.noteMenu); if (note) openMenu(noteMenuItems(note), button); }));
 }
@@ -423,8 +442,9 @@ function bindEvents() {
   document.querySelector("#list-menu")?.addEventListener("click", (event) => openMenu([{ label: sortNewest ? "Sort oldest first" : "Sort newest first", icon: "ph-sort-ascending", action: "list:sort:" }, { separator: true }, { label: "New note here", icon: "ph-note-pencil", hint: `${modLabel}+N`, action: `folder:new-note:${state.selectedFolderId}` }], event.currentTarget as HTMLElement));
   document.querySelector("#editor-menu")?.addEventListener("click", (event) => { const note = selectedNote(); if (note) openMenu(noteMenuItems(note), event.currentTarget as HTMLElement); });
   document.querySelectorAll<HTMLElement>("[data-note-action]").forEach((button) => button.addEventListener("click", () => { const note = selectedNote(); if (note) void performMenuAction(`note:${button.dataset.noteAction}:${note.id}`); }));
+  document.querySelector("#attach-here")?.addEventListener("click", () => { if (state.selectedNoteId) void attachDetachedNote(state.selectedNoteId); });
   const search = document.querySelector<HTMLInputElement>("#search-input"); search?.addEventListener("input", () => { searchQuery = search.value; repairState(); refreshNoteList(); });
-  const title = document.querySelector<HTMLInputElement>("#title-input"); title?.addEventListener("input", () => { const note = selectedNote(); if (!note) return; note.title = title.value; note.updated = now(); editorDirty = true; scheduleSave(); updateSelectedRowPreview(); });
+  const title = document.querySelector<HTMLInputElement>("#title-input"); title?.addEventListener("input", () => { const note = selectedNote(); if (!note) return; note.title = title.value; note.updated = now(); scheduleSave(); updateSelectedRowPreview(); });
   title?.addEventListener("keydown", (event) => { if (event.isComposing) return; if (event.key === "Enter") { event.preventDefault(); const body = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); if (body) { body.focus(); body.setSelectionRange(body.value.length, body.value.length); } } else if (event.key === "Escape") { event.preventDefault(); document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus(); } });
   title?.addEventListener("blur", reconcileNoteList);
   const editor = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); editor?.addEventListener("input", () => updateNote(editor)); editor?.addEventListener("keydown", handleEditorKeydown); editor?.addEventListener("blur", reconcileNoteList);
@@ -435,8 +455,6 @@ function bindEvents() {
   document.querySelector("#focus-mode")?.addEventListener("click", toggleFocus); document.querySelector("#expand-editor")?.addEventListener("click", toggleFocus);
   document.querySelector("#toolbar-more")?.addEventListener("click", () => { slashOpen = !slashOpen; slashIndex = 0; updateSlashMenu(); });
   bindTaskEvents(); bindSettingsEvents();
-  document.querySelector("[data-external-reload]")?.addEventListener("click", () => void reloadWorkspaceFromDesktop(true));
-  document.querySelector("[data-external-keep]")?.addEventListener("click", () => { externalChangeNoteId = ""; editorDirty = true; void saveState(); renderApp(); });
   document.querySelector("#close-help")?.addEventListener("click", () => { helpOpen = false; renderApp(); });
   document.querySelector("#help-overlay")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) { helpOpen = false; renderApp(); } });
 }
@@ -473,18 +491,8 @@ function cycleVisibleNote(direction: 1 | -1) {
   const rows = [...document.querySelectorAll<HTMLElement>("[data-note-id]")]; if (!rows.length) return;
   const active = document.activeElement; const region = active?.id === "title-input" ? "title" : active?.id === "markdown-editor" ? "body" : "row";
   const current = Math.max(0, rows.findIndex((row) => row.dataset.noteId === state.selectedNoteId)); const next = rows[(current + direction + rows.length) % rows.length];
-  clearTimeout(saveTimer); void saveState(false); state.selectedNoteId = next.dataset.noteId!; editorDirty = false; renderApp();
+  clearTimeout(saveTimer); void saveState(false); state.selectedNoteId = next.dataset.noteId!; renderApp();
   requestAnimationFrame(() => { if (region === "title") document.querySelector<HTMLInputElement>("#title-input")?.focus(); else if (region === "body") document.querySelector<HTMLTextAreaElement>("#markdown-editor")?.focus(); else document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus(); });
-}
-async function reloadWorkspaceFromDesktop(force = false) {
-  if (!isDesktopApp || (!force && editorDirty)) return;
-  try { const workspace = await invoke<string | null>("load_workspace"); if (workspace) { state = normalizeWorkspace(JSON.parse(workspace) as Workspace); externalChangeNoteId = ""; editorDirty = false; renderApp(); } } catch (error) { console.error("Could not reload changed workspace:", error); }
-}
-function showExternalChangeBanner(noteId: string) {
-  externalChangeNoteId = noteId; const panel = document.querySelector<HTMLElement>(".editor-panel"); if (!panel || panel.querySelector(".external-change")) return;
-  panel.insertAdjacentHTML("afterbegin", '<div class="external-change" role="status"><i class="ph ph-arrows-clockwise"></i><span>This note changed in another window.</span><button data-external-reload>Reload</button><button data-external-keep>Keep mine</button></div>');
-  panel.querySelector("[data-external-reload]")?.addEventListener("click", () => void reloadWorkspaceFromDesktop(true));
-  panel.querySelector("[data-external-keep]")?.addEventListener("click", () => { externalChangeNoteId = ""; panel.querySelector(".external-change")?.remove(); editorDirty = true; void saveState(); });
 }
 document.addEventListener("pointerdown", (event) => { if (menuState && !(event.target as HTMLElement).closest("#context-menu") && !(event.target as HTMLElement).closest("[data-note-menu],[data-folder-menu],[data-todo-menu],#editor-menu,#list-menu")) closeMenu(false); });
 window.addEventListener("blur", () => closeMenu(false)); window.addEventListener("resize", () => closeMenu(false));
@@ -510,11 +518,11 @@ async function renderDetachedEditor(noteId: string) {
   let note: Note | null = null;
   try { note = isDesktopApp ? await invoke<Note | null>("load_note", { noteId }) : state.notes.find((item) => item.id === noteId) ?? null; } catch (error) { app.innerHTML = `<main class="detached-error"><i class="ph ph-warning-circle"></i><h1>Could not open this note</h1><p>${escapeHtml(String(error))}</p></main>`; return; }
   if (!note) { app.innerHTML = '<main class="detached-error"><i class="ph ph-note-blank"></i><h1>Note not found</h1><p>It may have been deleted in another window.</p></main>'; return; }
-  note = { ...note, revision: note.revision ?? 0 }; let saveChain = Promise.resolve(); let saveTimerId = 0; let conflict = false; let phase: "saving" | "saved" | "conflict" | "error" = "saved";
-  const shell = () => `<main class="detached-editor"><header class="detached-titlebar"><span class="detached-brand">Odo</span><span id="detached-save-state" class="detached-save-state ${phase}">${phase === "saving" ? "Saving…" : phase === "conflict" ? "Conflict" : phase === "error" ? "Save failed" : "Saved"}</span><kbd>${modLabel}+S</kbd></header><section class="detached-paper">${conflict ? '<div class="conflict-banner" role="alert"><i class="ph ph-warning"></i><span>A newer version is already saved in SQLite.</span><button id="conflict-reload">Reload from SQLite</button><button id="conflict-keep">Keep editing</button></div>' : ""}<input id="detached-title" value="${attr(note!.title)}" aria-label="Note title"><textarea id="detached-body" aria-label="Note content" spellcheck="true">${escapeHtml(note!.content)}</textarea></section><footer class="detached-status"><span id="detached-count">${wordCount(note!.content)} words</span><span>Markdown</span><span>${modLabel}+W closes</span></footer></main>`;
-  const updatePhase = (next: typeof phase) => { phase = next; const node = document.querySelector<HTMLElement>("#detached-save-state"); if (node) { node.className = `detached-save-state ${phase}`; node.textContent = phase === "saving" ? "Saving…" : phase === "conflict" ? "Conflict" : phase === "error" ? "Save failed" : "Saved"; } };
-  const queueSave = () => { if (!note || conflict) return saveChain; clearTimeout(saveTimerId); updatePhase("saving"); saveChain = saveChain.catch(() => undefined).then(async () => { const snapshot = { ...note!, updated: now() }; note!.updated = snapshot.updated; if (!isDesktopApp) { const local = normalizeWorkspace(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? JSON.stringify(starterWorkspace()))); const index = local.notes.findIndex((item) => item.id === snapshot.id); if (index >= 0) local.notes[index] = snapshot; localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); updatePhase("saved"); return; } try { note!.revision = await invoke<number>("save_note", { note: snapshot }); updatePhase("saved"); } catch (error) { conflict = String(error).includes("newer edit") || String(error).includes("no longer exists"); updatePhase(conflict ? "conflict" : "error"); if (conflict) { const focused = document.activeElement?.id; app.innerHTML = shell(); bindDetached(); requestAnimationFrame(() => document.querySelector<HTMLElement>(focused === "detached-title" ? "#detached-title" : "#detached-body")?.focus()); } } }); return saveChain; };
-  const schedule = () => { clearTimeout(saveTimerId); updatePhase("saving"); saveTimerId = window.setTimeout(() => void queueSave(), 350); };
+  note = { ...note, revision: note.revision ?? 0 }; let saveChain: Promise<boolean> = Promise.resolve(true); let saveTimerId = 0; let phase: "saving" | "saved" | "error" = "saved";
+  const shell = () => `<main class="detached-editor"><header class="detached-titlebar"><span class="detached-brand">Odo</span><span id="detached-save-state" class="detached-save-state ${phase}"><i class="ph ph-broadcast"></i>${phase === "saving" ? "Syncing…" : phase === "error" ? "Save failed" : "Live & saved"}</span><button class="attach-main-button" id="attach-main" aria-label="Attach this note to the main Odo window"><i class="ph ph-arrow-bend-up-left"></i>Attach to main window</button><kbd>${modLabel}+S</kbd></header><section class="detached-paper"><input id="detached-title" value="${attr(note!.title)}" aria-label="Note title"><textarea id="detached-body" aria-label="Note content" spellcheck="true">${escapeHtml(note!.content)}</textarea></section><footer class="detached-status"><span id="detached-count">${wordCount(note!.content)} words</span><span><i class="ph ph-broadcast"></i> Live sync</span><span>${modLabel}+W closes</span></footer></main>`;
+  const updatePhase = (next: typeof phase) => { phase = next; const node = document.querySelector<HTMLElement>("#detached-save-state"); if (node) { node.className = `detached-save-state ${phase}`; node.innerHTML = `<i class="ph ph-broadcast"></i>${phase === "saving" ? "Syncing…" : phase === "error" ? "Save failed" : "Live & saved"}`; } };
+  const queueSave = (): Promise<boolean> => { if (!note) return Promise.resolve(false); clearTimeout(saveTimerId); updatePhase("saving"); saveChain = saveChain.catch(() => false).then(async () => { const snapshot = { ...note!, updated: now() }; note!.updated = snapshot.updated; try { if (isDesktopApp) note!.revision = await invoke<number>("save_note", { note: snapshot }); updatePhase("saved"); return true; } catch (error) { console.error("Could not save detached note:", error); updatePhase("error"); return false; } }); return saveChain; };
+  const schedule = () => { clearTimeout(saveTimerId); updatePhase("saving"); saveTimerId = window.setTimeout(() => void queueSave(), 125); };
   const bindDetached = () => {
     const title = document.querySelector<HTMLInputElement>("#detached-title")!; const body = document.querySelector<HTMLTextAreaElement>("#detached-body")!;
     title.addEventListener("input", () => { note!.title = title.value; document.title = `${title.value || "Untitled"} — Odo`; schedule(); });
@@ -522,16 +530,15 @@ async function renderDetachedEditor(noteId: string) {
     body.addEventListener("input", () => { note!.content = body.value; const count = document.querySelector<HTMLElement>("#detached-count"); if (count) count.textContent = `${wordCount(note!.content)} words`; schedule(); });
     body.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); title.focus(); } });
     title.addEventListener("blur", () => void queueSave()); body.addEventListener("blur", () => void queueSave());
-    document.querySelector("#conflict-reload")?.addEventListener("click", async () => { const fresh = await invoke<Note | null>("load_note", { noteId }); if (fresh) { note = { ...fresh, revision: fresh.revision ?? 0 }; conflict = false; phase = "saved"; app.innerHTML = shell(); bindDetached(); } });
-    document.querySelector("#conflict-keep")?.addEventListener("click", () => { conflict = false; updatePhase("error"); body.focus(); });
+    document.querySelector("#attach-main")?.addEventListener("click", async (event) => { const button = event.currentTarget as HTMLButtonElement; clearTimeout(saveTimerId); button.disabled = true; const saved = await queueSave(); if (!saved) { button.disabled = false; return; } try { if (isDesktopApp) await invoke("attach_note_to_main", { noteId }); window.close(); } catch (error) { console.error("Could not attach detached note:", error); updatePhase("error"); button.disabled = false; } });
   };
   document.title = `${note.title || "Untitled"} — Odo`; app.innerHTML = shell(); bindDetached();
-  document.addEventListener("keydown", (event) => { if (event.isComposing) return; const command = event.metaKey || event.ctrlKey; if (command && event.key.toLowerCase() === "s") { event.preventDefault(); clearTimeout(saveTimerId); void queueSave(); } if (command && event.key.toLowerCase() === "w") { event.preventDefault(); clearTimeout(saveTimerId); void queueSave().finally(() => window.close()); } });
+  document.addEventListener("keydown", (event) => { if (event.isComposing) return; const command = event.metaKey || event.ctrlKey; if (command && event.key.toLowerCase() === "s") { event.preventDefault(); clearTimeout(saveTimerId); void queueSave(); } if (command && event.key.toLowerCase() === "w") { event.preventDefault(); clearTimeout(saveTimerId); void queueSave().then((saved) => { if (saved) window.close(); }); } });
   window.addEventListener("beforeunload", () => { clearTimeout(saveTimerId); void queueSave(); });
 }
 
 async function bootstrap() {
   if (detachedNoteId) { await renderDetachedEditor(detachedNoteId); return; }
-  renderApp(); if (isDesktopApp) { await restoreDesktopWorkspace(); await listen<string>("workspace-changed", (event) => { const changedId = event.payload; const active = document.activeElement; if (changedId === state.selectedNoteId && (editorDirty || active?.id === "title-input" || active?.id === "markdown-editor")) showExternalChangeBanner(changedId); else void reloadWorkspaceFromDesktop(); }); }
+  renderApp(); if (isDesktopApp) { await restoreDesktopWorkspace(); (await invoke<string[]>("list_detached_notes")).forEach((id) => detachedNoteIds.add(id)); renderApp(); await listen<Note>("note-updated", (event) => patchLiveNote(event.payload)); await listen<string>("note-detached", (event) => { detachedNoteIds.add(event.payload); if (state.selectedNoteId === event.payload) renderApp(); }); await listen<string>("note-attached", (event) => { detachedNoteIds.delete(event.payload); if (state.selectedNoteId === event.payload) renderApp(); }); }
 }
 void bootstrap();
