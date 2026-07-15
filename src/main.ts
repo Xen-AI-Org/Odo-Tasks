@@ -1,6 +1,7 @@
 import "@phosphor-icons/web/regular/style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./styles.css";
 
 type NoteStatus = "active" | "archived" | "trash";
@@ -197,6 +198,85 @@ function renderNoteRows() {
 function slashMenuHtml() { return `<div class="slash-menu ${slashOpen ? "is-open" : ""}" id="slash-menu" role="listbox">${commands.map((command, index) => `<button class="slash-command ${index === slashIndex ? "is-active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === slashIndex}"><span class="command-icon"><i class="ph ${command.icon}"></i></span><span><strong>${command.label}</strong><small>${command.detail}</small></span>${index === 0 ? "<kbd>Enter</kbd>" : ""}</button>`).join("")}</div>`; }
 type RichBlock = "P" | "H1" | "H2" | "H3" | "BLOCKQUOTE" | "PRE" | "UL" | "OL";
 const blockSelector = "p,h1,h2,h3,blockquote,pre,ul,ol";
+const linkableUrlPattern = /(^|[^\w@])((?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9](?:[a-z0-9-]{0,62}\.)+[a-z]{2,})(?::\d+)?(?:\/[^\s<>"']*)?))/gi;
+
+function trimUrlPunctuation(value: string): string {
+  let trimmed = value.replace(/[.,!?;:]+$/g, "");
+  const pairs: [string, string][] = [["(", ")"], ["[", "]"], ["{", "}"]];
+  for (const [open, close] of pairs) {
+    while (trimmed.endsWith(close) && trimmed.split(close).length > trimmed.split(open).length) trimmed = trimmed.slice(0, -1);
+  }
+  return trimmed;
+}
+function webHref(value: string): string | null {
+  try {
+    const url = new URL(/^https?:\/\//i.test(value) ? value : `https://${value}`);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch { return null; }
+}
+function linkifyPlainUrls(root: ParentNode): boolean {
+  const documentRoot = root instanceof DocumentFragment ? root.ownerDocument : root.ownerDocument ?? document;
+  const walker = documentRoot.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = []; let current: Node | null; let changed = false;
+  while ((current = walker.nextNode())) {
+    const parent = current.parentElement;
+    if (parent && !parent.closest("a, code, pre")) nodes.push(current as Text);
+  }
+  nodes.forEach((node) => {
+    const text = node.data; const matches: { start: number; end: number; label: string; href: string }[] = [];
+    linkableUrlPattern.lastIndex = 0; let match: RegExpExecArray | null;
+    while ((match = linkableUrlPattern.exec(text))) {
+      const label = trimUrlPunctuation(match[2]); const href = webHref(label);
+      if (!label || !href) continue;
+      const start = match.index + match[1].length;
+      matches.push({ start, end: start + label.length, label, href });
+    }
+    if (!matches.length) return;
+    const fragment = documentRoot.createDocumentFragment(); let offset = 0;
+    matches.forEach(({ start, end, label, href }) => {
+      fragment.append(text.slice(offset, start));
+      const anchor = documentRoot.createElement("a"); anchor.href = href; anchor.dataset.autoLink = "true"; anchor.rel = "noopener noreferrer"; anchor.textContent = label; fragment.append(anchor);
+      offset = end;
+    });
+    fragment.append(text.slice(offset)); node.replaceWith(fragment); changed = true;
+  });
+  return changed;
+}
+function selectionTextOffset(root: HTMLElement): number | null {
+  const selection = window.getSelection(); if (!selection?.isCollapsed || !selection.anchorNode || !root.contains(selection.anchorNode)) return null;
+  const range = document.createRange(); range.selectNodeContents(root); range.setEnd(selection.anchorNode, selection.anchorOffset); return range.toString().length;
+}
+function restoreSelectionTextOffset(root: HTMLElement, offset: number | null) {
+  if (offset === null) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT); let remaining = offset; let current: Node | null;
+  while ((current = walker.nextNode())) {
+    const length = current.textContent?.length ?? 0;
+    if (remaining <= length) { const range = document.createRange(); range.setStart(current, remaining); range.collapse(true); const selection = window.getSelection(); selection?.removeAllRanges(); selection?.addRange(range); return; }
+    remaining -= length;
+  }
+  placeCaretEnd(root);
+}
+function refreshAutoLinks(editor: HTMLElement) {
+  const offset = selectionTextOffset(editor); let changed = false;
+  editor.querySelectorAll<HTMLAnchorElement>("a[data-auto-link]").forEach((anchor) => {
+    const text = anchor.textContent ?? ""; const label = trimUrlPunctuation(text); const href = webHref(label);
+    if (href && label === text) { if (anchor.getAttribute("href") !== href) anchor.href = href; return; }
+    anchor.replaceWith(document.createTextNode(text)); changed = true;
+  });
+  if (changed) editor.normalize();
+  changed = linkifyPlainUrls(editor) || changed;
+  if (changed) restoreSelectionTextOffset(editor, offset);
+}
+function shouldRefreshAutoLinks(event: InputEvent): boolean {
+  const selection = window.getSelection(); const anchorNode = selection?.anchorNode;
+  const anchor = anchorNode instanceof HTMLElement ? anchorNode.closest("a[data-auto-link]") : anchorNode?.parentElement?.closest("a[data-auto-link]");
+  return !!anchor || event.inputType === "insertParagraph" || event.inputType === "insertLineBreak" || event.inputType === "insertFromPaste" || (event.data?.length ?? 0) > 1 || /\s/.test(event.data ?? "");
+}
+async function openRichLink(anchor: HTMLAnchorElement) {
+  const href = webHref(anchor.href); if (!href) return;
+  try { if (isDesktopApp) await openUrl(href); else window.open(href, "_blank", "noopener,noreferrer"); }
+  catch (error) { console.error("Could not open link:", error); }
+}
 
 function inlineMarkdown(markdown: string): string {
   // Escape first: documents are always modelled as text/semantic tags, never pasted HTML.
@@ -207,7 +287,7 @@ function inlineMarkdown(markdown: string): string {
   html = html.replace(/~~([^~]+)~~/g, "<s>$1</s>");
   html = html.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
   html = html.replace(/(^|[^_])_([^_]+)_/g, "$1<em>$2</em>");
-  return html;
+  const template = document.createElement("template"); template.innerHTML = html; linkifyPlainUrls(template.content); return template.innerHTML;
 }
 function richTask(text: string, checked: boolean) { return `<li class="rich-task ${checked ? "is-checked" : ""}"><input class="rich-task-check" type="checkbox" ${checked ? "checked" : ""} contenteditable="false" aria-label="Toggle task"><span class="rich-task-label" contenteditable="true">${text ? inlineMarkdown(text) : "<br>"}</span></li>`; }
 function markdownToRich(markdown: string): string {
@@ -235,7 +315,7 @@ function richInlineMarkdown(node: Node): string {
   if (node.tagName === "EM" || node.tagName === "I") return `_${inner}_`;
   if (node.tagName === "S" || node.tagName === "DEL" || node.tagName === "STRIKE") return `~~${inner}~~`;
   if (node.tagName === "CODE") return `\`${inner}\``;
-  if (node.tagName === "A") return `[${inner}](${node.getAttribute("href") || "url"})`;
+  if (node.tagName === "A") return node.hasAttribute("data-auto-link") ? inner : `[${inner}](${node.getAttribute("href") || "url"})`;
   if (node.tagName === "BR") return "\n";
   return inner;
 }
@@ -575,8 +655,9 @@ function handleRichKeydown(event: KeyboardEvent, update = updateRichNote) {
   if (event.key === "Tab" && !slashOpen) { const list = (event.target as HTMLElement).closest("li"); if (list) { event.preventDefault(); document.execCommand(event.shiftKey ? "outdent" : "indent"); update(editor); } }
 }
 function bindRichEditor(editor: HTMLElement, update: (element: HTMLElement) => void) {
-  editor.addEventListener("input", () => { transformMarkdownShortcut(editor); update(editor); }); editor.addEventListener("keydown", (event) => handleRichKeydown(event, update)); editor.addEventListener("change", (event) => { const checkbox = (event.target as HTMLElement).closest<HTMLInputElement>(".rich-task-check"); if (checkbox) toggleRichTask(checkbox, update); else update(editor); });
-  editor.addEventListener("click", (event) => { const checkbox = (event.target as HTMLElement).closest<HTMLInputElement>(".rich-task-check"); if (checkbox) window.setTimeout(() => toggleRichTask(checkbox, update)); });
+  editor.addEventListener("input", (event) => { transformMarkdownShortcut(editor); if (shouldRefreshAutoLinks(event as InputEvent)) refreshAutoLinks(editor); update(editor); }); editor.addEventListener("keydown", (event) => handleRichKeydown(event, update)); editor.addEventListener("change", (event) => { const checkbox = (event.target as HTMLElement).closest<HTMLInputElement>(".rich-task-check"); if (checkbox) toggleRichTask(checkbox, update); else update(editor); });
+  editor.addEventListener("blur", () => { refreshAutoLinks(editor); update(editor); });
+  editor.addEventListener("click", (event) => { const target = event.target as HTMLElement; const checkbox = target.closest<HTMLInputElement>(".rich-task-check"); if (checkbox) window.setTimeout(() => toggleRichTask(checkbox, update)); const anchor = target.closest<HTMLAnchorElement>("a[href]"); if (anchor) { event.preventDefault(); void openRichLink(anchor); } });
   editor.addEventListener("paste", (event) => { event.preventDefault(); const text = event.clipboardData?.getData("text/plain") ?? ""; document.execCommand("insertText", false, text); });
 }
 
