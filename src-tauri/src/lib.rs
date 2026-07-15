@@ -42,7 +42,23 @@ struct Todo {
     completed: bool,
     created: String,
     updated: String,
+    #[serde(default = "default_category_id")]
+    category_id: String,
+    #[serde(default = "default_priority")]
+    priority: String,
+    #[serde(default = "default_effort")]
+    effort: i64,
+    #[serde(default)]
+    color: String,
+    #[serde(default)]
+    scheduled_start: Option<String>,
+    #[serde(default = "default_duration")]
+    duration_minutes: i64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TodoCategory { id: String, name: String, color: String, #[serde(default)] icon: String }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,15 +67,24 @@ struct Workspace {
     notes: Vec<Note>,
     #[serde(default)]
     todos: Vec<Todo>,
+    #[serde(default)]
+    todo_categories: Vec<TodoCategory>,
     selected_folder_id: String,
     selected_note_id: String,
     #[serde(default = "default_sort_mode")]
     sort_mode: String,
+    #[serde(default = "default_planner_view")]
+    planner_view: String,
 }
 
 fn default_sort_mode() -> String {
     "newest".into()
 }
+fn default_category_id() -> String { "inbox".into() }
+fn default_priority() -> String { "medium".into() }
+fn default_effort() -> i64 { 2 }
+fn default_duration() -> i64 { 30 }
+fn default_planner_view() -> String { "3".into() }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,6 +159,9 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
              CREATE TABLE IF NOT EXISTS app_state (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS todo_categories (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL, color TEXT NOT NULL, icon TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(|error| format!("Could not initialize the workspace database: {error}"))?;
@@ -155,6 +183,11 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             )
             .map_err(|error| format!("Could not upgrade the notes schema: {error}"))?;
     }
+    let todo_columns = connection.prepare("PRAGMA table_info(todos)").and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()).map_err(|error| format!("Could not inspect tasks schema: {error}"))?;
+    for (column, ddl) in [("category_id", "ALTER TABLE todos ADD COLUMN category_id TEXT NOT NULL DEFAULT 'inbox'"), ("priority", "ALTER TABLE todos ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'"), ("effort", "ALTER TABLE todos ADD COLUMN effort INTEGER NOT NULL DEFAULT 2"), ("color", "ALTER TABLE todos ADD COLUMN color TEXT NOT NULL DEFAULT ''"), ("scheduled_start", "ALTER TABLE todos ADD COLUMN scheduled_start TEXT"), ("duration_minutes", "ALTER TABLE todos ADD COLUMN duration_minutes INTEGER NOT NULL DEFAULT 30")] {
+        if !todo_columns.iter().any(|item| item == column) { connection.execute(ddl, []).map_err(|error| format!("Could not upgrade tasks schema: {error}"))?; }
+    }
+    connection.execute("INSERT OR IGNORE INTO todo_categories (id,name,color,icon,position) VALUES ('inbox','Inbox','#7b8e7c','ph-tray',0)", []).map_err(|error| format!("Could not seed task categories: {error}"))?;
     Ok(())
 }
 
@@ -169,6 +202,7 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
         .execute_batch(
             "DELETE FROM folders;
              DELETE FROM todos;
+             DELETE FROM todo_categories;
              CREATE TEMP TABLE IF NOT EXISTS incoming_note_ids (id TEXT PRIMARY KEY);
              DELETE FROM incoming_note_ids;",
         )
@@ -234,18 +268,22 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
         )
         .map_err(|error| format!("Could not finalize note removals: {error}"))?;
 
+    for (position, category) in workspace.todo_categories.iter().enumerate() {
+        transaction.execute("INSERT INTO todo_categories (id,name,color,icon,position) VALUES (?1,?2,?3,?4,?5)", params![category.id, category.name, category.color, category.icon, position as i64]).map_err(|error| format!("Could not save a task category: {error}"))?;
+    }
+    if workspace.todo_categories.is_empty() { transaction.execute("INSERT OR IGNORE INTO todo_categories (id,name,color,icon,position) VALUES ('inbox','Inbox','#7b8e7c','ph-tray',0)", []).map_err(|error| format!("Could not seed category: {error}"))?; }
     for (position, todo) in workspace.todos.iter().enumerate() {
         transaction
             .execute(
-                "INSERT INTO todos (id, text, completed, created, updated, position)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO todos (id, text, completed, created, updated, position, category_id, priority, effort, color, scheduled_start, duration_minutes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     todo.id,
                     todo.text,
                     todo.completed,
                     todo.created,
                     todo.updated,
-                    position as i64
+                    position as i64, todo.category_id, todo.priority, todo.effort, todo.color, todo.scheduled_start, todo.duration_minutes
                 ],
             )
             .map_err(|error| format!("Could not save a task: {error}"))?;
@@ -272,6 +310,7 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
             [&workspace.sort_mode],
         )
         .map_err(|error| format!("Could not save the note sort mode: {error}"))?;
+    transaction.execute("INSERT INTO app_state (key,value) VALUES ('plannerView',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&workspace.planner_view]).map_err(|error| format!("Could not save planner view: {error}"))?;
 
     transaction
         .commit()
@@ -327,7 +366,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .map_err(|error| format!("Could not decode notes: {error}"))?;
 
     let mut todo_statement = connection
-        .prepare("SELECT id, text, completed, created, updated FROM todos ORDER BY position")
+        .prepare("SELECT id, text, completed, created, updated, category_id, priority, effort, color, scheduled_start, duration_minutes FROM todos ORDER BY position")
         .map_err(|error| format!("Could not read tasks: {error}"))?;
     let todos = todo_statement
         .query_map([], |row| {
@@ -337,11 +376,14 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
                 completed: row.get(2)?,
                 created: row.get(3)?,
                 updated: row.get(4)?,
+                category_id: row.get(5)?, priority: row.get(6)?, effort: row.get(7)?, color: row.get(8)?, scheduled_start: row.get(9)?, duration_minutes: row.get(10)?,
             })
         })
         .map_err(|error| format!("Could not query tasks: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Could not decode tasks: {error}"))?;
+    let mut category_statement = connection.prepare("SELECT id,name,color,icon FROM todo_categories ORDER BY position").map_err(|error| format!("Could not read task categories: {error}"))?;
+    let todo_categories = category_statement.query_map([], |row| Ok(TodoCategory { id: row.get(0)?, name: row.get(1)?, color: row.get(2)?, icon: row.get(3)? })).map_err(|error| format!("Could not query task categories: {error}"))?.collect::<Result<Vec<_>, _>>().map_err(|error| format!("Could not decode categories: {error}"))?;
 
     let selected_folder_id = connection
         .query_row(
@@ -370,14 +412,17 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .optional()
         .map_err(|error| format!("Could not read the note sort mode: {error}"))?
         .unwrap_or_else(default_sort_mode);
+    let planner_view = connection.query_row("SELECT value FROM app_state WHERE key='plannerView'", [], |row| row.get(0)).optional().map_err(|error| format!("Could not read planner view: {error}"))?.unwrap_or_else(default_planner_view);
 
     Ok(Some(Workspace {
         folders,
         notes,
         todos,
+        todo_categories,
         selected_folder_id,
         selected_note_id,
         sort_mode,
+        planner_view,
     }))
 }
 
@@ -623,14 +668,15 @@ mod tests {
     fn workspace_round_trip_preserves_notes_folders_and_tasks() {
         let mut connection = Connection::open_in_memory().expect("open in-memory database");
         initialize_database(&connection).expect("initialize schema");
-        let input = r#"{
+        let input = r##"{
           "folders":[{"id":"inbox","name":"Inbox","parentId":null,"open":true,"icon":"ph-tray"}],
           "notes":[{"id":"note-1","folderId":"inbox","title":"Test","content":"Body","updated":"2026-07-15T00:00:00.000Z","status":"active","pinned":true}],
-          "todos":[{"id":"todo-1","text":"Ship it","completed":false,"created":"2026-07-15T00:00:00.000Z","updated":"2026-07-15T00:00:00.000Z"}],
+          "todos":[{"id":"todo-1","text":"Ship it","completed":false,"created":"2026-07-15T00:00:00.000Z","updated":"2026-07-15T00:00:00.000Z","categoryId":"work","priority":"high","effort":4,"color":"#7499b1","scheduledStart":"2026-07-15T09:00:00.000Z","durationMinutes":90}],
+          "todoCategories":[{"id":"inbox","name":"Inbox","color":"#7b8e7c"},{"id":"work","name":"Work","color":"#7499b1"}],
           "selectedFolderId":"inbox",
           "selectedNoteId":"note-1",
-          "sortMode":"manual"
-        }"#;
+          "sortMode":"manual", "plannerView":"4"
+        }"##;
 
         write_workspace(&mut connection, input).expect("save workspace");
         let workspace = read_workspace(&connection)
@@ -642,6 +688,10 @@ mod tests {
         assert_eq!(workspace.todos.len(), 1);
         assert_eq!(workspace.notes[0].title, "Test");
         assert_eq!(workspace.todos[0].text, "Ship it");
+        assert_eq!(workspace.todos[0].scheduled_start.as_deref(), Some("2026-07-15T09:00:00.000Z"));
+        assert_eq!(workspace.todos[0].duration_minutes, 90);
+        assert_eq!(workspace.todo_categories.len(), 2);
+        assert_eq!(workspace.planner_view, "4");
         assert_eq!(workspace.selected_note_id, "note-1");
         assert_eq!(workspace.sort_mode, "manual");
     }
