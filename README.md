@@ -12,6 +12,18 @@ A calm, local-first Markdown notes workspace built with [Tauri 2](https://v2.tau
 - Note and folder creation, sorting, archive/trash views, and focus mode
 - Autosave and local workspace persistence
 - Keyboard shortcuts for search, creation, saving, and focus mode
+- Native macOS menu-bar controls and a local MCP server for notes, folders, tasks, and journals
+
+## Odo MCP Server
+
+The desktop app includes an MCP server with both standard local transports:
+
+- Streamable HTTP at `http://127.0.0.1:8765/mcp` by default
+- `stdio` through the installed Odo executable with the `--mcp-stdio` argument
+
+Open **Settings → Odo MCP Server** to start or stop the server, change the bind address or preferred port, enable an optional bearer token, allow permanent deletion, configure start-at-login, and copy client configuration snippets. Closing the main window keeps Odo and an enabled HTTP server running in the menu bar.
+
+The MCP surface includes revision-safe note operations, nested folder management, planner and Markdown tasks, journal entries, search, atomic batches, backups, resources with subscriptions, five workflow prompts, and a redacted activity log retained for 60 days. Permanent note deletion is disabled separately by default.
 
 ## Prerequisites
 

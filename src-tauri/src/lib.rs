@@ -1,12 +1,21 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use serde_json::json;
+use tauri::{
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    tray::TrayIconBuilder,
+    AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
+};
+use tauri_plugin_autostart::ManagerExt;
+
+pub mod mcp;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,7 +67,13 @@ struct Todo {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TodoCategory { id: String, name: String, color: String, #[serde(default)] icon: String }
+struct TodoCategory {
+    id: String,
+    name: String,
+    color: String,
+    #[serde(default)]
+    icon: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,11 +107,21 @@ struct Workspace {
 fn default_sort_mode() -> String {
     "newest".into()
 }
-fn default_category_id() -> String { "inbox".into() }
-fn default_priority() -> String { "medium".into() }
-fn default_effort() -> i64 { 2 }
-fn default_duration() -> i64 { 30 }
-fn default_planner_view() -> String { "3".into() }
+fn default_category_id() -> String {
+    "inbox".into()
+}
+fn default_priority() -> String {
+    "medium".into()
+}
+fn default_effort() -> i64 {
+    2
+}
+fn default_duration() -> i64 {
+    30
+}
+fn default_planner_view() -> String {
+    "3".into()
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,7 +161,7 @@ fn open_database(app: &AppHandle) -> Result<Connection, String> {
     Ok(connection)
 }
 
-fn initialize_database(connection: &Connection) -> Result<(), String> {
+pub fn initialize_database(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -198,9 +223,45 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             )
             .map_err(|error| format!("Could not upgrade the notes schema: {error}"))?;
     }
-    let todo_columns = connection.prepare("PRAGMA table_info(todos)").and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()).map_err(|error| format!("Could not inspect tasks schema: {error}"))?;
-    for (column, ddl) in [("category_id", "ALTER TABLE todos ADD COLUMN category_id TEXT NOT NULL DEFAULT 'inbox'"), ("priority", "ALTER TABLE todos ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'"), ("effort", "ALTER TABLE todos ADD COLUMN effort INTEGER NOT NULL DEFAULT 2"), ("color", "ALTER TABLE todos ADD COLUMN color TEXT NOT NULL DEFAULT ''"), ("scheduled_start", "ALTER TABLE todos ADD COLUMN scheduled_start TEXT"), ("duration_minutes", "ALTER TABLE todos ADD COLUMN duration_minutes INTEGER NOT NULL DEFAULT 30")] {
-        if !todo_columns.iter().any(|item| item == column) { connection.execute(ddl, []).map_err(|error| format!("Could not upgrade tasks schema: {error}"))?; }
+    let todo_columns = connection
+        .prepare("PRAGMA table_info(todos)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| format!("Could not inspect tasks schema: {error}"))?;
+    for (column, ddl) in [
+        (
+            "category_id",
+            "ALTER TABLE todos ADD COLUMN category_id TEXT NOT NULL DEFAULT 'inbox'",
+        ),
+        (
+            "priority",
+            "ALTER TABLE todos ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'",
+        ),
+        (
+            "effort",
+            "ALTER TABLE todos ADD COLUMN effort INTEGER NOT NULL DEFAULT 2",
+        ),
+        (
+            "color",
+            "ALTER TABLE todos ADD COLUMN color TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "scheduled_start",
+            "ALTER TABLE todos ADD COLUMN scheduled_start TEXT",
+        ),
+        (
+            "duration_minutes",
+            "ALTER TABLE todos ADD COLUMN duration_minutes INTEGER NOT NULL DEFAULT 30",
+        ),
+    ] {
+        if !todo_columns.iter().any(|item| item == column) {
+            connection
+                .execute(ddl, [])
+                .map_err(|error| format!("Could not upgrade tasks schema: {error}"))?;
+        }
     }
     connection.execute("INSERT OR IGNORE INTO todo_categories (id,name,color,icon,position) VALUES ('inbox','Inbox','#7b8e7c','ph-tray',0)", []).map_err(|error| format!("Could not seed task categories: {error}"))?;
     Ok(())
@@ -285,9 +346,22 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
         .map_err(|error| format!("Could not finalize note removals: {error}"))?;
 
     for (position, category) in workspace.todo_categories.iter().enumerate() {
-        transaction.execute("INSERT INTO todo_categories (id,name,color,icon,position) VALUES (?1,?2,?3,?4,?5)", params![category.id, category.name, category.color, category.icon, position as i64]).map_err(|error| format!("Could not save a task category: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO todo_categories (id,name,color,icon,position) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    category.id,
+                    category.name,
+                    category.color,
+                    category.icon,
+                    position as i64
+                ],
+            )
+            .map_err(|error| format!("Could not save a task category: {error}"))?;
     }
-    if workspace.todo_categories.is_empty() { transaction.execute("INSERT OR IGNORE INTO todo_categories (id,name,color,icon,position) VALUES ('inbox','Inbox','#7b8e7c','ph-tray',0)", []).map_err(|error| format!("Could not seed category: {error}"))?; }
+    if workspace.todo_categories.is_empty() {
+        transaction.execute("INSERT OR IGNORE INTO todo_categories (id,name,color,icon,position) VALUES ('inbox','Inbox','#7b8e7c','ph-tray',0)", []).map_err(|error| format!("Could not seed category: {error}"))?;
+    }
     for (position, todo) in workspace.todos.iter().enumerate() {
         transaction
             .execute(
@@ -398,16 +472,46 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
                 completed: row.get(2)?,
                 created: row.get(3)?,
                 updated: row.get(4)?,
-                category_id: row.get(5)?, priority: row.get(6)?, effort: row.get(7)?, color: row.get(8)?, scheduled_start: row.get(9)?, duration_minutes: row.get(10)?,
+                category_id: row.get(5)?,
+                priority: row.get(6)?,
+                effort: row.get(7)?,
+                color: row.get(8)?,
+                scheduled_start: row.get(9)?,
+                duration_minutes: row.get(10)?,
             })
         })
         .map_err(|error| format!("Could not query tasks: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Could not decode tasks: {error}"))?;
-    let mut category_statement = connection.prepare("SELECT id,name,color,icon FROM todo_categories ORDER BY position").map_err(|error| format!("Could not read task categories: {error}"))?;
-    let todo_categories = category_statement.query_map([], |row| Ok(TodoCategory { id: row.get(0)?, name: row.get(1)?, color: row.get(2)?, icon: row.get(3)? })).map_err(|error| format!("Could not query task categories: {error}"))?.collect::<Result<Vec<_>, _>>().map_err(|error| format!("Could not decode categories: {error}"))?;
+    let mut category_statement = connection
+        .prepare("SELECT id,name,color,icon FROM todo_categories ORDER BY position")
+        .map_err(|error| format!("Could not read task categories: {error}"))?;
+    let todo_categories = category_statement
+        .query_map([], |row| {
+            Ok(TodoCategory {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                icon: row.get(3)?,
+            })
+        })
+        .map_err(|error| format!("Could not query task categories: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Could not decode categories: {error}"))?;
     let mut journal_statement = connection.prepare("SELECT id,date_key,content,created,updated FROM journal_entries ORDER BY date_key DESC, position").map_err(|error| format!("Could not read journal entries: {error}"))?;
-    let journal_entries = journal_statement.query_map([], |row| Ok(JournalEntry { id: row.get(0)?, date_key: row.get(1)?, content: row.get(2)?, created: row.get(3)?, updated: row.get(4)? })).map_err(|error| format!("Could not query journal entries: {error}"))?.collect::<Result<Vec<_>, _>>().map_err(|error| format!("Could not decode journal entries: {error}"))?;
+    let journal_entries = journal_statement
+        .query_map([], |row| {
+            Ok(JournalEntry {
+                id: row.get(0)?,
+                date_key: row.get(1)?,
+                content: row.get(2)?,
+                created: row.get(3)?,
+                updated: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("Could not query journal entries: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Could not decode journal entries: {error}"))?;
 
     let selected_folder_id = connection
         .query_row(
@@ -426,7 +530,12 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         )
         .optional()
         .map_err(|error| format!("Could not read the selected note: {error}"))?
-        .unwrap_or_else(|| notes.first().map(|note| note.id.clone()).unwrap_or_default());
+        .unwrap_or_else(|| {
+            notes
+                .first()
+                .map(|note| note.id.clone())
+                .unwrap_or_default()
+        });
     let sort_mode = connection
         .query_row(
             "SELECT value FROM app_state WHERE key = 'sortMode'",
@@ -436,7 +545,15 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .optional()
         .map_err(|error| format!("Could not read the note sort mode: {error}"))?
         .unwrap_or_else(default_sort_mode);
-    let planner_view = connection.query_row("SELECT value FROM app_state WHERE key='plannerView'", [], |row| row.get(0)).optional().map_err(|error| format!("Could not read planner view: {error}"))?.unwrap_or_else(default_planner_view);
+    let planner_view = connection
+        .query_row(
+            "SELECT value FROM app_state WHERE key='plannerView'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("Could not read planner view: {error}"))?
+        .unwrap_or_else(default_planner_view);
 
     Ok(Some(Workspace {
         folders,
@@ -461,7 +578,11 @@ fn maybe_create_backup(app: &AppHandle, connection: &Connection) -> Result<(), S
     let destination = backup_directory(app)?.join("workspace-latest.sqlite3");
     let fresh = fs::metadata(&destination)
         .and_then(|metadata| metadata.modified())
-        .and_then(|modified| SystemTime::now().duration_since(modified).map_err(std::io::Error::other))
+        .and_then(|modified| {
+            SystemTime::now()
+                .duration_since(modified)
+                .map_err(std::io::Error::other)
+        })
         .map(|age| age < Duration::from_secs(60 * 60))
         .unwrap_or(false);
     if !fresh {
@@ -577,11 +698,7 @@ fn save_note(app: AppHandle, note: Note) -> Result<i64, String> {
 }
 
 #[tauri::command]
-async fn open_note_window(
-    app: AppHandle,
-    note_id: String,
-    title: String,
-) -> Result<(), String> {
+async fn open_note_window(app: AppHandle, note_id: String, title: String) -> Result<(), String> {
     let label = note_window_label(&note_id);
     if let Some(window) = app.get_webview_window(&label) {
         window
@@ -665,10 +782,298 @@ fn export_note(app: AppHandle, title: String, contents: String) -> Result<String
     Ok(path.to_string_lossy().into_owned())
 }
 
+struct McpRuntime {
+    database_path: PathBuf,
+    status: Arc<Mutex<mcp::McpStatus>>,
+    cancellation: Mutex<Option<tokio_util::sync::CancellationToken>>,
+}
+
+impl McpRuntime {
+    fn new(database_path: PathBuf) -> Self {
+        Self {
+            database_path,
+            status: Arc::new(Mutex::new(mcp::McpStatus::default())),
+            cancellation: Mutex::new(None),
+        }
+    }
+
+    fn restart(&self, app: &AppHandle, config: mcp::McpConfig) {
+        if let Some(cancellation) = self
+            .cancellation
+            .lock()
+            .expect("lock MCP cancellation")
+            .take()
+        {
+            cancellation.cancel();
+        }
+        *self.status.lock().expect("lock MCP status") = mcp::McpStatus::default();
+        refresh_tray(app, &config, &self.status.lock().expect("lock MCP status"));
+        let _ = app.emit("mcp-status-changed", ());
+        if !config.enabled {
+            return;
+        }
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        *self.cancellation.lock().expect("lock MCP cancellation") = Some(cancellation.clone());
+        let database_path = self.database_path.clone();
+        let status = self.status.clone();
+        let event_app = app.clone();
+        let server_app = app.clone();
+        std::thread::Builder::new()
+            .name("odo-mcp-http".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .thread_name("odo-mcp-worker")
+                    .build()
+                    .expect("build Odo MCP runtime");
+                runtime.block_on(async move {
+                    let watcher_app = server_app.clone();
+                    let watcher_config = config.clone();
+                    let watcher_status = status.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        refresh_tray(
+                            &watcher_app,
+                            &watcher_config,
+                            &watcher_status.lock().expect("lock MCP status"),
+                        );
+                        let _ = watcher_app.emit("mcp-status-changed", ());
+                    });
+                    let notifier: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        let _ = event_app.emit("workspace-changed", ());
+                    });
+                    if let Err(error) = mcp::run_http(
+                        database_path,
+                        config.clone(),
+                        cancellation,
+                        Some(notifier),
+                        status.clone(),
+                    )
+                    .await
+                    {
+                        *status.lock().expect("lock MCP status") = mcp::McpStatus {
+                            running: false,
+                            endpoint: None,
+                            error: Some(error),
+                        };
+                    }
+                    refresh_tray(
+                        &server_app,
+                        &config,
+                        &status.lock().expect("lock MCP status"),
+                    );
+                    let _ = server_app.emit("mcp-status-changed", ());
+                });
+            })
+            .expect("spawn Odo MCP thread");
+    }
+}
+
+struct TrayHandles {
+    toggle: CheckMenuItem<tauri::Wry>,
+    status: MenuItem<tauri::Wry>,
+}
+
+fn refresh_tray(app: &AppHandle, config: &mcp::McpConfig, status: &mcp::McpStatus) {
+    let Some(handles) = app.try_state::<TrayHandles>() else {
+        return;
+    };
+    let _ = handles.toggle.set_checked(config.enabled);
+    let text = if let Some(error) = &status.error {
+        format!("MCP error: {}", error.chars().take(54).collect::<String>())
+    } else if let Some(endpoint) = &status.endpoint {
+        format!("MCP running — {endpoint}")
+    } else if config.enabled {
+        "MCP starting…".into()
+    } else {
+        "MCP stopped".into()
+    };
+    let _ = handles.status.set_text(text);
+    if let Some(tray) = app.tray_by_id("odo-menu") {
+        let _ = tray.set_tooltip(Some(if status.running {
+            "Odo — MCP running"
+        } else {
+            "Odo — MCP stopped"
+        }));
+    }
+}
+
+fn show_main(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn toggle_mcp_from_tray(app: &AppHandle) {
+    let runtime = app.state::<McpRuntime>();
+    if let Ok(mut config) = mcp::load_config(&runtime.database_path) {
+        config.enabled = !config.enabled;
+        if mcp::save_config(&runtime.database_path, &config).is_ok() {
+            runtime.restart(app, config);
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpSettingsResponse {
+    config: mcp::McpConfig,
+    status: mcp::McpStatus,
+    masked_token: String,
+    http_snippet: String,
+    stdio_snippet: String,
+}
+
+fn masked_token(token: &str) -> String {
+    if token.len() <= 8 {
+        return "•".repeat(token.len().max(8));
+    }
+    format!(
+        "{}{}{}",
+        &token[..4],
+        "•".repeat(12),
+        &token[token.len() - 4..]
+    )
+}
+
+#[tauri::command]
+fn get_mcp_settings(runtime: tauri::State<'_, McpRuntime>) -> Result<McpSettingsResponse, String> {
+    let config = mcp::load_config(&runtime.database_path)?;
+    let status = runtime.status.lock().expect("lock MCP status").clone();
+    let endpoint = status
+        .endpoint
+        .clone()
+        .unwrap_or_else(|| format!("http://{}:{}/mcp", config.host, config.port));
+    let http_value = if config.auth_enabled {
+        json!({"mcpServers":{"odo":{"url":endpoint,"headers":{"Authorization":format!("Bearer {}",config.token)}}}})
+    } else {
+        json!({"mcpServers":{"odo":{"url":endpoint}}})
+    };
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not locate the Odo executable: {error}"))?;
+    let stdio_value = json!({"mcpServers":{"odo":{"command":executable,"args":["--mcp-stdio"],"env":{"ODO_DATABASE_PATH":runtime.database_path}}}});
+    Ok(McpSettingsResponse {
+        masked_token: masked_token(&config.token),
+        http_snippet: serde_json::to_string_pretty(&http_value)
+            .map_err(|error| error.to_string())?,
+        stdio_snippet: serde_json::to_string_pretty(&stdio_value)
+            .map_err(|error| error.to_string())?,
+        config,
+        status,
+    })
+}
+
+#[tauri::command]
+fn update_mcp_settings(
+    app: AppHandle,
+    runtime: tauri::State<'_, McpRuntime>,
+    config: mcp::McpConfig,
+) -> Result<(), String> {
+    if config.auth_enabled && config.token.trim().is_empty() {
+        return Err("Authentication is enabled, so a token is required".into());
+    }
+    if config.start_at_login {
+        app.autolaunch()
+            .enable()
+            .map_err(|error| format!("Could not enable start at login: {error}"))?;
+    } else {
+        app.autolaunch()
+            .disable()
+            .map_err(|error| format!("Could not disable start at login: {error}"))?;
+    }
+    mcp::save_config(&runtime.database_path, &config)?;
+    runtime.restart(&app, config);
+    Ok(())
+}
+
+#[tauri::command]
+fn generate_mcp_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+#[tauri::command]
+fn get_mcp_change_version(runtime: tauri::State<'_, McpRuntime>) -> Result<i64, String> {
+    mcp::change_version(&runtime.database_path)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let database_path = database_path(&handle).map_err(std::io::Error::other)?;
+            let connection = open_database(&handle).map_err(std::io::Error::other)?;
+            mcp::ensure_support_schema(&connection).map_err(std::io::Error::other)?;
+            app.manage(McpRuntime::new(database_path.clone()));
+
+            let open_item = MenuItem::with_id(app, "open", "Open Odo", true, None::<&str>)?;
+            let settings_item =
+                MenuItem::with_id(app, "settings", "Open Settings", true, None::<&str>)?;
+            let separator_one = PredefinedMenuItem::separator(app)?;
+            let config = mcp::load_config(&database_path).map_err(std::io::Error::other)?;
+            let toggle_item = CheckMenuItem::with_id(
+                app,
+                "toggle-mcp",
+                "MCP Server",
+                true,
+                config.enabled,
+                None::<&str>,
+            )?;
+            let status_item =
+                MenuItem::with_id(app, "mcp-status", "MCP stopped", false, None::<&str>)?;
+            let separator_two = PredefinedMenuItem::separator(app)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit Odo", true, None::<&str>)?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &open_item,
+                    &settings_item,
+                    &separator_one,
+                    &toggle_item,
+                    &status_item,
+                    &separator_two,
+                    &quit_item,
+                ],
+            )?;
+            let tray = TrayIconBuilder::with_id("odo-menu")
+                .icon(app.default_window_icon().expect("Odo app icon").clone())
+                .icon_as_template(true)
+                .tooltip("Odo")
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show_main(app),
+                    "settings" => {
+                        show_main(app);
+                        let _ = app.emit("open-settings", ());
+                    }
+                    "toggle-mcp" => toggle_mcp_from_tray(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+            let _ = tray;
+            app.manage(TrayHandles {
+                toggle: toggle_item,
+                status: status_item,
+            });
+            app.state::<McpRuntime>().restart(&handle, config);
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             load_workspace,
             save_workspace,
@@ -679,10 +1084,26 @@ pub fn run() {
             attach_note_to_main,
             create_backup,
             get_storage_info,
-            export_note
+            export_note,
+            get_mcp_settings,
+            update_mcp_settings,
+            generate_mcp_token,
+            get_mcp_change_version
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|app, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } = event
+        {
+            if !has_visible_windows {
+                show_main(app);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -714,7 +1135,10 @@ mod tests {
         assert_eq!(workspace.todos.len(), 1);
         assert_eq!(workspace.notes[0].title, "Test");
         assert_eq!(workspace.todos[0].text, "Ship it");
-        assert_eq!(workspace.todos[0].scheduled_start.as_deref(), Some("2026-07-15T09:00:00.000Z"));
+        assert_eq!(
+            workspace.todos[0].scheduled_start.as_deref(),
+            Some("2026-07-15T09:00:00.000Z")
+        );
         assert_eq!(workspace.todos[0].duration_minutes, 90);
         assert_eq!(workspace.todo_categories.len(), 2);
         assert_eq!(workspace.journal_entries.len(), 1);
