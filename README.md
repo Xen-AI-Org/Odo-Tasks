@@ -1,6 +1,17 @@
-# Odo Tasks
+# Odo Notes
 
-A desktop task application built with [Tauri 2](https://v2.tauri.app/), TypeScript, Vite, and Rust. The project uses [OpenSpec](https://github.com/Fission-AI/OpenSpec) for spec-driven development.
+A calm, local-first Markdown notes workspace built with [Tauri 2](https://v2.tauri.app/), TypeScript, Vite, and Rust.
+
+![Odo notes workspace](docs/qa/implementation-final.png)
+
+## Highlights
+
+- Nested folders and a fast, searchable notes list
+- Markdown-first editor with formatting controls and a `/` block menu
+- Obsidian-style `-` lists and `- []` todo normalization
+- Note and folder creation, sorting, archive/trash views, and focus mode
+- Autosave and local workspace persistence
+- Keyboard shortcuts for search, creation, saving, and focus mode
 
 ## Prerequisites
 
