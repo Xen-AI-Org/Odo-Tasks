@@ -23,7 +23,7 @@ The desktop app includes an MCP server with both standard local transports:
 
 Open **Settings → Odo MCP Server** to start or stop the server, change the bind address or preferred port, enable an optional bearer token, allow permanent deletion, configure start-at-login, and copy client configuration snippets. Closing the main window keeps Odo and an enabled HTTP server running in the menu bar.
 
-The MCP surface includes revision-safe note operations, nested folder management, planner and Markdown tasks, journal entries, search, atomic batches, backups, resources with subscriptions, five workflow prompts, and a redacted activity log retained for 60 days. Permanent note deletion is disabled separately by default.
+The MCP surface includes revision-safe note operations, nested folder management with a strict 50-icon allowlist, planner and Markdown tasks, journal entries, paginated search and list tools, atomic batches, backups, described Markdown resources with subscriptions, five described workflow prompts, and a redacted activity log retained for 60 days. Permanent note deletion is disabled separately by default.
 
 ## Prerequisites
 

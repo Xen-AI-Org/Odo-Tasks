@@ -286,6 +286,11 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
         .map_err(|error| format!("Could not prepare the workspace save: {error}"))?;
 
     for (position, folder) in workspace.folders.iter().enumerate() {
+        let icon = if folder.id == "inbox" {
+            "ph-tray"
+        } else {
+            mcp::normalize_folder_icon(folder.icon.as_deref())
+        };
         transaction
             .execute(
                 "INSERT INTO folders (id, name, parent_id, is_open, icon, position)
@@ -295,7 +300,7 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
                     folder.name,
                     folder.parent_id,
                     folder.open,
-                    folder.icon,
+                    icon,
                     position as i64
                 ],
             )
@@ -426,12 +431,19 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .map_err(|error| format!("Could not read folders: {error}"))?;
     let folders = folder_statement
         .query_map([], |row| {
+            let id = row.get::<_, String>(0)?;
+            let stored_icon = row.get::<_, Option<String>>(4)?;
+            let icon = if id == "inbox" {
+                Some(stored_icon.unwrap_or_else(|| "ph-tray".into()))
+            } else {
+                Some(mcp::normalize_folder_icon(stored_icon.as_deref()).into())
+            };
             Ok(Folder {
-                id: row.get(0)?,
+                id,
                 name: row.get(1)?,
                 parent_id: row.get(2)?,
                 open: row.get(3)?,
-                icon: row.get(4)?,
+                icon,
             })
         })
         .map_err(|error| format!("Could not query folders: {error}"))?

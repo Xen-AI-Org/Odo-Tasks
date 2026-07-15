@@ -33,6 +33,14 @@ const isMac = navigator.platform.toLowerCase().includes("mac");
 const modLabel = isMac ? "Cmd" : "Ctrl";
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 const now = () => new Date().toISOString();
+const ALLOWED_FOLDER_ICONS = new Set([
+  "ph-folder", "ph-briefcase", "ph-user-circle", "ph-book", "ph-book-open", "ph-notebook", "ph-file-text", "ph-lightbulb", "ph-star", "ph-heart",
+  "ph-house", "ph-buildings", "ph-bank", "ph-graduation-cap", "ph-flask", "ph-code", "ph-terminal-window", "ph-globe", "ph-map-pin", "ph-airplane",
+  "ph-car", "ph-bicycle", "ph-camera", "ph-image", "ph-music-note", "ph-film-strip", "ph-game-controller", "ph-palette", "ph-paint-brush", "ph-tree",
+  "ph-leaf", "ph-flower", "ph-sun", "ph-moon", "ph-cloud", "ph-mountains", "ph-coffee", "ph-cooking-pot", "ph-barbell", "ph-basketball",
+  "ph-soccer-ball", "ph-paw-print", "ph-gift", "ph-shopping-bag", "ph-currency-dollar", "ph-chart-line-up", "ph-calendar-blank", "ph-clock", "ph-tag", "ph-planet",
+]);
+const safeFolderIcon = (icon: string | undefined, isInbox = false) => isInbox ? "ph-tray" : icon && ALLOWED_FOLDER_ICONS.has(icon) ? icon : "ph-folder";
 
 const starterFolders: Folder[] = [
   { id: "inbox", name: "Inbox", parentId: null, open: true, icon: "ph-tray" },
@@ -51,7 +59,7 @@ const escapeHtml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g,
 const attr = escapeHtml;
 function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Workspace {
   const fallback = starterWorkspace();
-  const folders = Array.isArray(input?.folders) ? input.folders : fallback.folders;
+  const folders = (Array.isArray(input?.folders) ? input.folders : fallback.folders).map((folder) => ({ ...folder, icon: safeFolderIcon(folder.icon, folder.id === "inbox") }));
   if (!folders.some((folder) => folder.id === "inbox")) folders.unshift({ id: "inbox", name: "Inbox", parentId: null, open: true, icon: "ph-tray" });
   const notes = (Array.isArray(input?.notes) ? input.notes : fallback.notes).map((note) => ({ ...note, revision: note.revision ?? 0 }));
   const sortMode: SortMode = input?.sortMode === "manual" || input?.sortMode === "oldest" ? input.sortMode : "newest";
@@ -184,7 +192,7 @@ async function restoreDesktopWorkspace() {
 function renderFolder(folder: Folder, depth = 0): string {
   const children = state.folders.filter((candidate) => candidate.parentId === folder.id);
   const toggle = children.length ? `<button class="folder-toggle" data-toggle-folder="${attr(folder.id)}" aria-label="${folder.open ? "Collapse" : "Expand"} ${attr(folder.name)}"><i class="ph ph-caret-${folder.open ? "down" : "right"}"></i></button>` : '<span class="folder-toggle-spacer"></span>';
-  return `<div class="folder-branch"><div class="folder-row ${currentView === "notes" && state.selectedFolderId === folder.id ? "is-selected" : ""}" data-folder-id="${attr(folder.id)}" data-drop-kind="folder" data-drop-id="${attr(folder.id)}" style="--depth:${depth}" role="button" tabindex="0" aria-dropeffect="move" aria-label="Move a note to ${attr(folder.name)}. ${folderCount(folder.id)} notes">${toggle}<i class="ph ${folder.icon ?? "ph-folder"} folder-icon"></i><span class="folder-name">${escapeHtml(folder.name)}</span><span class="folder-count">${folderCount(folder.id)}</span><span class="drop-cue" aria-hidden="true">Move here</span><button class="row-more" data-folder-menu="${attr(folder.id)}" aria-label="Folder actions"><i class="ph ph-dots-three"></i></button></div>${folder.open ? children.map((child) => renderFolder(child, depth + 1)).join("") : ""}</div>`;
+  return `<div class="folder-branch"><div class="folder-row ${currentView === "notes" && state.selectedFolderId === folder.id ? "is-selected" : ""}" data-folder-id="${attr(folder.id)}" data-drop-kind="folder" data-drop-id="${attr(folder.id)}" style="--depth:${depth}" role="button" tabindex="0" aria-dropeffect="move" aria-label="Move a note to ${attr(folder.name)}. ${folderCount(folder.id)} notes">${toggle}<i class="ph ${safeFolderIcon(folder.icon, folder.id === "inbox")} folder-icon"></i><span class="folder-name">${escapeHtml(folder.name)}</span><span class="folder-count">${folderCount(folder.id)}</span><span class="drop-cue" aria-hidden="true">Move here</span><button class="row-more" data-folder-menu="${attr(folder.id)}" aria-label="Folder actions"><i class="ph ph-dots-three"></i></button></div>${folder.open ? children.map((child) => renderFolder(child, depth + 1)).join("") : ""}</div>`;
 }
 function renderSidebar() {
   const remaining = state.todos.filter((todo) => !todo.completed).length;

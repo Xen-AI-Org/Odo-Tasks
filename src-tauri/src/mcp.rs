@@ -13,7 +13,7 @@ use rmcp::{
     },
     model::*,
     prompt, prompt_handler, prompt_router,
-    schemars::JsonSchema,
+    schemars::{JsonSchema, Schema, SchemaGenerator},
     service::{Peer, RequestContext},
     tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
@@ -24,6 +24,93 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const CONFIG_KEY: &str = "mcp_config_v1";
 const RETENTION_SECONDS: i64 = 60 * 24 * 60 * 60;
+pub const DEFAULT_FOLDER_ICON: &str = "ph-folder";
+pub const ALLOWED_FOLDER_ICONS: [&str; 50] = [
+    "ph-folder",
+    "ph-briefcase",
+    "ph-user-circle",
+    "ph-book",
+    "ph-book-open",
+    "ph-notebook",
+    "ph-file-text",
+    "ph-lightbulb",
+    "ph-star",
+    "ph-heart",
+    "ph-house",
+    "ph-buildings",
+    "ph-bank",
+    "ph-graduation-cap",
+    "ph-flask",
+    "ph-code",
+    "ph-terminal-window",
+    "ph-globe",
+    "ph-map-pin",
+    "ph-airplane",
+    "ph-car",
+    "ph-bicycle",
+    "ph-camera",
+    "ph-image",
+    "ph-music-note",
+    "ph-film-strip",
+    "ph-game-controller",
+    "ph-palette",
+    "ph-paint-brush",
+    "ph-tree",
+    "ph-leaf",
+    "ph-flower",
+    "ph-sun",
+    "ph-moon",
+    "ph-cloud",
+    "ph-mountains",
+    "ph-coffee",
+    "ph-cooking-pot",
+    "ph-barbell",
+    "ph-basketball",
+    "ph-soccer-ball",
+    "ph-paw-print",
+    "ph-gift",
+    "ph-shopping-bag",
+    "ph-currency-dollar",
+    "ph-chart-line-up",
+    "ph-calendar-blank",
+    "ph-clock",
+    "ph-tag",
+    "ph-planet",
+];
+
+pub fn normalize_folder_icon(icon: Option<&str>) -> &'static str {
+    icon.and_then(|value| {
+        ALLOWED_FOLDER_ICONS
+            .iter()
+            .copied()
+            .find(|allowed| *allowed == value)
+    })
+    .unwrap_or(DEFAULT_FOLDER_ICON)
+}
+
+fn validate_folder_icon(icon: Option<String>) -> Result<String, String> {
+    match icon {
+        Some(icon) if ALLOWED_FOLDER_ICONS.contains(&icon.as_str()) => Ok(icon),
+        Some(icon) => Err(format!(
+            "Folder icon '{icon}' is not allowed. Use one of the 50 values returned by folders_list.allowedIcons; action icons such as archive, trash, delete, add, and edit are reserved."
+        )),
+        None => Ok(DEFAULT_FOLDER_ICON.into()),
+    }
+}
+
+fn folder_icon_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<String>::json_schema(generator);
+    schema.insert(
+        "enum".into(),
+        Value::Array(
+            ALLOWED_FOLDER_ICONS
+                .iter()
+                .map(|icon| Value::String((*icon).into()))
+                .collect(),
+        ),
+    );
+    schema
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,22 +138,12 @@ impl Default for McpConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpStatus {
     pub running: bool,
     pub endpoint: Option<String>,
     pub error: Option<String>,
-}
-
-impl Default for McpStatus {
-    fn default() -> Self {
-        Self {
-            running: false,
-            endpoint: None,
-            error: None,
-        }
-    }
 }
 
 pub fn default_database_path() -> Result<PathBuf, String> {
@@ -137,6 +214,44 @@ pub fn ensure_support_schema(connection: &Connection) -> Result<(), String> {
             [now_epoch() - RETENTION_SECONDS],
         )
         .map_err(|error| format!("Could not prune MCP activity: {error}"))?;
+    let folders_exist: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='folders')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not inspect folder storage: {error}"))?;
+    if folders_exist {
+        let mut statement = connection
+            .prepare("SELECT id, icon FROM folders WHERE id <> 'inbox'")
+            .map_err(|error| format!("Could not inspect folder icons: {error}"))?;
+        let invalid_ids = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|error| format!("Could not read folder icons: {error}"))?
+            .filter_map(|row| match row {
+                Ok((id, icon))
+                    if normalize_folder_icon(icon.as_deref()) == DEFAULT_FOLDER_ICON
+                        && icon.as_deref() != Some(DEFAULT_FOLDER_ICON) =>
+                {
+                    Some(Ok(id))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Could not decode folder icons: {error}"))?;
+        drop(statement);
+        for id in invalid_ids {
+            connection
+                .execute(
+                    "UPDATE folders SET icon=?2 WHERE id=?1",
+                    params![id, DEFAULT_FOLDER_ICON],
+                )
+                .map_err(|error| format!("Could not normalize a folder icon: {error}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -234,7 +349,16 @@ pub struct ListNotesArgs {
     pub status: Option<String>,
     pub query: Option<String>,
     pub limit: Option<u32>,
+    pub offset: Option<u32>,
     pub include_content: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetNoteArgs {
+    /// Exact note ID. Provide either id or title, but not both.
+    pub id: Option<String>,
+    /// Case-insensitive exact title. If multiple notes share the title, use id instead.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -272,6 +396,8 @@ pub struct ModifyNoteArgs {
 pub struct CreateFolderArgs {
     pub name: String,
     pub parent_id: Option<String>,
+    /// Optional icon from the exact 50-value allowlist returned by folders_list.allowedIcons. Action icons are reserved.
+    #[schemars(schema_with = "folder_icon_schema")]
     pub icon: Option<String>,
 }
 
@@ -281,6 +407,8 @@ pub struct UpdateFolderArgs {
     pub id: String,
     pub name: Option<String>,
     pub parent_id: Option<String>,
+    /// Optional replacement icon from the exact 50-value allowlist returned by folders_list.allowedIcons. Action icons are reserved.
+    #[schemars(schema_with = "folder_icon_schema")]
     pub icon: Option<String>,
 }
 
@@ -291,6 +419,10 @@ pub struct ListTasksArgs {
     pub category_id: Option<String>,
     pub scheduled_from: Option<String>,
     pub scheduled_to: Option<String>,
+    /// Case-insensitive substring filter over task text.
+    pub query: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -347,6 +479,12 @@ pub struct JournalArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct JournalDateArgs {
+    pub date_key: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct MarkdownTaskArgs {
     pub note_id: String,
     pub line: u32,
@@ -358,18 +496,22 @@ pub struct MarkdownTaskArgs {
 pub struct SearchArgs {
     pub query: String,
     pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ActivityArgs {
     pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchOperation {
+    /// Required discriminator. Set to notes.create, notes.update, notes.move, notes.status, notes.pin, tasks.create, tasks.complete, or tasks.delete.
     pub operation: String,
     pub id: Option<String>,
+    /// Required for notes.update, notes.move, notes.status, and notes.pin; obtain it from notes_get, notes_list, or search.
     pub expected_revision: Option<i64>,
     pub folder_id: Option<String>,
     pub status: Option<String>,
@@ -456,6 +598,83 @@ impl OdoMcp {
             })),
         ).optional().map_err(|error| format!("Could not read note: {error}"))?
             .ok_or_else(|| format!("Note '{id}' was not found"))
+    }
+
+    fn note_json_by_title(connection: &Connection, title: &str) -> Result<Value, String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT id FROM notes WHERE title = ?1 COLLATE NOCASE ORDER BY updated DESC LIMIT 2",
+            )
+            .map_err(|error| format!("Could not find note by title: {error}"))?;
+        let ids = statement
+            .query_map([title], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("Could not search note titles: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Could not decode note matches: {error}"))?;
+        match ids.as_slice() {
+            [] => Err(format!("No note with the exact title '{title}' was found")),
+            [id] => Self::note_json(connection, id),
+            ids => Err(format!(
+                "Multiple notes have the title '{title}'. Call notes_get with one of these IDs instead: {}",
+                ids.join(", ")
+            )),
+        }
+    }
+
+    fn task_json(connection: &Connection, id: &str) -> Result<Value, String> {
+        connection
+            .query_row(
+                "SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes FROM todos WHERE id=?1",
+                [id],
+                |row| Ok(json!({
+                    "id":row.get::<_,String>(0)?,"text":row.get::<_,String>(1)?,"completed":row.get::<_,bool>(2)?,
+                    "created":row.get::<_,String>(3)?,"updated":row.get::<_,String>(4)?,"categoryId":row.get::<_,String>(5)?,
+                    "priority":row.get::<_,String>(6)?,"effort":row.get::<_,i64>(7)?,"color":row.get::<_,String>(8)?,
+                    "scheduledStart":row.get::<_,Option<String>>(9)?,"durationMinutes":row.get::<_,i64>(10)?
+                })),
+            )
+            .optional()
+            .map_err(|error| format!("Could not read task: {error}"))?
+            .ok_or_else(|| format!("Task '{id}' was not found"))
+    }
+
+    fn folder_json(connection: &Connection, id: &str) -> Result<Value, String> {
+        connection
+            .query_row(
+                "SELECT f.id,f.name,f.parent_id,f.icon,f.position,COUNT(n.id) FROM folders f LEFT JOIN notes n ON n.folder_id=f.id WHERE f.id=?1 GROUP BY f.id",
+                [id],
+                |row| {
+                    let folder_id = row.get::<_, String>(0)?;
+                    let stored_icon = row.get::<_, Option<String>>(3)?;
+                    let icon = if folder_id == "inbox" {
+                        stored_icon.unwrap_or_else(|| "ph-tray".into())
+                    } else {
+                        normalize_folder_icon(stored_icon.as_deref()).into()
+                    };
+                    Ok(json!({
+                        "id":folder_id,"name":row.get::<_,String>(1)?,"parentId":row.get::<_,Option<String>>(2)?,
+                        "icon":icon,"position":row.get::<_,i64>(4)?,"noteCount":row.get::<_,i64>(5)?
+                    }))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Could not read folder: {error}"))?
+            .ok_or_else(|| format!("Folder '{id}' was not found"))
+    }
+
+    fn category_json(connection: &Connection, id: &str) -> Result<Value, String> {
+        connection
+            .query_row(
+                "SELECT id,name,color,icon,position FROM todo_categories WHERE id=?1",
+                [id],
+                |row| Ok(json!({
+                    "id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"color":row.get::<_,String>(2)?,
+                    "icon":row.get::<_,String>(3)?,"position":row.get::<_,i64>(4)?
+                })),
+            )
+            .optional()
+            .map_err(|error| format!("Could not read category: {error}"))?
+            .ok_or_else(|| format!("Category '{id}' was not found"))
     }
 
     fn update_note_inner(&self, args: UpdateNoteArgs) -> Result<Value, String> {
@@ -552,29 +771,68 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Search note titles/content, planner tasks, and journal entries; returns compact matches"
+        description = "Search note titles/content, planner-task text, and journal content. query must contain at least one non-whitespace character. Results are globally ordered by most recent update and paginated with limit (default 50, max 200) and offset (default 0)."
     )]
     async fn search(
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
         tool_result((|| {
+            let query = args.query.trim();
+            if query.is_empty() {
+                return Err("query must not be empty".into());
+            }
             let c = self.connection()?;
-            let pattern = format!("%{}%", args.query);
-            let limit = args.limit.unwrap_or(50).min(200) as i64;
-            let mut results = Vec::new();
-            let mut s=c.prepare("SELECT id,title,substr(content,1,240),status,revision FROM notes WHERE title LIKE ?1 OR content LIKE ?1 ORDER BY updated DESC LIMIT ?2").map_err(|e|e.to_string())?;
-            for row in s.query_map(params![pattern,limit],|r|Ok(json!({"kind":"note","id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"excerpt":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"revision":r.get::<_,i64>(4)?}))).map_err(|e|e.to_string())? { results.push(row.map_err(|e|e.to_string())?); }
-            let mut s=c.prepare("SELECT id,text,completed,scheduled_start FROM todos WHERE text LIKE ?1 ORDER BY updated DESC LIMIT ?2").map_err(|e|e.to_string())?;
-            for row in s.query_map(params![pattern,limit],|r|Ok(json!({"kind":"task","id":r.get::<_,String>(0)?,"text":r.get::<_,String>(1)?,"completed":r.get::<_,bool>(2)?,"scheduledStart":r.get::<_,Option<String>>(3)?}))).map_err(|e|e.to_string())? { results.push(row.map_err(|e|e.to_string())?); }
-            let mut s=c.prepare("SELECT id,date_key,substr(content,1,240) FROM journal_entries WHERE content LIKE ?1 ORDER BY date_key DESC LIMIT ?2").map_err(|e|e.to_string())?;
-            for row in s.query_map(params![pattern,limit],|r|Ok(json!({"kind":"journal","id":r.get::<_,String>(0)?,"dateKey":r.get::<_,String>(1)?,"excerpt":r.get::<_,String>(2)?}))).map_err(|e|e.to_string())? { results.push(row.map_err(|e|e.to_string())?); }
-            Ok(json!({"query":args.query,"results":results}))
+            let pattern = format!("%{query}%");
+            let limit = args.limit.unwrap_or(50).clamp(1, 200);
+            let offset = args.offset.unwrap_or(0);
+            let mut statement = c.prepare(
+                "SELECT kind,id,label,excerpt,status,revision,completed,scheduled_start,date_key FROM (
+                   SELECT 'note' AS kind,id,title AS label,substr(content,1,240) AS excerpt,status,revision,NULL AS completed,NULL AS scheduled_start,NULL AS date_key,updated AS sort_key
+                   FROM notes WHERE title LIKE ?1 OR content LIKE ?1
+                   UNION ALL
+                   SELECT 'task',id,text,NULL,NULL,NULL,completed,scheduled_start,NULL,updated
+                   FROM todos WHERE text LIKE ?1
+                   UNION ALL
+                   SELECT 'journal',id,date_key,substr(content,1,240),NULL,NULL,NULL,NULL,date_key,updated
+                   FROM journal_entries WHERE content LIKE ?1 OR date_key LIKE ?1
+                 ) ORDER BY sort_key DESC,id LIMIT ?2 OFFSET ?3"
+            ).map_err(|error| error.to_string())?;
+            let mut results = statement
+                .query_map(params![pattern, i64::from(limit) + 1, i64::from(offset)], |row| {
+                    let kind = row.get::<_, String>(0)?;
+                    let id = row.get::<_, String>(1)?;
+                    let label = row.get::<_, String>(2)?;
+                    let excerpt = row.get::<_, Option<String>>(3)?;
+                    Ok(match kind.as_str() {
+                        "note" => json!({
+                            "kind":"note","id":id,"title":label,"excerpt":excerpt.unwrap_or_default(),
+                            "status":row.get::<_,Option<String>>(4)?,"revision":row.get::<_,Option<i64>>(5)?
+                        }),
+                        "task" => json!({
+                            "kind":"task","id":id,"text":label,"completed":row.get::<_,Option<bool>>(6)?.unwrap_or(false),
+                            "scheduledStart":row.get::<_,Option<String>>(7)?
+                        }),
+                        _ => json!({
+                            "kind":"journal","id":id,"dateKey":row.get::<_,Option<String>>(8)?.unwrap_or(label),
+                            "excerpt":excerpt.unwrap_or_default()
+                        }),
+                    })
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            let has_more = results.len() > limit as usize;
+            results.truncate(limit as usize);
+            Ok(json!({
+                "query":query,"results":results,"limit":limit,"offset":offset,"hasMore":has_more,
+                "nextOffset":if has_more { Some(offset + limit) } else { None }
+            }))
         })())
     }
 
     #[tool(
-        description = "Apply multiple backend mutations atomically. Supported operations: notes.create, notes.update, notes.move, notes.status, notes.pin, tasks.create, tasks.complete, tasks.delete"
+        description = "Apply multiple backend mutations atomically. Each object in operations requires an operation field set to one of: notes.create, notes.update, notes.move, notes.status, notes.pin, tasks.create, tasks.complete, tasks.delete. notes.update, notes.move, notes.status, and notes.pin also require expectedRevision from the latest notes_get, notes_list, or search result; the whole batch is rejected on a missing or stale revision."
     )]
     async fn batch_apply(
         &self,
@@ -681,18 +939,25 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "List the complete nested folder model with parent IDs, icons, and direct note counts"
+        description = "List the complete nested folder model with parent IDs, validated icons, direct note counts, and allowedIcons: the exact 50 folder icon values accepted by folders_create and folders_update. Action icons used by Odo navigation or mutations are intentionally excluded."
     )]
     async fn folders_list(&self) -> Result<CallToolResult, McpError> {
         tool_result((|| {
             let c = self.connection()?;
             let mut s=c.prepare("SELECT f.id,f.name,f.parent_id,f.icon,f.position,COUNT(n.id) FROM folders f LEFT JOIN notes n ON n.folder_id=f.id GROUP BY f.id ORDER BY f.position").map_err(|e|e.to_string())?;
-            let rows=s.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"parentId":r.get::<_,Option<String>>(2)?,"icon":r.get::<_,Option<String>>(3)?,"position":r.get::<_,i64>(4)?,"noteCount":r.get::<_,i64>(5)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
-            Ok(json!({"folders":rows}))
+            let rows=s.query_map([],|r|{
+                let id=r.get::<_,String>(0)?;
+                let stored=r.get::<_,Option<String>>(3)?;
+                let icon=if id=="inbox"{stored.unwrap_or_else(||"ph-tray".into())}else{normalize_folder_icon(stored.as_deref()).into()};
+                Ok(json!({"id":id,"name":r.get::<_,String>(1)?,"parentId":r.get::<_,Option<String>>(2)?,"icon":icon,"position":r.get::<_,i64>(4)?,"noteCount":r.get::<_,i64>(5)?}))
+            }).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+            Ok(json!({"folders":rows,"allowedIcons":ALLOWED_FOLDER_ICONS.as_slice()}))
         })())
     }
 
-    #[tool(description = "Create a folder, optionally nested under another folder")]
+    #[tool(
+        description = "Create a folder, optionally nested under another folder, and return the complete created folder object. icon defaults to ph-folder and must be one of the exact 50 values from folders_list.allowedIcons; archive, trash, delete, add, edit, and other action icons are reserved and rejected."
+    )]
     async fn folders_create(
         &self,
         Parameters(args): Parameters<CreateFolderArgs>,
@@ -702,8 +967,9 @@ impl OdoMcp {
             if args.name.trim().is_empty() {
                 return Err("Folder name cannot be empty".into());
             }
+            let icon = validate_folder_icon(args.icon)?;
             let id = format!("folder-{}", uuid::Uuid::new_v4());
-            c.execute("INSERT INTO folders(id,name,parent_id,is_open,icon,position) VALUES(?1,?2,?3,1,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM folders))",params![id,args.name.trim(),args.parent_id,args.icon]).map_err(|e|format!("Could not create folder: {e}"))?;
+            c.execute("INSERT INTO folders(id,name,parent_id,is_open,icon,position) VALUES(?1,?2,?3,1,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM folders))",params![id,args.name.trim(),args.parent_id,icon]).map_err(|e|format!("Could not create folder: {e}"))?;
             bump_change(&c)?;
             audit(
                 &c,
@@ -713,7 +979,7 @@ impl OdoMcp {
                 "success",
                 "",
             );
-            Ok(json!({"id":id}))
+            Self::folder_json(&c, &id)
         })();
         if result.is_ok() {
             self.changed(&["odo://folders".into(), "odo://workspace".into()])
@@ -722,7 +988,9 @@ impl OdoMcp {
         tool_result(result)
     }
 
-    #[tool(description = "Rename, move, or change the icon of an existing folder")]
+    #[tool(
+        description = "Rename, move, or change the icon of an existing folder and return the complete updated folder object. A supplied icon must be one of the exact 50 values from folders_list.allowedIcons; action icons are reserved and rejected."
+    )]
     async fn folders_update(
         &self,
         Parameters(args): Parameters<UpdateFolderArgs>,
@@ -740,7 +1008,11 @@ impl OdoMcp {
                 .ok_or_else(|| "Folder not found".to_string())?;
             let name = args.name.unwrap_or(current.0);
             let parent = args.parent_id.or(current.1);
-            let icon = args.icon.or(current.2);
+            let icon = match args.icon {
+                Some(icon) => validate_folder_icon(Some(icon))?,
+                None if args.id == "inbox" => current.2.unwrap_or_else(|| "ph-tray".into()),
+                None => normalize_folder_icon(current.2.as_deref()).into(),
+            };
             c.execute(
                 "UPDATE folders SET name=?2,parent_id=?3,icon=?4 WHERE id=?1",
                 params![args.id, name, parent, icon],
@@ -755,7 +1027,7 @@ impl OdoMcp {
                 "success",
                 "",
             );
-            Ok(json!({"id":args.id}))
+            Self::folder_json(&c, &args.id)
         })();
         if result.is_ok() {
             self.changed(&["odo://folders".into(), "odo://workspace".into()])
@@ -806,7 +1078,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "List notes with optional folder, status, text query, content inclusion, and bounded result count"
+        description = "List notes with optional folder, status, and text filters. Content is excluded by default and returned as null; set includeContent=true to include full Markdown. Results are ordered by most recently updated and paginated with limit (default 100, max 500) and offset (default 0)."
     )]
     async fn notes_list(
         &self,
@@ -814,6 +1086,8 @@ impl OdoMcp {
     ) -> Result<CallToolResult, McpError> {
         tool_result((|| {
             let c = self.connection()?;
+            let limit = args.limit.unwrap_or(100).clamp(1, 500);
+            let offset = args.offset.unwrap_or(0);
             let mut sql="SELECT id,folder_id,title,content,updated,status,pinned,revision FROM notes WHERE 1=1".to_string();
             let mut values: Vec<String> = vec![];
             if let Some(v) = args.folder_id {
@@ -830,25 +1104,37 @@ impl OdoMcp {
                 values.push(p.clone());
                 values.push(p)
             }
-            sql.push_str(" ORDER BY updated DESC LIMIT ?");
-            values.push(args.limit.unwrap_or(100).min(500).to_string());
+            sql.push_str(" ORDER BY updated DESC LIMIT ? OFFSET ?");
+            values.push((limit + 1).to_string());
+            values.push(offset.to_string());
             let mut s = c.prepare(&sql).map_err(|e| e.to_string())?;
-            let rows=s.query_map(rusqlite::params_from_iter(values.iter()),|r|{let content:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"folderId":r.get::<_,String>(1)?,"title":r.get::<_,String>(2)?,"content":if args.include_content.unwrap_or(false){Value::String(content.clone())}else{Value::Null},"excerpt":content.chars().take(240).collect::<String>(),"updated":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"pinned":r.get::<_,bool>(6)?,"revision":r.get::<_,i64>(7)?}))}).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
-            Ok(json!({"notes":rows}))
+            let mut rows=s.query_map(rusqlite::params_from_iter(values.iter()),|r|{let content:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"folderId":r.get::<_,String>(1)?,"title":r.get::<_,String>(2)?,"content":if args.include_content.unwrap_or(false){Value::String(content.clone())}else{Value::Null},"excerpt":content.chars().take(240).collect::<String>(),"updated":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"pinned":r.get::<_,bool>(6)?,"revision":r.get::<_,i64>(7)?}))}).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+            let has_more = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            Ok(
+                json!({"notes":rows,"limit":limit,"offset":offset,"hasMore":has_more,"nextOffset":if has_more{Some(offset+limit)}else{None}}),
+            )
         })())
     }
 
     #[tool(
-        description = "Read a complete note including Markdown content and its revision required for safe updates"
+        description = "Read a complete note including Markdown content and the revision required for safe updates. Provide exactly one lookup field: id for an exact note ID, or title for a case-insensitive exact title. Duplicate titles are rejected with matching IDs so the caller can disambiguate."
     )]
     async fn notes_get(
         &self,
-        Parameters(args): Parameters<IdArgs>,
+        Parameters(args): Parameters<GetNoteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        tool_result(
-            self.connection()
-                .and_then(|c| Self::note_json(&c, &args.id)),
-        )
+        tool_result((|| {
+            let connection = self.connection()?;
+            match (args.id, args.title) {
+                (Some(id), None) if !id.trim().is_empty() => Self::note_json(&connection, &id),
+                (None, Some(title)) if !title.trim().is_empty() => {
+                    Self::note_json_by_title(&connection, title.trim())
+                }
+                (Some(_), Some(_)) => Err("Provide either id or title, not both".into()),
+                _ => Err("Provide a non-empty id or title".into()),
+            }
+        })())
     }
 
     #[tool(description = "Create a Markdown note in a folder; defaults to Inbox")]
@@ -1089,7 +1375,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "List planner tasks with completion, category, priority, effort, color, scheduling, and duration filters"
+        description = "List planner tasks with completion, category, scheduling, and case-insensitive text-query filters. Results preserve planner order and are paginated with limit (default 100, max 500) and offset (default 0)."
     )]
     async fn tasks_list(
         &self,
@@ -1097,15 +1383,45 @@ impl OdoMcp {
     ) -> Result<CallToolResult, McpError> {
         tool_result((|| {
             let c = self.connection()?;
-            let mut s=c.prepare("SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes FROM todos ORDER BY position").map_err(|e|e.to_string())?;
-            let mut rows = vec![];
-            for row in s.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"text":r.get::<_,String>(1)?,"completed":r.get::<_,bool>(2)?,"created":r.get::<_,String>(3)?,"updated":r.get::<_,String>(4)?,"categoryId":r.get::<_,String>(5)?,"priority":r.get::<_,String>(6)?,"effort":r.get::<_,i64>(7)?,"color":r.get::<_,String>(8)?,"scheduledStart":r.get::<_,Option<String>>(9)?,"durationMinutes":r.get::<_,i64>(10)?}))).map_err(|e|e.to_string())?{let v=row.map_err(|e|e.to_string())?;if args.completed.is_some_and(|x|v["completed"]!=x)||args.category_id.as_ref().is_some_and(|x|v["categoryId"]!=*x)||args.scheduled_from.as_ref().is_some_and(|x|v["scheduledStart"].as_str().is_none_or(|s|s<x.as_str()))||args.scheduled_to.as_ref().is_some_and(|x|v["scheduledStart"].as_str().is_none_or(|s|s>x.as_str())){continue}rows.push(v)}
-            Ok(json!({"tasks":rows}))
+            let limit = args.limit.unwrap_or(100).clamp(1, 500);
+            let offset = args.offset.unwrap_or(0);
+            let mut sql="SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes FROM todos WHERE 1=1".to_string();
+            let mut values: Vec<String> = vec![];
+            if let Some(completed) = args.completed {
+                sql.push_str(" AND completed=?");
+                values.push(if completed { "1" } else { "0" }.into());
+            }
+            if let Some(category) = args.category_id {
+                sql.push_str(" AND category_id=?");
+                values.push(category);
+            }
+            if let Some(from) = args.scheduled_from {
+                sql.push_str(" AND scheduled_start IS NOT NULL AND scheduled_start>=?");
+                values.push(from);
+            }
+            if let Some(to) = args.scheduled_to {
+                sql.push_str(" AND scheduled_start IS NOT NULL AND scheduled_start<=?");
+                values.push(to);
+            }
+            if let Some(query) = args.query.filter(|query| !query.trim().is_empty()) {
+                sql.push_str(" AND text LIKE ?");
+                values.push(format!("%{}%", query.trim()));
+            }
+            sql.push_str(" ORDER BY position LIMIT ? OFFSET ?");
+            values.push((limit + 1).to_string());
+            values.push(offset.to_string());
+            let mut statement = c.prepare(&sql).map_err(|error| error.to_string())?;
+            let mut rows=statement.query_map(rusqlite::params_from_iter(values.iter()),|r|Ok(json!({"id":r.get::<_,String>(0)?,"text":r.get::<_,String>(1)?,"completed":r.get::<_,bool>(2)?,"created":r.get::<_,String>(3)?,"updated":r.get::<_,String>(4)?,"categoryId":r.get::<_,String>(5)?,"priority":r.get::<_,String>(6)?,"effort":r.get::<_,i64>(7)?,"color":r.get::<_,String>(8)?,"scheduledStart":r.get::<_,Option<String>>(9)?,"durationMinutes":r.get::<_,i64>(10)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+            let has_more = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            Ok(
+                json!({"tasks":rows,"limit":limit,"offset":offset,"hasMore":has_more,"nextOffset":if has_more{Some(offset+limit)}else{None}}),
+            )
         })())
     }
 
     #[tool(
-        description = "Create a planner task with category, priority, effort, color, optional schedule, and duration"
+        description = "Create a planner task with category, priority, effort, color, optional schedule, and duration; returns the complete created task object"
     )]
     async fn tasks_create(
         &self,
@@ -1125,7 +1441,7 @@ impl OdoMcp {
                 "success",
                 "",
             );
-            Ok(json!({"id":id}))
+            Self::task_json(&c, &id)
         })();
         if result.is_ok() {
             self.changed(&["odo://tasks".into(), "odo://workspace".into()])
@@ -1134,7 +1450,9 @@ impl OdoMcp {
         tool_result(result)
     }
 
-    #[tool(description = "Update any planner task field, including completion and scheduling")]
+    #[tool(
+        description = "Update any planner task field, including completion and scheduling; returns the complete updated task object"
+    )]
     async fn tasks_update(
         &self,
         Parameters(args): Parameters<UpdateTaskArgs>,
@@ -1157,7 +1475,7 @@ impl OdoMcp {
                 "success",
                 "",
             );
-            Ok(json!({"id":args.id}))
+            Self::task_json(&c, &args.id)
         })();
         if result.is_ok() {
             self.changed(&["odo://tasks".into(), "odo://workspace".into()])
@@ -1211,7 +1529,9 @@ impl OdoMcp {
         })())
     }
 
-    #[tool(description = "Create a planner task category")]
+    #[tool(
+        description = "Create a planner task category and return the complete created category object"
+    )]
     async fn categories_create(
         &self,
         Parameters(args): Parameters<CategoryArgs>,
@@ -1231,7 +1551,7 @@ impl OdoMcp {
                 "success",
                 "",
             );
-            Ok(json!({"id":id}))
+            Self::category_json(&c, &id)
         })();
         if result.is_ok() {
             self.changed(&["odo://tasks".into()]).await;
@@ -1335,7 +1655,7 @@ impl OdoMcp {
     #[tool(description = "Read a journal entry for a YYYY-MM-DD date")]
     async fn journal_get(
         &self,
-        Parameters(args): Parameters<JournalArgs>,
+        Parameters(args): Parameters<JournalDateArgs>,
     ) -> Result<CallToolResult, McpError> {
         tool_result((|| {
             let c = self.connection()?;
@@ -1401,7 +1721,7 @@ impl OdoMcp {
     #[tool(description = "Delete a journal entry for a YYYY-MM-DD date")]
     async fn journal_delete(
         &self,
-        Parameters(args): Parameters<JournalArgs>,
+        Parameters(args): Parameters<JournalDateArgs>,
     ) -> Result<CallToolResult, McpError> {
         let result = (|| {
             let c = self.connection()?;
@@ -1436,51 +1756,74 @@ impl OdoMcp {
         tool_result(result)
     }
 
-    #[tool(description = "List the redacted MCP activity audit retained for the previous 60 days")]
+    #[tool(
+        description = "List the redacted MCP activity audit retained for the previous 60 days, newest first. Paginate with limit (default 100, max 1000) and offset (default 0)."
+    )]
     async fn activity_list(
         &self,
         Parameters(args): Parameters<ActivityArgs>,
     ) -> Result<CallToolResult, McpError> {
         tool_result((|| {
             let c = self.connection()?;
-            let mut s=c.prepare("SELECT id,created_at,transport,operation,target_id,outcome,detail FROM mcp_activity ORDER BY id DESC LIMIT ?1").map_err(|e|e.to_string())?;
-            let rows=s.query_map([args.limit.unwrap_or(100).min(1000)],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"createdAt":r.get::<_,i64>(1)?,"transport":r.get::<_,String>(2)?,"operation":r.get::<_,String>(3)?,"targetId":r.get::<_,Option<String>>(4)?,"outcome":r.get::<_,String>(5)?,"detail":r.get::<_,String>(6)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
-            Ok(json!({"retentionDays":60,"activity":rows}))
+            let limit = args.limit.unwrap_or(100).clamp(1, 1000);
+            let offset = args.offset.unwrap_or(0);
+            let mut s=c.prepare("SELECT id,created_at,transport,operation,target_id,outcome,detail FROM mcp_activity ORDER BY id DESC LIMIT ?1 OFFSET ?2").map_err(|e|e.to_string())?;
+            let mut rows=s.query_map(params![limit+1,offset],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"createdAt":r.get::<_,i64>(1)?,"transport":r.get::<_,String>(2)?,"operation":r.get::<_,String>(3)?,"targetId":r.get::<_,Option<String>>(4)?,"outcome":r.get::<_,String>(5)?,"detail":r.get::<_,String>(6)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+            let has_more = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            Ok(
+                json!({"retentionDays":60,"activity":rows,"limit":limit,"offset":offset,"hasMore":has_more,"nextOffset":if has_more{Some(offset+limit)}else{None}}),
+            )
         })())
     }
 }
 
 #[prompt_router]
 impl OdoMcp {
-    #[prompt(name = "daily_planning")]
+    #[prompt(
+        name = "daily_planning",
+        description = "Build a realistic prioritized day plan from today's Odo tasks and journal."
+    )]
     async fn daily_planning(
         &self,
         Parameters(args): Parameters<PromptArgs>,
     ) -> Result<Vec<PromptMessage>, McpError> {
         Ok(vec![PromptMessage::new_text(Role::User,format!("Review my Odo planner tasks and today's journal. Build a realistic daily plan with priorities, time blocks, and a small finish line. Focus: {}",args.focus.unwrap_or_else(||"balanced progress".into())))])
     }
-    #[prompt(name = "inbox_triage")]
+    #[prompt(
+        name = "inbox_triage",
+        description = "Organize Inbox notes and unscheduled tasks into folders, next actions, and safe archival suggestions."
+    )]
     async fn inbox_triage(
         &self,
         Parameters(args): Parameters<PromptArgs>,
     ) -> Result<Vec<PromptMessage>, McpError> {
         Ok(vec![PromptMessage::new_text(Role::User,format!("Review Odo Inbox notes and unscheduled planner tasks. Propose folders, task conversions, archival, and next actions without permanently deleting anything. Focus: {}",args.focus.unwrap_or_else(||"clarity".into())))])
     }
-    #[prompt(name = "weekly_review")]
+    #[prompt(
+        name = "weekly_review",
+        description = "Review the week's notes, tasks, and journal entries for wins, lessons, unfinished work, and next priorities."
+    )]
     async fn weekly_review(
         &self,
         Parameters(args): Parameters<PromptArgs>,
     ) -> Result<Vec<PromptMessage>, McpError> {
         Ok(vec![PromptMessage::new_text(Role::User,format!("Use this week's Odo notes, completed and open tasks, and journal entries to run a weekly review: wins, unfinished work, lessons, and next-week priorities. Focus: {}",args.focus.unwrap_or_else(||"sustainable momentum".into())))])
     }
-    #[prompt(name = "meeting_note_processing")]
+    #[prompt(
+        name = "meeting_note_processing",
+        description = "Turn an Odo meeting note into decisions, owners, deadlines, follow-ups, and planner tasks."
+    )]
     async fn meeting_note_processing(
         &self,
         Parameters(args): Parameters<PromptArgs>,
     ) -> Result<Vec<PromptMessage>, McpError> {
         Ok(vec![PromptMessage::new_text(Role::User,format!("Process the relevant Odo meeting note into decisions, owners, deadlines, follow-ups, and planner tasks. Preserve the original note. Focus: {}",args.focus.unwrap_or_else(||"clear accountability".into())))])
     }
-    #[prompt(name = "overdue_task_review")]
+    #[prompt(
+        name = "overdue_task_review",
+        description = "Triage overdue and unscheduled planner tasks into complete, reschedule, delegate, split, or delete recommendations."
+    )]
     async fn overdue_task_review(
         &self,
         Parameters(args): Parameters<PromptArgs>,
@@ -1505,12 +1848,12 @@ impl ServerHandler for OdoMcp {
     ) -> Result<ListResourcesResult, McpError> {
         Ok(ListResourcesResult {
             resources: vec![
-                Resource::new("odo://workspace", "Odo workspace summary"),
-                Resource::new("odo://folders", "Odo folder tree"),
-                Resource::new("odo://notes", "Odo notes index"),
-                Resource::new("odo://tasks", "Odo planner tasks"),
-                Resource::new("odo://journal", "Odo journal index"),
-                Resource::new("odo://activity", "Odo MCP activity (60 days)"),
+                Resource::new("odo://workspace", "Odo workspace summary").with_description("Counts for folders, notes, planner tasks, and journal entries in the local workspace.").with_mime_type("text/markdown"),
+                Resource::new("odo://folders", "Odo folder tree").with_description("The complete nested folder index with parent IDs and validated icons.").with_mime_type("text/markdown"),
+                Resource::new("odo://notes", "Odo notes index").with_description("A compact index of notes with folder, status, pin, timestamp, and revision metadata.").with_mime_type("text/markdown"),
+                Resource::new("odo://tasks", "Odo planner tasks").with_description("All planner tasks with completion, category, priority, effort, and scheduling metadata.").with_mime_type("text/markdown"),
+                Resource::new("odo://journal", "Odo journal index").with_description("A newest-first index of journal days with compact excerpts and timestamps.").with_mime_type("text/markdown"),
+                Resource::new("odo://activity", "Odo MCP activity (60 days)").with_description("The redacted MCP operation audit retained for the previous 60 days.").with_mime_type("text/markdown"),
             ],
             ..Default::default()
         })
@@ -1523,8 +1866,8 @@ impl ServerHandler for OdoMcp {
     ) -> Result<ListResourceTemplatesResult, McpError> {
         Ok(ListResourceTemplatesResult {
             resource_templates: vec![
-                ResourceTemplate::new("odo://notes/{id}", "Odo note"),
-                ResourceTemplate::new("odo://journal/{date}", "Odo journal day"),
+                ResourceTemplate::new("odo://notes/{id}", "Odo note").with_description("A complete note, including Markdown content and revision metadata, addressed by note ID.").with_mime_type("text/markdown"),
+                ResourceTemplate::new("odo://journal/{date}", "Odo journal day").with_description("A complete journal entry addressed by its YYYY-MM-DD date key.").with_mime_type("text/markdown"),
             ],
             ..Default::default()
         })
@@ -1593,10 +1936,15 @@ impl ServerHandler for OdoMcp {
             ))
         })();
         match result {
-            Ok(value) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                value.to_string(),
-                uri,
-            )])),
+            Ok(value) => {
+                let body =
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    format!("```json\n{body}\n```"),
+                    uri,
+                )
+                .with_mime_type("text/markdown")]))
+            }
             Err(message) => Err(McpError::resource_not_found(
                 message,
                 Some(json!({"uri":uri})),
@@ -1624,6 +1972,92 @@ impl ServerHandler for OdoMcp {
     ) -> Result<(), McpError> {
         self.subscribers.lock().await.remove(&request.uri);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn folder_icon_allowlist_has_50_unique_non_action_icons() {
+        assert_eq!(ALLOWED_FOLDER_ICONS.len(), 50);
+        assert_eq!(
+            ALLOWED_FOLDER_ICONS
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            50
+        );
+        for reserved in [
+            "ph-archive",
+            "ph-archive-tray",
+            "ph-trash",
+            "ph-trash-simple",
+            "ph-tray",
+            "ph-plus",
+            "ph-pencil",
+        ] {
+            assert!(!ALLOWED_FOLDER_ICONS.contains(&reserved));
+            assert!(validate_folder_icon(Some(reserved.into())).is_err());
+        }
+        for icon in ALLOWED_FOLDER_ICONS {
+            assert_eq!(validate_folder_icon(Some(icon.into())).unwrap(), icon);
+        }
+    }
+
+    #[test]
+    fn support_schema_normalizes_existing_invalid_folder_icons() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE folders (id TEXT PRIMARY KEY, icon TEXT);
+                 INSERT INTO folders(id,icon) VALUES ('inbox','ph-tray');
+                 INSERT INTO folders(id,icon) VALUES ('bad','ph-trash');
+                 INSERT INTO folders(id,icon) VALUES ('good','ph-book');",
+            )
+            .unwrap();
+        ensure_support_schema(&connection).unwrap();
+        let bad: String = connection
+            .query_row("SELECT icon FROM folders WHERE id='bad'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let good: String = connection
+            .query_row("SELECT icon FROM folders WHERE id='good'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let inbox: String = connection
+            .query_row("SELECT icon FROM folders WHERE id='inbox'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(bad, DEFAULT_FOLDER_ICON);
+        assert_eq!(good, "ph-book");
+        assert_eq!(inbox, "ph-tray");
+    }
+
+    #[test]
+    fn journal_read_schema_only_accepts_date_key() {
+        let schema = rmcp::schemars::schema_for!(JournalDateArgs);
+        let value = serde_json::to_value(schema).unwrap();
+        let properties = value["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 1);
+        assert!(properties.contains_key("dateKey"));
+    }
+
+    #[test]
+    fn folder_create_schema_exposes_the_exact_icon_enum() {
+        let schema = rmcp::schemars::schema_for!(CreateFolderArgs);
+        let value = serde_json::to_value(schema).unwrap();
+        let icons = value["properties"]["icon"]["enum"].as_array().unwrap();
+        assert_eq!(icons.len(), 50);
+        assert!(icons.contains(&Value::String("ph-folder".into())));
+        assert!(!icons.contains(&Value::String("ph-trash".into())));
     }
 }
 
