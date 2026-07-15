@@ -16,7 +16,7 @@ export default defineConfig(async () => ({
   // Vite's pre-bundler avoids a Node 25 optimizer crash on redirected
   // OneDrive workspaces while preserving normal dev-server behavior.
   optimizeDeps: {
-    exclude: ["@tauri-apps/api/core"],
+    exclude: ["@tauri-apps/api/core", "@tauri-apps/api/event"],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

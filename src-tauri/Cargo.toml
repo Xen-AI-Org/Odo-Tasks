@@ -1,6 +1,6 @@
 [package]
 name = "odo-tasks"
-version = "0.1.0"
+version = "0.1.1"
 description = "A desktop task application built with Tauri"
 authors = ["Odo Tasks contributors"]
 edition = "2021"

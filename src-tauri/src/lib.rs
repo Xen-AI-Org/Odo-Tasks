@@ -6,7 +6,7 @@ use std::{
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +29,8 @@ struct Note {
     status: String,
     #[serde(default)]
     pinned: bool,
+    #[serde(default)]
+    revision: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,6 +86,9 @@ fn backup_directory(app: &AppHandle) -> Result<PathBuf, String> {
 fn open_database(app: &AppHandle) -> Result<Connection, String> {
     let connection = Connection::open(database_path(app)?)
         .map_err(|error| format!("Could not open the workspace database: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("Could not configure the workspace database: {error}"))?;
     initialize_database(&connection)?;
     Ok(connection)
 }
@@ -126,6 +131,24 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
              );",
         )
         .map_err(|error| format!("Could not initialize the workspace database: {error}"))?;
+
+    let has_revision = connection
+        .prepare("PRAGMA table_info(notes)")
+        .and_then(|mut statement| {
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(columns.iter().any(|column| column == "revision"))
+        })
+        .map_err(|error| format!("Could not inspect the notes schema: {error}"))?;
+    if !has_revision {
+        connection
+            .execute(
+                "ALTER TABLE notes ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| format!("Could not upgrade the notes schema: {error}"))?;
+    }
     Ok(())
 }
 
@@ -137,7 +160,12 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
         .map_err(|error| format!("Could not start the save transaction: {error}"))?;
 
     transaction
-        .execute_batch("DELETE FROM folders; DELETE FROM notes; DELETE FROM todos;")
+        .execute_batch(
+            "DELETE FROM folders;
+             DELETE FROM todos;
+             CREATE TEMP TABLE IF NOT EXISTS incoming_note_ids (id TEXT PRIMARY KEY);
+             DELETE FROM incoming_note_ids;",
+        )
         .map_err(|error| format!("Could not prepare the workspace save: {error}"))?;
 
     for (position, folder) in workspace.folders.iter().enumerate() {
@@ -160,8 +188,24 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
     for (position, note) in workspace.notes.iter().enumerate() {
         transaction
             .execute(
-                "INSERT INTO notes (id, folder_id, title, content, updated, status, pinned, position)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR IGNORE INTO incoming_note_ids (id) VALUES (?1)",
+                [&note.id],
+            )
+            .map_err(|error| format!("Could not stage a note save: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO notes (id, folder_id, title, content, updated, status, pinned, position, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                   folder_id = excluded.folder_id,
+                   title = excluded.title,
+                   content = excluded.content,
+                   updated = excluded.updated,
+                   status = excluded.status,
+                   pinned = excluded.pinned,
+                   position = excluded.position,
+                   revision = notes.revision + 1
+                 WHERE excluded.updated >= notes.updated",
                 params![
                     note.id,
                     note.folder_id,
@@ -170,11 +214,19 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
                     note.updated,
                     note.status,
                     note.pinned,
-                    position as i64
+                    position as i64,
+                    note.revision
                 ],
             )
             .map_err(|error| format!("Could not save a note: {error}"))?;
     }
+
+    transaction
+        .execute_batch(
+            "DELETE FROM notes WHERE id NOT IN (SELECT id FROM incoming_note_ids);
+             DROP TABLE incoming_note_ids;",
+        )
+        .map_err(|error| format!("Could not finalize note removals: {error}"))?;
 
     for (position, todo) in workspace.todos.iter().enumerate() {
         transaction
@@ -240,7 +292,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
 
     let mut note_statement = connection
         .prepare(
-            "SELECT id, folder_id, title, content, updated, status, pinned
+            "SELECT id, folder_id, title, content, updated, status, pinned, revision
              FROM notes ORDER BY position",
         )
         .map_err(|error| format!("Could not read notes: {error}"))?;
@@ -254,6 +306,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
                 updated: row.get(4)?,
                 status: row.get(5)?,
                 pinned: row.get(6)?,
+                revision: row.get(7)?,
             })
         })
         .map_err(|error| format!("Could not query notes: {error}"))?
@@ -326,7 +379,7 @@ fn maybe_create_backup(app: &AppHandle, connection: &Connection) -> Result<(), S
 
 #[tauri::command]
 fn load_workspace(app: AppHandle) -> Result<Option<String>, String> {
-    let mut connection = open_database(&app)?;
+    let connection = open_database(&app)?;
     if let Some(workspace) = read_workspace(&connection)? {
         maybe_create_backup(&app, &connection)?;
         return serde_json::to_string(&workspace)
@@ -334,16 +387,105 @@ fn load_workspace(app: AppHandle) -> Result<Option<String>, String> {
             .map_err(|error| format!("Could not encode the workspace: {error}"));
     }
 
-    let legacy_path = app_data_dir(&app)?.join("workspace.json");
-    if legacy_path.exists() {
-        let contents = fs::read_to_string(&legacy_path)
-            .map_err(|error| format!("Could not read the previous workspace: {error}"))?;
-        write_workspace(&mut connection, &contents)?;
-        let _ = fs::rename(&legacy_path, legacy_path.with_extension("json.migrated"));
-        return Ok(Some(contents));
+    Ok(None)
+}
+
+#[tauri::command]
+fn load_note(app: AppHandle, note_id: String) -> Result<Option<Note>, String> {
+    let connection = open_database(&app)?;
+    connection
+        .query_row(
+            "SELECT id, folder_id, title, content, updated, status, pinned, revision
+             FROM notes WHERE id = ?1",
+            [&note_id],
+            |row| {
+                Ok(Note {
+                    id: row.get(0)?,
+                    folder_id: row.get(1)?,
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                    updated: row.get(4)?,
+                    status: row.get(5)?,
+                    pinned: row.get(6)?,
+                    revision: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Could not load the note: {error}"))
+}
+
+#[tauri::command]
+fn save_note(app: AppHandle, note: Note) -> Result<i64, String> {
+    let connection = open_database(&app)?;
+    let updated = connection
+        .execute(
+            "UPDATE notes
+             SET folder_id = ?2, title = ?3, content = ?4, updated = ?5,
+                 status = ?6, pinned = ?7, revision = revision + 1
+             WHERE id = ?1 AND revision = ?8",
+            params![
+                note.id,
+                note.folder_id,
+                note.title,
+                note.content,
+                note.updated,
+                note.status,
+                note.pinned,
+                note.revision
+            ],
+        )
+        .map_err(|error| format!("Could not save the note: {error}"))?;
+    if updated == 0 {
+        return Err("The note no longer exists or a newer edit is already saved.".into());
+    }
+    let revision = connection
+        .query_row(
+            "SELECT revision FROM notes WHERE id = ?1",
+            [&note.id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not read the saved note revision: {error}"))?;
+    maybe_create_backup(&app, &connection)?;
+    app.emit("workspace-changed", &note.id)
+        .map_err(|error| format!("Could not notify other windows: {error}"))?;
+    Ok(revision)
+}
+
+#[tauri::command]
+async fn open_note_window(
+    app: AppHandle,
+    note_id: String,
+    title: String,
+) -> Result<(), String> {
+    let label_suffix: String = note_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .collect();
+    let label = format!("note-{label_suffix}");
+    if let Some(window) = app.get_webview_window(&label) {
+        window
+            .set_focus()
+            .map_err(|error| format!("Could not focus the note window: {error}"))?;
+        return Ok(());
     }
 
-    Ok(None)
+    WebviewWindowBuilder::new(
+        &app,
+        label,
+        WebviewUrl::App(format!("index.html?note={note_id}").into()),
+    )
+    .title(if title.trim().is_empty() {
+        "Untitled — Odo".to_string()
+    } else {
+        format!("{title} — Odo")
+    })
+    .inner_size(760.0, 760.0)
+    .min_inner_size(520.0, 420.0)
+    .center()
+    .build()
+    .map_err(|error| format!("Could not open the note window: {error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -401,6 +543,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_workspace,
             save_workspace,
+            load_note,
+            save_note,
+            open_note_window,
             create_backup,
             get_storage_info,
             export_note
@@ -436,5 +581,37 @@ mod tests {
         assert_eq!(workspace.notes[0].title, "Test");
         assert_eq!(workspace.todos[0].text, "Ship it");
         assert_eq!(workspace.selected_note_id, "note-1");
+    }
+
+    #[test]
+    fn stale_workspace_snapshot_cannot_overwrite_a_newer_note_revision() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory database");
+        initialize_database(&connection).expect("initialize schema");
+        let stale_snapshot = r#"{
+          "folders":[{"id":"inbox","name":"Inbox","parentId":null,"open":true,"icon":"ph-tray"}],
+          "notes":[{"id":"note-1","folderId":"inbox","title":"Old","content":"Old body","updated":"2026-07-15T00:00:00.000Z","status":"active","pinned":false,"revision":0}],
+          "todos":[],
+          "selectedFolderId":"inbox",
+          "selectedNoteId":"note-1"
+        }"#;
+
+        write_workspace(&mut connection, stale_snapshot).expect("save initial workspace");
+        connection
+            .execute(
+                "UPDATE notes SET title = 'New', content = 'New body',
+                 updated = '2026-07-15T00:01:00.000Z', revision = 3
+                 WHERE id = 'note-1'",
+                [],
+            )
+            .expect("simulate detached note save");
+
+        write_workspace(&mut connection, stale_snapshot).expect("save stale workspace snapshot");
+        let workspace = read_workspace(&connection)
+            .expect("read workspace")
+            .expect("workspace exists");
+
+        assert_eq!(workspace.notes[0].title, "New");
+        assert_eq!(workspace.notes[0].content, "New body");
+        assert_eq!(workspace.notes[0].revision, 3);
     }
 }

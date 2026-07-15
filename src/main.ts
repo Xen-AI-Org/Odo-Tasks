@@ -1,21 +1,25 @@
 import "@phosphor-icons/web/regular/style.css";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 
 type NoteStatus = "active" | "archived" | "trash";
 type View = "notes" | "tasks" | "settings" | "archived" | "trash";
 type Folder = { id: string; name: string; parentId: string | null; open: boolean; icon?: string };
-type Note = { id: string; folderId: string; title: string; content: string; updated: string; status: NoteStatus; pinned?: boolean };
+type Note = { id: string; folderId: string; title: string; content: string; updated: string; status: NoteStatus; pinned?: boolean; revision: number };
 type Todo = { id: string; text: string; completed: boolean; created: string; updated: string };
 type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; selectedFolderId: string; selectedNoteId: string };
 type StorageInfo = { databasePath: string; backupDirectory: string };
 type SavePhase = "idle" | "saving" | "saved" | "error";
 type MenuItem = { label?: string; icon?: string; hint?: string; action?: string; disabled?: boolean; danger?: boolean; separator?: boolean };
 type MenuState = { items: MenuItem[]; x: number; y: number; trigger: HTMLElement | null } | null;
+type DialogOptions = { kind: "confirm" | "prompt" | "notice"; title: string; message: string; confirmLabel?: string; cancelLabel?: string; destructive?: boolean; label?: string; initialValue?: string; path?: string; validate?: (value: string) => string | null };
+type DialogState = { options: DialogOptions; trigger: HTMLElement | null; resolve: (value: boolean | string | null) => void; error: string } | null;
 
 const STORAGE_KEY = "odo-notes-workspace-v2";
 const MOTION_KEY = "odo-motion-enabled";
 const isDesktopApp = "__TAURI_INTERNALS__" in window;
+const detachedNoteId = new URLSearchParams(location.search).get("note");
 const isMac = navigator.platform.toLowerCase().includes("mac");
 const modLabel = isMac ? "Cmd" : "Ctrl";
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -30,7 +34,7 @@ const starterFolders: Folder[] = [
   { id: "journal", name: "Journal", parentId: "personal", open: false },
 ];
 const starterNotes: Note[] = [
-  { id: "welcome", folderId: "inbox", title: "Welcome to Odo", updated: now(), status: "active", pinned: true, content: "## A calm place for your work\n\nCapture ideas, organize projects, and keep your day moving.\n\n- Press Ctrl+N for a new note\n- Press Ctrl+2 for Tasks\n- Type / on a new line for blocks" },
+  { id: "welcome", folderId: "inbox", title: "Welcome to Odo", updated: now(), status: "active", pinned: true, revision: 0, content: "## A calm place for your work\n\nCapture ideas, organize projects, and keep your day moving.\n\n- Press Ctrl+N for a new note\n- Press Ctrl+2 for Tasks\n- Type / on a new line for blocks" },
 ];
 const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], selectedFolderId: "inbox", selectedNoteId: "welcome" });
 
@@ -40,10 +44,11 @@ function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Works
   const fallback = starterWorkspace();
   const folders = Array.isArray(input?.folders) ? input.folders : fallback.folders;
   if (!folders.some((folder) => folder.id === "inbox")) folders.unshift({ id: "inbox", name: "Inbox", parentId: null, open: true, icon: "ph-tray" });
-  return { folders, notes: Array.isArray(input?.notes) ? input.notes : fallback.notes, todos: Array.isArray(input?.todos) ? input.todos : [], selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "" };
+  const notes = (Array.isArray(input?.notes) ? input.notes : fallback.notes).map((note) => ({ ...note, revision: note.revision ?? 0 }));
+  return { folders, notes, todos: Array.isArray(input?.todos) ? input.todos : [], selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "" };
 }
 function initialState(): Workspace {
-  try { const saved = localStorage.getItem(STORAGE_KEY); if (saved) return normalizeWorkspace(JSON.parse(saved) as Workspace); } catch { localStorage.removeItem(STORAGE_KEY); }
+  if (!isDesktopApp) try { const saved = localStorage.getItem(STORAGE_KEY); if (saved) return normalizeWorkspace(JSON.parse(saved) as Workspace); } catch { localStorage.removeItem(STORAGE_KEY); }
   return starterWorkspace();
 }
 
@@ -63,6 +68,11 @@ let menuState: MenuState = null;
 let completedCollapsed = false;
 let editingTodoId = "";
 let helpOpen = false;
+let dialogState: DialogState = null;
+let workspaceReady = !isDesktopApp;
+let editorDirty = false;
+let externalChangeNoteId = "";
+let newRowId = "";
 let storageInfo: StorageInfo | null = null;
 let storageError = "";
 let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
@@ -136,7 +146,7 @@ async function restoreDesktopWorkspace() {
     const workspace = await invoke<string | null>("load_workspace");
     if (workspace) state = normalizeWorkspace(JSON.parse(workspace) as Workspace); else await saveState(false);
   } catch (error) { console.error("Could not restore Odo workspace:", error); setSavePhase("error"); }
-  repairState(); renderApp();
+  workspaceReady = true; repairState(); renderApp();
 }
 
 function renderFolder(folder: Folder, depth = 0): string {
@@ -157,14 +167,14 @@ function renderNotesPanel() {
 function renderNoteRows() {
   const notes = visibleNotes();
   if (!notes.length) return `<div class="empty-state"><span class="empty-icon"><i class="ph ${currentView === "trash" ? "ph-trash" : currentView === "archived" ? "ph-archive-tray" : "ph-note-blank"}"></i></span><strong>${searchQuery ? "No matching notes" : currentView === "trash" ? "Trash is empty" : currentView === "archived" ? "Nothing archived" : "A clear page awaits"}</strong><p>${searchQuery ? "Try a different search." : "Capture a thought and give it somewhere to grow."}</p>${currentView === "notes" && !searchQuery ? '<button class="primary-button" data-create-note>Create a note</button>' : ""}</div>`;
-  return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}"><div class="note-heading"><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${escapeHtml(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
+  return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""} ${note.id === newRowId ? "is-new" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}"><div class="note-heading"><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${escapeHtml(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
 }
 function slashMenuHtml() { return `<div class="slash-menu ${slashOpen ? "is-open" : ""}" id="slash-menu" role="listbox">${commands.map((command, index) => `<button class="slash-command ${index === slashIndex ? "is-active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === slashIndex}"><span class="command-icon"><i class="ph ${command.icon}"></i></span><span><strong>${command.label}</strong><small>${command.detail}</small></span>${index === 0 ? "<kbd>Enter</kbd>" : ""}</button>`).join("")}</div>`; }
 function renderEditor() {
   const note = selectedNote();
   if (!note) return `<main class="editor-panel empty-editor"><div class="app-actions"><span id="save-status"></span></div><div class="editor-empty"><span class="empty-icon"><i class="ph ph-note-pencil"></i></span><h2>No note selected</h2><p>Select a note, or start with a fresh page.</p><button class="primary-button" data-create-note>New note <kbd>${modLabel}+N</kbd></button></div></main>`;
   const canEdit = note.status === "active";
-  return `<main class="editor-panel"><div class="app-actions"><span id="save-status" class="save-status ${savePhase}"></span><button class="action-button" id="focus-mode"><i class="ph ph-book-open-text"></i><span>${focusMode ? "Exit focus" : "Focus"}</span></button><span class="action-separator"></span>${note.status === "active" ? '<button class="icon-button" data-note-action="archive" title="Archive note"><i class="ph ph-archive-tray"></i></button>' : ""}<button class="icon-button" id="editor-menu" title="More note actions" aria-label="More note actions"><i class="ph ph-dots-three"></i></button></div>
+  return `<main class="editor-panel">${externalChangeNoteId === note.id ? '<div class="external-change" role="status"><i class="ph ph-arrows-clockwise"></i><span>This note changed in another window.</span><button data-external-reload>Reload</button><button data-external-keep>Keep mine</button></div>' : ""}<div class="app-actions"><span id="save-status" class="save-status ${savePhase}"></span><button class="action-button" id="focus-mode"><i class="ph ph-book-open-text"></i><span>${focusMode ? "Exit focus" : "Focus"}</span></button><span class="action-separator"></span>${note.status === "active" ? '<button class="icon-button" data-note-action="archive" title="Archive note"><i class="ph ph-archive-tray"></i></button>' : ""}<button class="icon-button" id="editor-menu" title="More note actions" aria-label="More note actions"><i class="ph ph-dots-three"></i></button></div>
     ${canEdit ? `<div class="format-bar" role="toolbar" aria-label="Formatting"><button data-insert="## ">H₁</button><button data-insert="### ">H₂</button><button data-insert="#### ">H₃</button><span></span><button data-wrap="**">B</button><button data-wrap="_" class="italic">I</button><button data-wrap="~~" class="strike">S</button><span></span><button class="icon-button" data-insert="- " title="Bulleted list"><i class="ph ph-list-bullets"></i></button><button class="icon-button" data-insert="- [ ] " title="To-do list"><i class="ph ph-check-square"></i></button><span></span><button class="icon-button" data-wrap="[]()" data-link title="Add link"><i class="ph ph-link"></i></button><button class="icon-button" data-wrap="\`" title="Inline code"><i class="ph ph-code"></i></button><span></span><button class="icon-button" id="toolbar-more" title="Block menu"><i class="ph ph-dots-three"></i></button><button class="icon-button expand-editor" id="expand-editor" title="Focus mode"><i class="ph ph-arrows-out"></i></button></div>` : '<div class="readonly-bar"><i class="ph ph-info"></i>This note is read-only here. Restore it to edit.</div>'}
     <article class="editor-page"><input class="title-input" id="title-input" value="${attr(note.title)}" aria-label="Note title" ${canEdit ? "" : "readonly"}><div class="note-meta"><span>${formatEditorDate(note.updated)}</span><span>·</span><span id="word-count">${wordCount(note.content)} words</span></div><div class="editor-wrap"><textarea id="markdown-editor" aria-label="Markdown content" spellcheck="true" ${canEdit ? "" : "readonly"}>${escapeHtml(note.content)}</textarea>${canEdit ? slashMenuHtml() : ""}</div></article></main>`;
 }
@@ -182,15 +192,23 @@ function renderSettings() {
   return `<main class="wide-view settings-view"><header class="wide-header"><div><span class="eyebrow">Preferences</span><h1>Settings</h1><p>Make Odo feel at home on this computer.</p></div><button class="icon-button close-wide" data-go-inbox title="Back to notes"><i class="ph ph-x"></i></button></header><div class="settings-sheet">
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-database"></i><div><h2>Storage & backups</h2><p>${isDesktopApp ? "Your workspace is stored locally on this computer." : "Browser mode stores this workspace in local storage."}</p></div></div>${isDesktopApp ? `<div class="path-grid"><span>Database</span><code>${escapeHtml(storageInfo?.databasePath ?? "Loading…")}</code><span>Backups</span><code>${escapeHtml(storageInfo?.backupDirectory ?? "Loading…")}</code></div><button class="secondary-button" id="create-backup" ${storageError ? "disabled" : ""}><i class="ph ph-cloud-arrow-up"></i>Create backup</button>${storageError ? `<p class="inline-error">${escapeHtml(storageError)}</p>` : ""}` : '<div class="browser-note"><i class="ph ph-info"></i>Install and open the desktop app to create file backups.</div>'}</section>
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-sparkle"></i><div><h2>Appearance & motion</h2><p>Keep transitions calm, quick, and comfortable.</p></div></div><label class="switch-row"><span>Interface motion<small>Menus, panels, and task feedback</small></span><input id="motion-toggle" type="checkbox" ${motionEnabled ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label></section>
-    <section class="settings-section"><div class="settings-copy"><i class="ph ph-keyboard"></i><div><h2>Keyboard shortcuts</h2><p>Everything important stays within reach.</p></div></div><div class="shortcut-grid">${[["New note",`${modLabel}+N`],["New folder",`${modLabel}+Shift+N`],["Search",`${modLabel}+K`],["Tasks",`${modLabel}+2`],["Save",`${modLabel}+S`],["Focus mode",`${modLabel}+Shift+F`]].map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join("")}</div><button class="secondary-button" id="show-help"><i class="ph ph-question"></i>View all shortcuts</button></section></div></main>`;
+    <section class="settings-section"><div class="settings-copy"><i class="ph ph-keyboard"></i><div><h2>Keyboard shortcuts</h2><p>Everything important stays within reach.</p></div></div><div class="shortcut-grid">${[["New note",`${modLabel}+N`],["New folder",`${modLabel}+Shift+N`],["Search",`${modLabel}+K`],["Tasks",`${modLabel}+2`],["Next note",`${modLabel}+Tab`],["Previous note",`${modLabel}+Shift+Tab`],["Save",`${modLabel}+S`],["Focus mode",`${modLabel}+Shift+F`]].map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join("")}</div><button class="secondary-button" id="show-help"><i class="ph ph-question"></i>View all shortcuts</button></section></div></main>`;
 }
 function renderDialogLayer() {
   return `<dialog id="folder-dialog" class="create-dialog"><form id="folder-form"><div class="dialog-icon"><i class="ph ph-folder-plus"></i></div><div><h2>Create a new folder</h2><p>Add it inside the current location.</p></div><label>Folder name<input id="folder-name" autocomplete="off" placeholder="e.g. Research" required></label><div class="dialog-actions"><button type="button" class="secondary-button" data-close-dialog>Cancel</button><button type="submit" class="primary-button">Create</button></div></form></dialog>
-    <dialog id="move-dialog" class="create-dialog"><form id="move-form"><div class="dialog-icon"><i class="ph ph-folder-notch-open"></i></div><div><h2>Move note</h2><p>Choose its new home.</p></div><label>Folder<select id="move-folder">${state.folders.map((folder) => `<option value="${attr(folder.id)}">${escapeHtml(folder.name)}</option>`).join("")}</select></label><div class="dialog-actions"><button type="button" class="secondary-button" data-close-dialog>Cancel</button><button type="submit" class="primary-button">Move</button></div></form></dialog>`;
+    <dialog id="move-dialog" class="create-dialog"><form id="move-form"><div class="dialog-icon"><i class="ph ph-folder-notch-open"></i></div><div><h2>Move note</h2><p>Choose its new home.</p></div><label>Folder<select id="move-folder">${state.folders.map((folder) => `<option value="${attr(folder.id)}">${escapeHtml(folder.name)}</option>`).join("")}</select></label><div class="dialog-actions"><button type="button" class="secondary-button" data-close-dialog>Cancel</button><button type="submit" class="primary-button">Move</button></div></form></dialog><div id="odo-dialog-layer">${renderOdoDialog()}</div>`;
+}
+
+function renderOdoDialog() {
+  if (!dialogState) return "";
+  const { options, error } = dialogState; const icon = options.destructive ? "ph-warning" : options.kind === "notice" ? "ph-info" : options.kind === "prompt" ? "ph-pencil-simple" : "ph-question";
+  const prompt = options.kind === "prompt" ? `<label>${escapeHtml(options.label ?? "Name")}<input id="odo-dialog-input" value="${attr(options.initialValue ?? "")}" autocomplete="off" aria-describedby="odo-dialog-error"></label><p class="dialog-error" id="odo-dialog-error" aria-live="polite">${escapeHtml(error)}</p>` : options.path ? `<code class="dialog-path">${escapeHtml(options.path)}</code>` : "";
+  const cancel = options.kind !== "notice" ? `<button type="button" class="secondary-button" data-dialog-cancel>${escapeHtml(options.cancelLabel ?? "No")}</button>` : "";
+  return `<div class="odo-dialog-backdrop"><section class="odo-dialog ${options.destructive ? "is-destructive" : ""}" role="dialog" aria-modal="true" aria-labelledby="odo-dialog-title" aria-describedby="odo-dialog-message"><div class="dialog-icon"><i class="ph ${icon}"></i></div><div class="odo-dialog-copy"><h2 id="odo-dialog-title">${escapeHtml(options.title)}</h2><p id="odo-dialog-message">${escapeHtml(options.message)}</p></div>${prompt}<div class="dialog-actions">${cancel}<button type="button" class="${options.destructive ? "danger-button" : "primary-button"}" data-dialog-confirm>${escapeHtml(options.confirmLabel ?? (options.kind === "notice" ? "Done" : "Yes"))}</button></div></section></div>`;
 }
 function renderHelp() {
   if (!helpOpen) return "";
-  const shortcuts = [[`${modLabel}+N`,"New note"],[`${modLabel}+Shift+N`,"New folder"],[`${modLabel}+K`,"Search"],[`${modLabel}+S`,"Save"],[`${modLabel}+1`,"Inbox"],[`${modLabel}+2`,"Tasks"],[`${modLabel}+Shift+T`,"Tasks"],[`${modLabel}+D`,"Duplicate note"],[`${modLabel}+E`,"Archive note"],["F2","Rename selection"],["?","Shortcut help"],["Esc","Close / exit focus"]];
+  const shortcuts = [[`${modLabel}+N`,"New note"],[`${modLabel}+Shift+N`,"New folder"],[`${modLabel}+K`,"Search"],[`${modLabel}+S`,"Save"],[`${modLabel}+Tab`,"Next note"],[`${modLabel}+Shift+Tab`,"Previous note"],[`${modLabel}+1`,"Inbox"],[`${modLabel}+2`,"Tasks"],[`${modLabel}+Shift+T`,"Tasks"],[`${modLabel}+D`,"Duplicate note"],[`${modLabel}+E`,"Archive note"],["F2","Rename selection"],["?","Shortcut help"],["Esc","Close / exit focus"]];
   return `<div class="overlay" id="help-overlay"><section class="help-panel" role="dialog" aria-modal="true" aria-labelledby="help-title"><header><div><span class="eyebrow">Keyboard first</span><h2 id="help-title">Shortcuts</h2></div><button class="icon-button" id="close-help" aria-label="Close shortcuts"><i class="ph ph-x"></i></button></header><div class="help-grid">${shortcuts.map(([key,label]) => `<span>${label}</span><kbd>${key}</kbd>`).join("")}</div><p>Menus also support arrow keys, Home, End, Enter, and Escape.</p></section></div>`;
 }
 function renderMenu() {
@@ -198,13 +216,16 @@ function renderMenu() {
   return `<div class="context-menu" id="context-menu" role="menu" style="left:${menuState.x}px;top:${menuState.y}px">${menuState.items.map((item, index) => item.separator ? '<div class="menu-separator" role="separator"></div>' : `<button role="menuitem" data-menu-index="${index}" ${item.disabled ? "disabled" : ""} class="${item.danger ? "danger" : ""}"><i class="ph ${item.icon ?? "ph-dot"}"></i><span>${escapeHtml(item.label ?? "")}</span>${item.hint ? `<kbd>${escapeHtml(item.hint)}</kbd>` : ""}</button>`).join("")}</div>`;
 }
 function renderApp() {
+  if (detachedNoteId) return;
+  if (!workspaceReady) { document.querySelector<HTMLElement>("#app")!.innerHTML = '<main class="loading-shell" aria-label="Loading Odo"><span class="loading-wordmark">Odo</span><span class="loading-line"></span><span>Opening your workspace…</span></main>'; return; }
   repairState(); closeMenu(false);
   document.documentElement.classList.toggle("no-motion", !motionEnabled);
   const app = document.querySelector<HTMLElement>("#app")!;
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}`;
   const content = currentView === "tasks" ? renderTasks() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor();
   app.innerHTML = `${renderSidebar()}${content}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div>`;
-  updateSaveStatus(); bindEvents();
+  updateSaveStatus(); bindEvents(); bindOdoDialog();
+  if (newRowId) requestAnimationFrame(() => { document.querySelector(`[data-note-id="${CSS.escape(newRowId)}"]`)?.classList.remove("is-new"); newRowId = ""; });
 }
 
 function refreshNoteList() {
@@ -212,11 +233,18 @@ function refreshNoteList() {
   const scroll = list.scrollTop; list.innerHTML = renderNoteRows(); list.scrollTop = scroll; bindNoteRows();
   const count = document.querySelector<HTMLElement>("#note-count"); if (count) count.textContent = `${visibleNotes().length} notes`;
 }
+function updateSelectedRowPreview() {
+  const note = selectedNote(); if (!note) return;
+  const row = document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(note.id)}"]`); if (!row) return;
+  const title = row.querySelector<HTMLElement>(".note-title"); const excerpt = row.querySelector<HTMLElement>(".note-excerpt"); const time = row.querySelector<HTMLTimeElement>("time");
+  if (title) title.textContent = note.title || "Untitled"; if (excerpt) excerpt.textContent = noteExcerpt(note.content); if (time) time.textContent = formatListDate(note.updated);
+}
+function reconcileNoteList() { editorDirty = false; refreshNoteList(); }
 function focusTitle() { requestAnimationFrame(() => { const title = document.querySelector<HTMLInputElement>("#title-input"); title?.focus(); title?.select(); }); }
 function createNoteAndFocusTitle(folderId?: string) {
   const target = folderId && state.folders.some((folder) => folder.id === folderId) ? folderId : currentView === "notes" && state.folders.some((folder) => folder.id === state.selectedFolderId) ? state.selectedFolderId : "inbox";
-  const note: Note = { id: uid("note"), folderId: target, title: "Untitled", content: "", updated: now(), status: "active" };
-  state.notes.push(note); state.selectedFolderId = target; state.selectedNoteId = note.id; currentView = "notes"; searchQuery = ""; slashOpen = false; void saveState(false); renderApp(); focusTitle();
+  const note: Note = { id: uid("note"), folderId: target, title: "Untitled", content: "", updated: now(), status: "active", revision: 0 };
+  state.notes.push(note); newRowId = note.id; state.selectedFolderId = target; state.selectedNoteId = note.id; currentView = "notes"; searchQuery = ""; slashOpen = false; void saveState(false); renderApp(); focusTitle();
 }
 function openFolderDialog(parentId?: string) {
   if (parentId) state.selectedFolderId = parentId;
@@ -271,13 +299,41 @@ function bindMenu() {
   });
 }
 
+function showOdoDialog(options: DialogOptions): Promise<boolean | string | null> {
+  return new Promise((resolve) => {
+    dialogState = { options, trigger: document.activeElement as HTMLElement | null, resolve, error: "" };
+    const layer = document.querySelector<HTMLElement>("#odo-dialog-layer"); if (layer) { layer.innerHTML = renderOdoDialog(); bindOdoDialog(); }
+    requestAnimationFrame(() => (options.kind === "prompt" ? document.querySelector<HTMLInputElement>("#odo-dialog-input") : document.querySelector<HTMLButtonElement>(options.destructive ? "[data-dialog-cancel]" : "[data-dialog-confirm]"))?.focus());
+  });
+}
+function confirmOdo(title: string, message: string, confirmLabel = "Yes", destructive = false) { return showOdoDialog({ kind: "confirm", title, message, confirmLabel, destructive }) as Promise<boolean>; }
+function promptOdo(title: string, message: string, initialValue: string) { return showOdoDialog({ kind: "prompt", title, message, label: "Name", initialValue, confirmLabel: "Save", cancelLabel: "Cancel", validate: (value) => value.trim() ? null : "Enter a name to continue." }) as Promise<string | null>; }
+function noticeOdo(title: string, message: string, path?: string) { return showOdoDialog({ kind: "notice", title, message, path, confirmLabel: "Done" }) as Promise<boolean>; }
+function closeOdoDialog(value: boolean | string | null) {
+  const current = dialogState; if (!current) return; dialogState = null; document.querySelector<HTMLElement>("#odo-dialog-layer")!.innerHTML = ""; current.resolve(value); requestAnimationFrame(() => current.trigger?.focus());
+}
+function bindOdoDialog() {
+  const dialog = document.querySelector<HTMLElement>(".odo-dialog"); if (!dialog || !dialogState) return;
+  const submit = () => { if (!dialogState) return; if (dialogState.options.kind === "prompt") { const input = dialog.querySelector<HTMLInputElement>("#odo-dialog-input")!; const error = dialogState.options.validate?.(input.value) ?? null; if (error) { dialogState.error = error; const errorNode = dialog.querySelector<HTMLElement>("#odo-dialog-error"); if (errorNode) errorNode.textContent = error; input.focus(); return; } closeOdoDialog(input.value.trim()); } else closeOdoDialog(true); };
+  dialog.querySelector("[data-dialog-confirm]")?.addEventListener("click", submit); dialog.querySelector("[data-dialog-cancel]")?.addEventListener("click", () => closeOdoDialog(dialogState?.options.kind === "confirm" ? false : null));
+  dialog.addEventListener("keydown", (event) => {
+    event.stopPropagation(); const buttons = [...dialog.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")]; const typing = isTypingTarget(event.target);
+    if (event.key === "Escape") { event.preventDefault(); closeOdoDialog(dialogState?.options.kind === "confirm" ? false : null); return; }
+    if (!typing && event.key.toLowerCase() === "y" && dialogState?.options.kind === "confirm") { event.preventDefault(); closeOdoDialog(true); return; }
+    if (!typing && event.key.toLowerCase() === "n" && dialogState?.options.kind === "confirm") { event.preventDefault(); closeOdoDialog(false); return; }
+    if (!typing && (event.key === "ArrowLeft" || event.key === "ArrowRight") && buttons.length > 1) { event.preventDefault(); const current = Math.max(0, buttons.indexOf(document.activeElement as HTMLButtonElement)); buttons[(current + (event.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length].focus(); return; }
+    if (event.key === "Enter" && (dialogState?.options.kind === "prompt" || document.activeElement === dialog.querySelector("[data-dialog-confirm]"))) { event.preventDefault(); submit(); return; }
+    if (event.key === "Tab") { const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])')]; if (!focusable.length) return; const first = focusable[0]; const last = focusable[focusable.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } }
+  });
+}
+
 async function performMenuAction(action: string) {
   const [kind, verb, id] = action.split(":");
   if (kind === "list" && verb === "sort") { sortNewest = !sortNewest; renderApp(); return; }
   if (kind === "note") {
     const note = state.notes.find((item) => item.id === id); if (!note) return;
     if (verb === "rename") {
-      if (note.status !== "active") { const name = window.prompt("Rename note", note.title || "Untitled")?.trim(); if (!name) return; note.title = name; note.updated = now(); await saveState(false); renderApp(); return; }
+      if (note.status !== "active") { const name = await promptOdo("Rename note", `Choose a new name for “${note.title || "Untitled"}”.`, note.title || "Untitled"); if (!name) return; note.title = name; note.updated = now(); await saveState(false); renderApp(); return; }
       state.selectedNoteId = note.id; currentView = "notes"; state.selectedFolderId = note.folderId; renderApp(); focusTitle(); return;
     }
     if (verb === "pin") note.pinned = !note.pinned;
@@ -286,7 +342,7 @@ async function performMenuAction(action: string) {
     if (verb === "archive") note.status = "archived";
     if (verb === "trash") note.status = "trash";
     if (verb === "restore") note.status = "active";
-    if (verb === "delete" && window.confirm(`Permanently delete “${note.title || "Untitled"}”? This cannot be undone.`)) state.notes = state.notes.filter((item) => item.id !== note.id); else if (verb === "delete") return;
+    if (verb === "delete" && await confirmOdo("Delete note permanently?", `“${note.title || "Untitled"}” will be removed forever. This cannot be undone.`, "Delete permanently", true)) state.notes = state.notes.filter((item) => item.id !== note.id); else if (verb === "delete") return;
     if (verb === "export") { await exportNote(note); return; }
     note.updated = now(); repairState(); await saveState(false); renderApp();
   }
@@ -294,9 +350,9 @@ async function performMenuAction(action: string) {
     const folder = state.folders.find((item) => item.id === id); if (!folder) return;
     if (verb === "new-note") { createNoteAndFocusTitle(folder.id); return; }
     if (verb === "new-folder") { state.selectedFolderId = folder.id; currentView = "notes"; renderApp(); openFolderDialog(folder.id); return; }
-    if (verb === "rename") { const name = window.prompt("Rename folder", folder.name)?.trim(); if (!name) return; folder.name = name; }
+    if (verb === "rename") { const name = await promptOdo("Rename folder", `Choose a new name for “${folder.name}”.`, folder.name); if (!name) return; folder.name = name; }
     if (verb === "delete") {
-      if (folder.id === "inbox" || !window.confirm(`Delete “${folder.name}” and its subfolders? Notes inside will move to Trash.`)) return;
+      if (folder.id === "inbox" || !await confirmOdo("Delete folder?", `“${folder.name}” and every subfolder will be deleted. Notes inside will move to Trash.`, "Delete folder", true)) return;
       const ids = descendants(folder.id); state.notes.filter((note) => ids.includes(note.folderId)).forEach((note) => { note.status = "trash"; note.updated = now(); }); state.folders = state.folders.filter((item) => !ids.includes(item.id)); state.selectedFolderId = "inbox";
     }
     repairState(); await saveState(false); renderApp();
@@ -306,12 +362,12 @@ async function performMenuAction(action: string) {
     if (verb === "toggle") todo.completed = !todo.completed;
     if (verb === "edit") { editingTodoId = todo.id; renderApp(); focusTodoEditor(todo.id); return; }
     if (verb === "duplicate") state.todos.push({ ...todo, id: uid("todo"), text: `${todo.text} copy`, created: now(), updated: now() });
-    if (verb === "delete") state.todos = state.todos.filter((item) => item.id !== todo.id);
+    if (verb === "delete") { if (!await confirmOdo("Delete task?", `“${todo.text}” will be removed from your task list.`, "Delete task", true)) return; state.todos = state.todos.filter((item) => item.id !== todo.id); }
     todo.updated = now(); await saveState(false); renderApp();
   }
 }
 async function exportNote(note: Note) {
-  if (isDesktopApp) { try { await invoke<string>("export_note", { title: note.title || "Untitled", contents: note.content }); } catch (error) { window.alert(`Could not export note: ${String(error)}`); } return; }
+  if (isDesktopApp) { try { const path = await invoke<string>("export_note", { title: note.title || "Untitled", contents: note.content }); await noticeOdo("Note exported", `“${note.title || "Untitled"}” was exported as Markdown.`, path); } catch (error) { await noticeOdo("Export failed", `Could not export “${note.title || "Untitled"}”: ${String(error)}`); } return; }
   const blob = new Blob([`# ${note.title || "Untitled"}\n\n${note.content}`], { type: "text/markdown" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${(note.title || "Untitled").replace(/[\\/:*?\"<>|]/g, "-")}.md`; link.click(); URL.revokeObjectURL(link.href);
 }
 
@@ -324,13 +380,20 @@ function insertFormatting(value: string, wrap = false, link = false) { const edi
 function updateNote(editor: HTMLTextAreaElement) {
   const note = selectedNote(); if (!note || note.status !== "active") return;
   const normalized = editor.value.replace(/^(\s*)-\s*\[\](?=\s|$)/gm, "$1- [ ]"); if (normalized !== editor.value) { const cursor = editor.selectionStart + normalized.length - editor.value.length; editor.value = normalized; editor.selectionStart = editor.selectionEnd = cursor; }
-  note.content = editor.value; note.updated = now(); const count = document.querySelector<HTMLElement>("#word-count"); if (count) count.textContent = `${wordCount(note.content)} words`; scheduleSave();
-  const cursor = editor.selectionStart; const lineStart = editor.value.lastIndexOf("\n", cursor - 1) + 1; slashOpen = /^\/[a-z-]*$/i.test(editor.value.slice(lineStart, cursor)); if (slashOpen) slashIndex = 0; updateSlashMenu(); refreshNoteList();
+  note.content = editor.value; note.updated = now(); editorDirty = true; const count = document.querySelector<HTMLElement>("#word-count"); if (count) count.textContent = `${wordCount(note.content)} words`; scheduleSave(); updateSelectedRowPreview();
+  const cursor = editor.selectionStart; const lineStart = editor.value.lastIndexOf("\n", cursor - 1) + 1; slashOpen = /^\/[a-z-]*$/i.test(editor.value.slice(lineStart, cursor)); if (slashOpen) slashIndex = 0; updateSlashMenu();
+}
+
+async function openDetachedNote(note: Note) {
+  await saveState(false);
+  if (isDesktopApp) { try { await invoke("open_note_window", { noteId: note.id, title: note.title || "Untitled" }); } catch (error) { await noticeOdo("Could not open note window", String(error)); } return; }
+  window.open(`${location.pathname}?note=${encodeURIComponent(note.id)}`, `odo-note-${note.id}`, "width=820,height=720");
 }
 
 function bindNoteRows() {
   document.querySelectorAll<HTMLElement>("[data-note-id]").forEach((row) => {
     row.addEventListener("click", (event) => { if ((event.target as HTMLElement).closest("[data-note-menu]")) return; state.selectedNoteId = row.dataset.noteId!; renderApp(); });
+    row.addEventListener("dblclick", (event) => { if ((event.target as HTMLElement).closest("[data-note-menu]")) return; const note = state.notes.find((item) => item.id === row.dataset.noteId); if (note) void openDetachedNote(note); });
     row.addEventListener("contextmenu", (event) => { event.preventDefault(); const note = state.notes.find((item) => item.id === row.dataset.noteId); if (note) openMenu(noteMenuItems(note), row, event.clientX, event.clientY); });
     row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); state.selectedNoteId = row.dataset.noteId!; renderApp(); } if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); const rows = [...document.querySelectorAll<HTMLElement>("[data-note-id]")]; const index = rows.indexOf(row); const next = rows[index + (event.key === "ArrowDown" ? 1 : -1)]; if (next) { state.selectedNoteId = next.dataset.noteId!; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus()); } } });
   });
@@ -361,8 +424,10 @@ function bindEvents() {
   document.querySelector("#editor-menu")?.addEventListener("click", (event) => { const note = selectedNote(); if (note) openMenu(noteMenuItems(note), event.currentTarget as HTMLElement); });
   document.querySelectorAll<HTMLElement>("[data-note-action]").forEach((button) => button.addEventListener("click", () => { const note = selectedNote(); if (note) void performMenuAction(`note:${button.dataset.noteAction}:${note.id}`); }));
   const search = document.querySelector<HTMLInputElement>("#search-input"); search?.addEventListener("input", () => { searchQuery = search.value; repairState(); refreshNoteList(); });
-  const title = document.querySelector<HTMLInputElement>("#title-input"); title?.addEventListener("input", () => { const note = selectedNote(); if (!note) return; note.title = title.value; note.updated = now(); scheduleSave(); refreshNoteList(); });
-  const editor = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); editor?.addEventListener("input", () => updateNote(editor)); editor?.addEventListener("keydown", handleEditorKeydown);
+  const title = document.querySelector<HTMLInputElement>("#title-input"); title?.addEventListener("input", () => { const note = selectedNote(); if (!note) return; note.title = title.value; note.updated = now(); editorDirty = true; scheduleSave(); updateSelectedRowPreview(); });
+  title?.addEventListener("keydown", (event) => { if (event.isComposing) return; if (event.key === "Enter") { event.preventDefault(); const body = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); if (body) { body.focus(); body.setSelectionRange(body.value.length, body.value.length); } } else if (event.key === "Escape") { event.preventDefault(); document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus(); } });
+  title?.addEventListener("blur", reconcileNoteList);
+  const editor = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); editor?.addEventListener("input", () => updateNote(editor)); editor?.addEventListener("keydown", handleEditorKeydown); editor?.addEventListener("blur", reconcileNoteList);
   document.querySelectorAll<HTMLElement>("[data-command-index]").forEach((button) => button.addEventListener("click", () => insertCommand(Number(button.dataset.commandIndex))));
   document.querySelectorAll<HTMLButtonElement>("[data-insert]").forEach((button) => button.addEventListener("click", () => insertFormatting(button.dataset.insert!)));
   document.querySelectorAll<HTMLButtonElement>("[data-wrap]").forEach((button) => button.addEventListener("click", () => insertFormatting(button.dataset.wrap!, true, button.hasAttribute("data-link"))));
@@ -370,12 +435,14 @@ function bindEvents() {
   document.querySelector("#focus-mode")?.addEventListener("click", toggleFocus); document.querySelector("#expand-editor")?.addEventListener("click", toggleFocus);
   document.querySelector("#toolbar-more")?.addEventListener("click", () => { slashOpen = !slashOpen; slashIndex = 0; updateSlashMenu(); });
   bindTaskEvents(); bindSettingsEvents();
+  document.querySelector("[data-external-reload]")?.addEventListener("click", () => void reloadWorkspaceFromDesktop(true));
+  document.querySelector("[data-external-keep]")?.addEventListener("click", () => { externalChangeNoteId = ""; editorDirty = true; void saveState(); renderApp(); });
   document.querySelector("#close-help")?.addEventListener("click", () => { helpOpen = false; renderApp(); });
   document.querySelector("#help-overlay")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) { helpOpen = false; renderApp(); } });
 }
 function handleEditorKeydown(event: KeyboardEvent) {
   const editor = event.currentTarget as HTMLTextAreaElement;
-  if (slashOpen && ["ArrowDown","ArrowUp","Enter","Escape"].includes(event.key)) { event.preventDefault(); if (event.key === "ArrowDown") slashIndex = (slashIndex + 1) % commands.length; if (event.key === "ArrowUp") slashIndex = (slashIndex - 1 + commands.length) % commands.length; if (event.key === "Enter") { insertCommand(slashIndex); return; } if (event.key === "Escape") slashOpen = false; updateSlashMenu(); }
+  if (slashOpen && ["ArrowDown","ArrowUp","Enter","Escape"].includes(event.key)) { event.preventDefault(); event.stopPropagation(); if (event.key === "ArrowDown") slashIndex = (slashIndex + 1) % commands.length; if (event.key === "ArrowUp") slashIndex = (slashIndex - 1 + commands.length) % commands.length; if (event.key === "Enter") { insertCommand(slashIndex); return; } if (event.key === "Escape") slashOpen = false; updateSlashMenu(); }
   if (event.key === "Tab" && !slashOpen) { event.preventDefault(); editor.setRangeText("  ", editor.selectionStart, editor.selectionEnd, "end"); updateNote(editor); }
 }
 function bindTaskEvents() {
@@ -385,30 +452,50 @@ function bindTaskEvents() {
   document.querySelectorAll<HTMLElement>("[data-todo-menu]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); const todo = state.todos.find((item) => item.id === button.dataset.todoMenu); if (todo) openMenu(todoMenuItems(todo), button); }));
   document.querySelectorAll<HTMLInputElement>("[data-edit-todo]").forEach((input) => { input.addEventListener("keydown", (event) => { if (event.key === "Enter") commitTodoEdit(input); if (event.key === "Escape") { editingTodoId = ""; renderApp(); } }); input.addEventListener("blur", () => { if (editingTodoId) commitTodoEdit(input); }); });
   document.querySelector("#toggle-completed")?.addEventListener("click", () => { completedCollapsed = !completedCollapsed; renderApp(); });
-  document.querySelector("#clear-completed")?.addEventListener("click", () => { if (window.confirm("Clear all completed tasks? This cannot be undone.")) { state.todos = state.todos.filter((todo) => !todo.completed); void saveState(false); renderApp(); } });
+  document.querySelector("#clear-completed")?.addEventListener("click", async () => { const count = state.todos.filter((todo) => todo.completed).length; if (await confirmOdo("Clear completed tasks?", `${count} completed ${count === 1 ? "task" : "tasks"} will be permanently removed.`, "Clear completed", true)) { state.todos = state.todos.filter((todo) => !todo.completed); void saveState(false); renderApp(); } });
 }
 function handleTaskKeydown(event: KeyboardEvent) {
   if ((event.target as HTMLElement).matches("input")) return; const row = event.currentTarget as HTMLElement; const id = row.dataset.todoId!; const rows = [...document.querySelectorAll<HTMLElement>("[data-todo-id]")]; const index = rows.indexOf(row);
   if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); rows[index + (event.key === "ArrowDown" ? 1 : -1)]?.focus(); }
   if (event.key === " ") { event.preventDefault(); toggleTodo(id); }
   if (event.key === "Enter") { event.preventDefault(); editingTodoId = id; renderApp(); focusTodoEditor(id); }
-  if (event.key === "Delete" && window.confirm("Delete this task?")) { state.todos = state.todos.filter((todo) => todo.id !== id); void saveState(false); renderApp(); }
+  if (event.key === "Delete") { event.preventDefault(); const todo = state.todos.find((item) => item.id === id); if (todo) void (async () => { if (await confirmOdo("Delete task?", `“${todo.text}” will be removed from your task list.`, "Delete task", true)) { state.todos = state.todos.filter((item) => item.id !== id); await saveState(false); renderApp(); } })(); }
 }
 function bindSettingsEvents() {
   document.querySelector("#motion-toggle")?.addEventListener("change", (event) => { motionEnabled = (event.target as HTMLInputElement).checked; localStorage.setItem(MOTION_KEY, String(motionEnabled)); document.documentElement.classList.toggle("no-motion", !motionEnabled); });
   document.querySelector("#show-help")?.addEventListener("click", () => { helpOpen = true; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#close-help")?.focus()); });
-  document.querySelector("#create-backup")?.addEventListener("click", async (event) => { const button = event.currentTarget as HTMLButtonElement; button.disabled = true; button.innerHTML = '<i class="ph ph-circle-notch"></i>Creating…'; try { const path = await invoke<string>("create_backup"); window.alert(`Backup created:\n${path}`); } catch (error) { window.alert(`Could not create backup: ${String(error)}`); } finally { renderApp(); } });
+  document.querySelector("#create-backup")?.addEventListener("click", async (event) => { const button = event.currentTarget as HTMLButtonElement; button.disabled = true; button.innerHTML = '<i class="ph ph-circle-notch"></i>Creating…'; try { const path = await invoke<string>("create_backup"); await noticeOdo("Backup created", "Your SQLite workspace backup is ready.", path); } catch (error) { await noticeOdo("Backup failed", `Could not create a backup: ${String(error)}`); } finally { renderApp(); } });
 }
 
 function isTypingTarget(target: EventTarget | null) { const element = target as HTMLElement | null; return !!element?.closest("input, textarea, select, [contenteditable=true]"); }
+function cycleVisibleNote(direction: 1 | -1) {
+  if (!["notes", "archived", "trash"].includes(currentView)) return;
+  const rows = [...document.querySelectorAll<HTMLElement>("[data-note-id]")]; if (!rows.length) return;
+  const active = document.activeElement; const region = active?.id === "title-input" ? "title" : active?.id === "markdown-editor" ? "body" : "row";
+  const current = Math.max(0, rows.findIndex((row) => row.dataset.noteId === state.selectedNoteId)); const next = rows[(current + direction + rows.length) % rows.length];
+  clearTimeout(saveTimer); void saveState(false); state.selectedNoteId = next.dataset.noteId!; editorDirty = false; renderApp();
+  requestAnimationFrame(() => { if (region === "title") document.querySelector<HTMLInputElement>("#title-input")?.focus(); else if (region === "body") document.querySelector<HTMLTextAreaElement>("#markdown-editor")?.focus(); else document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus(); });
+}
+async function reloadWorkspaceFromDesktop(force = false) {
+  if (!isDesktopApp || (!force && editorDirty)) return;
+  try { const workspace = await invoke<string | null>("load_workspace"); if (workspace) { state = normalizeWorkspace(JSON.parse(workspace) as Workspace); externalChangeNoteId = ""; editorDirty = false; renderApp(); } } catch (error) { console.error("Could not reload changed workspace:", error); }
+}
+function showExternalChangeBanner(noteId: string) {
+  externalChangeNoteId = noteId; const panel = document.querySelector<HTMLElement>(".editor-panel"); if (!panel || panel.querySelector(".external-change")) return;
+  panel.insertAdjacentHTML("afterbegin", '<div class="external-change" role="status"><i class="ph ph-arrows-clockwise"></i><span>This note changed in another window.</span><button data-external-reload>Reload</button><button data-external-keep>Keep mine</button></div>');
+  panel.querySelector("[data-external-reload]")?.addEventListener("click", () => void reloadWorkspaceFromDesktop(true));
+  panel.querySelector("[data-external-keep]")?.addEventListener("click", () => { externalChangeNoteId = ""; panel.querySelector(".external-change")?.remove(); editorDirty = true; void saveState(); });
+}
 document.addEventListener("pointerdown", (event) => { if (menuState && !(event.target as HTMLElement).closest("#context-menu") && !(event.target as HTMLElement).closest("[data-note-menu],[data-folder-menu],[data-todo-menu],#editor-menu,#list-menu")) closeMenu(false); });
 window.addEventListener("blur", () => closeMenu(false)); window.addEventListener("resize", () => closeMenu(false));
 document.addEventListener("keydown", (event) => {
+  if (event.isComposing || detachedNoteId) return;
   const command = event.metaKey || event.ctrlKey; const key = event.key.toLowerCase(); const typing = isTypingTarget(event.target);
   if (event.key === "Escape") { if (menuState) { event.preventDefault(); closeMenu(); return; } const openDialog = document.querySelector<HTMLDialogElement>("dialog[open]"); if (openDialog) { event.preventDefault(); openDialog.close(); return; } if (helpOpen) { event.preventDefault(); helpOpen = false; renderApp(); return; } if (focusMode) { event.preventDefault(); focusMode = false; renderApp(); return; } }
   if (command && key === "n") { event.preventDefault(); if (event.shiftKey) openFolderDialog(); else createNoteAndFocusTitle(); return; }
   if (command && key === "k") { event.preventDefault(); if (!document.querySelector("#search-input")) { currentView = "notes"; renderApp(); } requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#search-input")?.focus()); return; }
   if (command && key === "s") { event.preventDefault(); void saveState(); return; }
+  if (command && event.key === "Tab") { event.preventDefault(); cycleVisibleNote(event.shiftKey ? -1 : 1); return; }
   if (command && event.shiftKey && key === "f") { event.preventDefault(); focusMode = !focusMode; if (currentView !== "notes") { currentView = "notes"; repairState(); } renderApp(); return; }
   if (command && ((event.shiftKey && key === "t") || key === "2")) { event.preventDefault(); setView("tasks"); return; }
   if (command && key === "1") { event.preventDefault(); state.selectedFolderId = "inbox"; setView("notes"); return; }
@@ -418,5 +505,33 @@ document.addEventListener("keydown", (event) => {
   if (!typing && event.key === "?") { event.preventDefault(); helpOpen = true; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#close-help")?.focus()); }
 });
 
-renderApp();
-void restoreDesktopWorkspace();
+async function renderDetachedEditor(noteId: string) {
+  const app = document.querySelector<HTMLElement>("#app")!; app.className = "detached-app"; app.innerHTML = '<main class="detached-loading"><span class="loading-wordmark">Odo</span><span>Opening note…</span></main>';
+  let note: Note | null = null;
+  try { note = isDesktopApp ? await invoke<Note | null>("load_note", { noteId }) : state.notes.find((item) => item.id === noteId) ?? null; } catch (error) { app.innerHTML = `<main class="detached-error"><i class="ph ph-warning-circle"></i><h1>Could not open this note</h1><p>${escapeHtml(String(error))}</p></main>`; return; }
+  if (!note) { app.innerHTML = '<main class="detached-error"><i class="ph ph-note-blank"></i><h1>Note not found</h1><p>It may have been deleted in another window.</p></main>'; return; }
+  note = { ...note, revision: note.revision ?? 0 }; let saveChain = Promise.resolve(); let saveTimerId = 0; let conflict = false; let phase: "saving" | "saved" | "conflict" | "error" = "saved";
+  const shell = () => `<main class="detached-editor"><header class="detached-titlebar"><span class="detached-brand">Odo</span><span id="detached-save-state" class="detached-save-state ${phase}">${phase === "saving" ? "Saving…" : phase === "conflict" ? "Conflict" : phase === "error" ? "Save failed" : "Saved"}</span><kbd>${modLabel}+S</kbd></header><section class="detached-paper">${conflict ? '<div class="conflict-banner" role="alert"><i class="ph ph-warning"></i><span>A newer version is already saved in SQLite.</span><button id="conflict-reload">Reload from SQLite</button><button id="conflict-keep">Keep editing</button></div>' : ""}<input id="detached-title" value="${attr(note!.title)}" aria-label="Note title"><textarea id="detached-body" aria-label="Note content" spellcheck="true">${escapeHtml(note!.content)}</textarea></section><footer class="detached-status"><span id="detached-count">${wordCount(note!.content)} words</span><span>Markdown</span><span>${modLabel}+W closes</span></footer></main>`;
+  const updatePhase = (next: typeof phase) => { phase = next; const node = document.querySelector<HTMLElement>("#detached-save-state"); if (node) { node.className = `detached-save-state ${phase}`; node.textContent = phase === "saving" ? "Saving…" : phase === "conflict" ? "Conflict" : phase === "error" ? "Save failed" : "Saved"; } };
+  const queueSave = () => { if (!note || conflict) return saveChain; clearTimeout(saveTimerId); updatePhase("saving"); saveChain = saveChain.catch(() => undefined).then(async () => { const snapshot = { ...note!, updated: now() }; note!.updated = snapshot.updated; if (!isDesktopApp) { const local = normalizeWorkspace(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? JSON.stringify(starterWorkspace()))); const index = local.notes.findIndex((item) => item.id === snapshot.id); if (index >= 0) local.notes[index] = snapshot; localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); updatePhase("saved"); return; } try { note!.revision = await invoke<number>("save_note", { note: snapshot }); updatePhase("saved"); } catch (error) { conflict = String(error).includes("newer edit") || String(error).includes("no longer exists"); updatePhase(conflict ? "conflict" : "error"); if (conflict) { const focused = document.activeElement?.id; app.innerHTML = shell(); bindDetached(); requestAnimationFrame(() => document.querySelector<HTMLElement>(focused === "detached-title" ? "#detached-title" : "#detached-body")?.focus()); } } }); return saveChain; };
+  const schedule = () => { clearTimeout(saveTimerId); updatePhase("saving"); saveTimerId = window.setTimeout(() => void queueSave(), 350); };
+  const bindDetached = () => {
+    const title = document.querySelector<HTMLInputElement>("#detached-title")!; const body = document.querySelector<HTMLTextAreaElement>("#detached-body")!;
+    title.addEventListener("input", () => { note!.title = title.value; document.title = `${title.value || "Untitled"} — Odo`; schedule(); });
+    title.addEventListener("keydown", (event) => { if (event.isComposing) return; if (event.key === "Enter") { event.preventDefault(); body.focus(); body.setSelectionRange(body.value.length, body.value.length); } if (event.key === "Escape") { event.preventDefault(); body.focus(); } });
+    body.addEventListener("input", () => { note!.content = body.value; const count = document.querySelector<HTMLElement>("#detached-count"); if (count) count.textContent = `${wordCount(note!.content)} words`; schedule(); });
+    body.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); title.focus(); } });
+    title.addEventListener("blur", () => void queueSave()); body.addEventListener("blur", () => void queueSave());
+    document.querySelector("#conflict-reload")?.addEventListener("click", async () => { const fresh = await invoke<Note | null>("load_note", { noteId }); if (fresh) { note = { ...fresh, revision: fresh.revision ?? 0 }; conflict = false; phase = "saved"; app.innerHTML = shell(); bindDetached(); } });
+    document.querySelector("#conflict-keep")?.addEventListener("click", () => { conflict = false; updatePhase("error"); body.focus(); });
+  };
+  document.title = `${note.title || "Untitled"} — Odo`; app.innerHTML = shell(); bindDetached();
+  document.addEventListener("keydown", (event) => { if (event.isComposing) return; const command = event.metaKey || event.ctrlKey; if (command && event.key.toLowerCase() === "s") { event.preventDefault(); clearTimeout(saveTimerId); void queueSave(); } if (command && event.key.toLowerCase() === "w") { event.preventDefault(); clearTimeout(saveTimerId); void queueSave().finally(() => window.close()); } });
+  window.addEventListener("beforeunload", () => { clearTimeout(saveTimerId); void queueSave(); });
+}
+
+async function bootstrap() {
+  if (detachedNoteId) { await renderDetachedEditor(detachedNoteId); return; }
+  renderApp(); if (isDesktopApp) { await restoreDesktopWorkspace(); await listen<string>("workspace-changed", (event) => { const changedId = event.payload; const active = document.activeElement; if (changedId === state.selectedNoteId && (editorDirty || active?.id === "title-input" || active?.id === "markdown-editor")) showExternalChangeBanner(changedId); else void reloadWorkspaceFromDesktop(); }); }
+}
+void bootstrap();
