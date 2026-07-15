@@ -126,6 +126,7 @@ kbd { color: #716e67; font: 11px/1.2 ui-monospace, "Cascadia Code", monospace; w
 .note-title-wrap { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .pin-icon { flex: 0 0 auto; color: #bd8200; font-size: 13px; transform: rotate(-25deg); }
 .note-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #292823; font-size: 14.5px; font-weight: 600; }
+.note-title a { color: #2563eb; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .note-heading time { color: #716d65; font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .note-excerpt { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; color: #68655e; font-size: 12.5px; line-height: 1.5; }
 .empty-state { height: 100%; min-height: 320px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 25px; color: #858179; text-align: center; animation: rise-in 180ms ease-out; }
@@ -153,8 +154,9 @@ kbd { color: #716e67; font: 11px/1.2 ui-monospace, "Cascadia Code", monospace; w
 .readonly-bar { height: 50px; display: flex; align-items: center; gap: 8px; padding: 0 21px; border-bottom: 1px solid #eadfbf; background: #fff9e9; color: #735b21; font-size: 12px; }
 .editor-page { min-height: 0; overflow-y: auto; padding: 28px 34px 70px; }
 .editor-page > * { width: min(100%, 760px); margin-right: auto; margin-left: auto; }
-.title-input { display: block; height: 58px; padding: 0; border: 0; outline: 0; background: transparent; font: 500 clamp(32px,3vw,44px)/1.15 Georgia, "Times New Roman", serif; letter-spacing: -1.4px; }
+.title-input { display: block; height: 58px; overflow-x: auto; overflow-y: hidden; padding: 0; border: 0; outline: 0; background: transparent; font: 500 clamp(32px,3vw,44px)/1.15 Georgia, "Times New Roman", serif; letter-spacing: -1.4px; white-space: nowrap; caret-color: #c58200; }
 .title-input::selection { background: #f8ebc8; }
+.title-input a, #detached-title a { color: #2563eb; text-decoration: underline; text-decoration-color: currentColor; text-underline-offset: 3px; cursor: pointer; }
 #markdown-editor::selection, .rich-editor::selection { background: #fae2a3; }
 .note-meta { height: 37px; display: flex; align-items: flex-start; gap: 8px; color: #77736b; font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .editor-wrap { position: relative; min-height: 620px; }
@@ -329,7 +331,7 @@ kbd { color: #716e67; font: 11px/1.2 ui-monospace, "Cascadia Code", monospace; w
 .attach-main-button { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; padding: 6px 9px; border: 1px solid #ded4ad; border-radius: 6px; background: #fff9e7; color: #735910; font-size: 11px; font-weight: 700; transition: background 130ms ease, transform 130ms ease; }
 .attach-main-button:hover, .attach-main-button:focus-visible { background: #f9edc8; transform: translateY(-1px); }
 .detached-paper { min-height: 0; display: grid; grid-template-rows: auto minmax(0,1fr); overflow: hidden; padding: 28px clamp(25px, 6vw, 64px) 20px; }
-#detached-title { width: min(100%, 860px); height: 58px; margin: 0 auto; padding: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: 500 clamp(30px,5vw,43px)/1.15 Georgia, serif; letter-spacing: -1.2px; }
+#detached-title { width: min(100%, 860px); height: 58px; overflow-x: auto; overflow-y: hidden; margin: 0 auto; padding: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: 500 clamp(30px,5vw,43px)/1.15 Georgia, serif; letter-spacing: -1.2px; white-space: nowrap; caret-color: #c58200; }
 #detached-body { width: min(100%, 860px); height: 100%; min-height: 0; overflow-y: auto; margin: 0 auto; padding: 13px 0 70px; }
 .detached-rich-editor { font-size: 15px; line-height: 1.72; }
 .detached-status { display: flex; align-items: center; gap: 17px; padding: 0 14px; border-top: 1px solid var(--line); background: #faf8f3; color: var(--muted); font-size: 10.5px; }
