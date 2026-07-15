@@ -169,14 +169,105 @@ function renderNoteRows() {
   return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""} ${note.id === newRowId ? "is-new" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}"><div class="note-heading"><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${escapeHtml(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
 }
 function slashMenuHtml() { return `<div class="slash-menu ${slashOpen ? "is-open" : ""}" id="slash-menu" role="listbox">${commands.map((command, index) => `<button class="slash-command ${index === slashIndex ? "is-active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === slashIndex}"><span class="command-icon"><i class="ph ${command.icon}"></i></span><span><strong>${command.label}</strong><small>${command.detail}</small></span>${index === 0 ? "<kbd>Enter</kbd>" : ""}</button>`).join("")}</div>`; }
+type RichBlock = "P" | "H1" | "H2" | "H3" | "BLOCKQUOTE" | "PRE" | "UL" | "OL";
+const blockSelector = "p,h1,h2,h3,blockquote,pre,ul,ol";
+
+function inlineMarkdown(markdown: string): string {
+  // Escape first: documents are always modelled as text/semantic tags, never pasted HTML.
+  let html = escapeHtml(markdown);
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/\[([^\]]+)\]\(([^\s)]+)\)/g, '<a href="$2" rel="noopener noreferrer">$1</a>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/~~([^~]+)~~/g, "<s>$1</s>");
+  html = html.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+  html = html.replace(/(^|[^_])_([^_]+)_/g, "$1<em>$2</em>");
+  return html;
+}
+function richTask(text: string, checked: boolean) { return `<li class="rich-task ${checked ? "is-checked" : ""}"><input class="rich-task-check" type="checkbox" ${checked ? "checked" : ""} contenteditable="false" aria-label="Toggle task"><span class="rich-task-label" contenteditable="true">${text ? inlineMarkdown(text) : "<br>"}</span></li>`; }
+function markdownToRich(markdown: string): string {
+  const lines = markdown.replace(/\r\n?/g, "\n").split("\n"); const output: string[] = []; let index = 0;
+  const paragraph = (text: string) => `<p>${inlineMarkdown(text) || "<br>"}</p>`;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (/^```/.test(line)) { const language = line.slice(3).trim(); const code: string[] = []; index++; while (index < lines.length && !/^```/.test(lines[index])) code.push(lines[index++]); if (index < lines.length) index++; output.push(`<pre data-language="${attr(language)}"><code>${escapeHtml(code.join("\n")) || "\n"}</code></pre>`); continue; }
+    if (/^\s*---+\s*$/.test(line)) { output.push("<hr>"); index++; continue; }
+    const heading = line.match(/^(#{1,3})\s+(.*)$/); if (heading) { output.push(`<h${heading[1].length}>${inlineMarkdown(heading[2]) || "<br>"}</h${heading[1].length}>`); index++; continue; }
+    if (/^>\s?/.test(line)) { const quote: string[] = []; while (index < lines.length && /^>\s?/.test(lines[index])) quote.push(lines[index++].replace(/^>\s?/, "")); output.push(`<blockquote>${quote.map(paragraph).join("")}</blockquote>`); continue; }
+    if (/^- \[[ xX]\](?:\s|$)/.test(line)) { const tasks: string[] = []; while (index < lines.length && /^- \[[ xX]\](?:\s|$)/.test(lines[index])) { const task = lines[index++].match(/^- \[([ xX])\]\s?(.*)$/)!; tasks.push(richTask(task[2], task[1].toLowerCase() === "x")); } output.push(`<ul class="rich-list rich-task-list">${tasks.join("")}</ul>`); continue; }
+    if (/^-\s+/.test(line)) { const items: string[] = []; while (index < lines.length && /^-\s+/.test(lines[index])) items.push(`<li>${inlineMarkdown(lines[index++].replace(/^-\s+/, "")) || "<br>"}</li>`); output.push(`<ul class="rich-list">${items.join("")}</ul>`); continue; }
+    if (/^\d+\.\s+/.test(line)) { const items: string[] = []; while (index < lines.length && /^\d+\.\s+/.test(lines[index])) items.push(`<li>${inlineMarkdown(lines[index++].replace(/^\d+\.\s+/, "")) || "<br>"}</li>`); output.push(`<ol class="rich-list">${items.join("")}</ol>`); continue; }
+    if (!line.trim()) { index++; if (output.length && output[output.length - 1] !== "<p><br></p>") output.push("<p><br></p>"); continue; }
+    const text: string[] = [line]; index++; while (index < lines.length && lines[index].trim() && !/^(#{1,3}\s|>|- \[[ xX]\]\s|-\s+|\d+\.\s+|```|---+$)/.test(lines[index])) text.push(lines[index++]); output.push(paragraph(text.join("\n")));
+  }
+  return output.join("") || "<p><br></p>";
+}
+function richInlineMarkdown(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+  if (!(node instanceof HTMLElement)) return "";
+  const inner = [...node.childNodes].map(richInlineMarkdown).join("");
+  if (node.tagName === "STRONG" || node.tagName === "B") return `**${inner}**`;
+  if (node.tagName === "EM" || node.tagName === "I") return `_${inner}_`;
+  if (node.tagName === "S" || node.tagName === "DEL" || node.tagName === "STRIKE") return `~~${inner}~~`;
+  if (node.tagName === "CODE") return `\`${inner}\``;
+  if (node.tagName === "A") return `[${inner}](${node.getAttribute("href") || "url"})`;
+  if (node.tagName === "BR") return "\n";
+  return inner;
+}
+function normalizeRichTasks(editor: HTMLElement) {
+  editor.querySelectorAll<HTMLElement>(".rich-task").forEach((item) => {
+    let label = item.querySelector<HTMLElement>(".rich-task-label");
+    if (!label) { label = document.createElement("span"); label.className = "rich-task-label"; label.contentEditable = "true"; item.append(label); }
+    // Chromium can place text beside the nested label after a structural
+    // conversion. Move it back before every model read so no task text is lost.
+    [...item.childNodes].filter((node) => node !== label && !(node instanceof HTMLInputElement) && (node.nodeType === Node.TEXT_NODE || node.nodeName === "BR")).forEach((node) => label!.append(node));
+    if (!label.childNodes.length) label.append(document.createElement("br"));
+  });
+}
+function richToMarkdown(editor: HTMLElement): string {
+  normalizeRichTasks(editor);
+  const blocks = [...editor.children] as HTMLElement[];
+  const values = blocks.map((block) => {
+    const text = richInlineMarkdown(block).replace(/\u00a0/g, " ").replace(/\n+$/, "");
+    if (block.tagName === "H1") return `# ${text}`; if (block.tagName === "H2") return `## ${text}`; if (block.tagName === "H3") return `### ${text}`;
+    if (block.tagName === "BLOCKQUOTE") return [...block.children].map((item) => `> ${richInlineMarkdown(item).replace(/\n/g, " ")}`).join("\n");
+    if (block.tagName === "PRE") { const code = block.querySelector("code")?.textContent ?? block.textContent ?? ""; const language = block.dataset.language || ""; return `\`\`\`${language}\n${code.replace(/\n$/, "")}\n\`\`\``; }
+    if (block.tagName === "HR") return "---";
+    if (block.tagName === "UL" || block.tagName === "OL") return [...block.children].filter((item) => item.tagName === "LI").map((item, i) => { const task = item.classList.contains("rich-task"); const label = task ? item.querySelector<HTMLElement>(".rich-task-label") : item; const content = richInlineMarkdown(label ?? item).replace(/\n/g, " "); return task ? `- [${item.querySelector<HTMLInputElement>("input")?.checked ? "x" : " "}]${content.trim() ? ` ${content.trim()}` : ""}` : block.tagName === "OL" ? `${i + 1}. ${content}` : `- ${content}`; }).join("\n");
+    return text;
+  }).filter((value, i, list) => value || (i > 0 && i < list.length - 1));
+  return values.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function editorSelection(): Selection | null { const selection = window.getSelection(); return selection?.rangeCount && selection.anchorNode && (selection.anchorNode.parentElement?.closest("[data-rich-editor]") || (selection.anchorNode as HTMLElement).closest?.("[data-rich-editor]")) ? selection : null; }
+function currentRichBlock(editor: HTMLElement): HTMLElement | null {
+  const selection = editorSelection(); let target = selection?.anchorNode instanceof HTMLElement ? selection.anchorNode : selection?.anchorNode?.parentElement;
+  while (target && target !== editor) {
+    if (target.parentElement === editor && (target.matches(blockSelector) || target.tagName === "DIV")) return target;
+    if (target.tagName === "LI") return target;
+    target = target.parentElement;
+  }
+  return null;
+}
+function placeCaretEnd(element: HTMLElement) { const selection = window.getSelection(); const range = document.createRange(); range.selectNodeContents(element); range.collapse(false); selection?.removeAllRanges(); selection?.addRange(range); element.focus(); }
+function placeCaretInTaskLabel(label: HTMLElement) { if (!label.childNodes.length) label.append(document.createElement("br")); const selection = window.getSelection(); const range = document.createRange(); range.selectNodeContents(label); range.collapse(false); selection?.removeAllRanges(); selection?.addRange(range); label.focus(); }
+function createTaskList(): HTMLElement { const list = document.createElement("ul"); list.className = "rich-list rich-task-list"; return list; }
+function createTaskItem(): HTMLElement { const holder = document.createElement("template"); holder.innerHTML = richTask("", false); return holder.content.firstElementChild as HTMLElement; }
+function replaceRichBlock(editor: HTMLElement, next: HTMLElement) { const block = currentRichBlock(editor); if (block) block.replaceWith(next); else editor.append(next); const label = next.querySelector<HTMLElement>(".rich-task-label"); if (label) placeCaretInTaskLabel(label); else placeCaretEnd(next); }
+function applyRichBlock(type: RichBlock) {
+  const editor = document.querySelector<HTMLElement>("[data-rich-editor]"); if (!editor) return; editor.focus(); const block = currentRichBlock(editor); if (type === "UL" || type === "OL") { document.execCommand(type === "UL" ? "insertUnorderedList" : "insertOrderedList"); updateRichNote(editor); return; }
+  if (type === "PRE") { const pre = document.createElement("pre"); const code = document.createElement("code"); code.textContent = block?.textContent || ""; pre.append(code); replaceRichBlock(editor, pre); }
+  else { document.execCommand("formatBlock", false, type); }
+  updateRichNote(editor);
+}
+function applyRichInline(command: string) { const editor = document.querySelector<HTMLElement>("[data-rich-editor]"); if (!editor) return; editor.focus(); if (command === "link") { const href = "https://"; document.execCommand("createLink", false, href); } else document.execCommand(command); updateRichNote(editor); }
+function makeCurrentTask(editor: HTMLElement) { const list = createTaskList(); const item = createTaskItem(); list.append(item); replaceRichBlock(editor, list); updateRichNote(editor); }
 function renderEditor() {
   const note = selectedNote();
   if (!note) return `<main class="editor-panel empty-editor"><div class="app-actions"><span id="save-status"></span></div><div class="editor-empty"><span class="empty-icon"><i class="ph ph-note-pencil"></i></span><h2>No note selected</h2><p>Select a note, or start with a fresh page.</p><button class="primary-button" data-create-note>New note <kbd>${modLabel}+N</kbd></button></div></main>`;
   if (detachedNoteIds.has(note.id)) return `<main class="editor-panel detached-main-panel"><div class="app-actions"><span id="save-status" class="save-status ${savePhase}"></span><button class="icon-button" id="editor-menu" title="More note actions" aria-label="More note actions"><i class="ph ph-dots-three"></i></button></div><section class="detached-note-card" role="status" aria-live="polite"><div class="detached-window-mark"><i class="ph ph-browser"></i><span class="sync-dot"></span></div><span class="eyebrow">Live sync</span><h2>Editing in its own window</h2><p>Changes arrive here as you type. This page is paused so there is always one clear editor.</p><button class="primary-button attach-here" id="attach-here"><i class="ph ph-arrow-bend-up-left"></i><span>Attach here</span></button><p class="detached-hint"><i class="ph ph-cursor-click"></i>Select this note in the list to attach it here.</p></section></main>`;
   const canEdit = note.status === "active";
   return `<main class="editor-panel"><div class="app-actions"><span id="save-status" class="save-status ${savePhase}"></span><button class="action-button" id="focus-mode"><i class="ph ph-book-open-text"></i><span>${focusMode ? "Exit focus" : "Focus"}</span></button><span class="action-separator"></span>${note.status === "active" ? '<button class="icon-button" data-note-action="archive" title="Archive note"><i class="ph ph-archive-tray"></i></button>' : ""}<button class="icon-button" id="editor-menu" title="More note actions" aria-label="More note actions"><i class="ph ph-dots-three"></i></button></div>
-    ${canEdit ? `<div class="format-bar" role="toolbar" aria-label="Formatting"><button data-insert="## ">H₁</button><button data-insert="### ">H₂</button><button data-insert="#### ">H₃</button><span></span><button data-wrap="**">B</button><button data-wrap="_" class="italic">I</button><button data-wrap="~~" class="strike">S</button><span></span><button class="icon-button" data-insert="- " title="Bulleted list"><i class="ph ph-list-bullets"></i></button><button class="icon-button" data-insert="- [ ] " title="To-do list"><i class="ph ph-check-square"></i></button><span></span><button class="icon-button" data-wrap="[]()" data-link title="Add link"><i class="ph ph-link"></i></button><button class="icon-button" data-wrap="\`" title="Inline code"><i class="ph ph-code"></i></button><span></span><button class="icon-button" id="toolbar-more" title="Block menu"><i class="ph ph-dots-three"></i></button><button class="icon-button expand-editor" id="expand-editor" title="Focus mode"><i class="ph ph-arrows-out"></i></button></div>` : '<div class="readonly-bar"><i class="ph ph-info"></i>This note is read-only here. Restore it to edit.</div>'}
-    <article class="editor-page"><input class="title-input" id="title-input" value="${attr(note.title)}" aria-label="Note title" ${canEdit ? "" : "readonly"}><div class="note-meta"><span>${formatEditorDate(note.updated)}</span><span>·</span><span id="word-count">${wordCount(note.content)} words</span></div><div class="editor-wrap"><textarea id="markdown-editor" aria-label="Markdown content" spellcheck="true" ${canEdit ? "" : "readonly"}>${escapeHtml(note.content)}</textarea>${canEdit ? slashMenuHtml() : ""}</div></article></main>`;
+    ${canEdit ? `<div class="format-bar" role="toolbar" aria-label="Formatting"><button data-block="H1" title="Heading 1">H₁</button><button data-block="H2" title="Heading 2">H₂</button><button data-block="H3" title="Heading 3">H₃</button><span></span><button data-rich-command="bold" title="Bold (${modLabel}+B)">B</button><button data-rich-command="italic" class="italic" title="Italic (${modLabel}+I)">I</button><button data-rich-command="strikeThrough" class="strike" title="Strike through">S</button><span></span><button class="icon-button" data-block="UL" title="Bulleted list"><i class="ph ph-list-bullets"></i></button><button class="icon-button" data-rich-task title="To-do list"><i class="ph ph-check-square"></i></button><span></span><button class="icon-button" data-rich-command="link" title="Add link"><i class="ph ph-link"></i></button><button class="icon-button" data-block="PRE" title="Code block"><i class="ph ph-code"></i></button><span></span><button class="icon-button" id="toolbar-more" title="Block menu"><i class="ph ph-dots-three"></i></button><button class="icon-button expand-editor" id="expand-editor" title="Focus mode"><i class="ph ph-arrows-out"></i></button></div>` : '<div class="readonly-bar"><i class="ph ph-info"></i>This note is read-only here. Restore it to edit.</div>'}
+    <article class="editor-page"><input class="title-input" id="title-input" value="${attr(note.title)}" aria-label="Note title" ${canEdit ? "" : "readonly"}><div class="note-meta"><span>${formatEditorDate(note.updated)}</span><span>·</span><span id="word-count">${wordCount(note.content)} words</span></div><div class="editor-wrap"><div id="markdown-editor" class="rich-editor" data-rich-editor contenteditable="${canEdit}" role="textbox" aria-multiline="true" aria-label="Note content" spellcheck="true">${markdownToRich(note.content)}</div>${canEdit ? slashMenuHtml() : ""}</div></article></main>`;
 }
 function renderTasks() {
   const active = state.todos.filter((todo) => !todo.completed); const completed = state.todos.filter((todo) => todo.completed);
@@ -375,13 +466,45 @@ function toggleTodo(id: string) { const todo = state.todos.find((item) => item.i
 function focusTodoEditor(id: string) { requestAnimationFrame(() => { const input = document.querySelector<HTMLInputElement>(`[data-edit-todo="${CSS.escape(id)}"]`); input?.focus(); input?.select(); }); }
 function commitTodoEdit(input: HTMLInputElement) { const todo = state.todos.find((item) => item.id === input.dataset.editTodo); if (!todo) return; const text = input.value.trim(); if (text) { todo.text = text; todo.updated = now(); } editingTodoId = ""; void saveState(false); renderApp(); }
 function updateSlashMenu() { const menu = document.querySelector<HTMLElement>("#slash-menu"); if (!menu) return; menu.classList.toggle("is-open", slashOpen); menu.querySelectorAll(".slash-command").forEach((item, index) => item.classList.toggle("is-active", index === slashIndex)); }
-function insertCommand(index: number) { const editor = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); if (!editor) return; const cursor = editor.selectionStart; const lineStart = editor.value.lastIndexOf("\n", cursor - 1) + 1; const slash = editor.value.lastIndexOf("/", cursor); const start = slash >= lineStart ? slash : cursor; editor.setRangeText(commands[index].value, start, cursor, "end"); if (commands[index].value.includes("\n\n")) editor.selectionStart = editor.selectionEnd = start + 4; slashOpen = false; updateSlashMenu(); editor.focus(); updateNote(editor); }
-function insertFormatting(value: string, wrap = false, link = false) { const editor = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); if (!editor) return; const start = editor.selectionStart; const end = editor.selectionEnd; const selected = editor.value.slice(start, end); const replacement = wrap ? link ? `[${selected || "link text"}](url)` : `${value}${selected}${value}` : value; editor.setRangeText(replacement, start, end, "end"); editor.focus(); updateNote(editor); }
-function updateNote(editor: HTMLTextAreaElement) {
+function insertCommand(index: number) { const editor = document.querySelector<HTMLElement>("[data-rich-editor]"); if (!editor) return; slashOpen = false; updateSlashMenu(); const value = commands[index].value; if (value === "## ") applyRichBlock("H2"); else if (value === "- [ ] ") makeCurrentTask(editor); else if (value === "- ") applyRichBlock("UL"); else if (value === "> ") applyRichBlock("BLOCKQUOTE"); else if (value.includes("```")) applyRichBlock("PRE"); else { const block = currentRichBlock(editor) ?? editor.appendChild(document.createElement("p")); block.textContent = ""; placeCaretEnd(block); } }
+function updateRichNote(editor: HTMLElement) {
   const note = selectedNote(); if (!note || note.status !== "active") return;
-  const normalized = editor.value.replace(/^(\s*)-\s*\[\](?=\s|$)/gm, "$1- [ ]"); if (normalized !== editor.value) { const cursor = editor.selectionStart + normalized.length - editor.value.length; editor.value = normalized; editor.selectionStart = editor.selectionEnd = cursor; }
-  note.content = editor.value; note.updated = now(); const count = document.querySelector<HTMLElement>("#word-count"); if (count) count.textContent = `${wordCount(note.content)} words`; scheduleSave(); updateSelectedRowPreview();
-  const cursor = editor.selectionStart; const lineStart = editor.value.lastIndexOf("\n", cursor - 1) + 1; slashOpen = /^\/[a-z-]*$/i.test(editor.value.slice(lineStart, cursor)); if (slashOpen) slashIndex = 0; updateSlashMenu();
+  note.content = richToMarkdown(editor); note.updated = now(); const count = document.querySelector<HTMLElement>("#word-count"); if (count) count.textContent = `${wordCount(note.content)} words`; scheduleSave(); updateSelectedRowPreview();
+  const block = currentRichBlock(editor); slashOpen = block?.tagName === "P" && /^\/[a-z-]*$/i.test(block.textContent ?? ""); if (slashOpen) slashIndex = 0; updateSlashMenu();
+}
+function normalizeRichBlocks(editor: HTMLElement) {
+  // Chromium creates bare DIVs after Enter from headings and quotes. Make those
+  // first-class paragraphs before interpreting the next Markdown shortcut.
+  [...editor.children].filter((child) => child.tagName === "DIV").forEach((block) => {
+    const selection = window.getSelection(); const caretWasHere = !!selection?.anchorNode && block.contains(selection.anchorNode);
+    const paragraph = document.createElement("p"); while (block.firstChild) paragraph.append(block.firstChild); if (!paragraph.childNodes.length) paragraph.append(document.createElement("br")); block.replaceWith(paragraph); if (caretWasHere) placeCaretEnd(paragraph);
+  });
+}
+function transformMarkdownShortcut(editor: HTMLElement) {
+  normalizeRichBlocks(editor);
+  const block = currentRichBlock(editor) ?? [...editor.children].find((child) => child.tagName === "P" && /^(#{1,3}\s|- |1\. |> |- \[ \] )$/.test((child.textContent ?? "").replace(/\u00a0/g, " "))) as HTMLElement | undefined;
+  if (!block || block.tagName !== "P") return;
+  const text = (block.textContent ?? "").replace(/\u00a0/g, " ");
+  const heading = text.match(/^(#{1,3})\s$/); if (heading) { const next = document.createElement(`h${heading[1].length}`); next.append(document.createElement("br")); block.replaceWith(next); placeCaretEnd(next); return; }
+  // Hold a bare "- " for one more character so the longer "- [ ] " task
+  // shorthand wins. A normal bullet becomes a list as soon as its text starts.
+  if (text === "- [ ] ") { makeCurrentTask(editor); return; }
+  const bullet = text.match(/^-\s+(.+)$/); if (bullet && !text.startsWith("- [")) { const list = document.createElement("ul"); list.className = "rich-list"; const item = document.createElement("li"); item.textContent = bullet[1]; list.append(item); block.replaceWith(list); placeCaretEnd(item); return; }
+  if (text === "1. ") { const list = document.createElement("ol"); list.className = "rich-list"; const item = document.createElement("li"); item.append(document.createElement("br")); list.append(item); block.replaceWith(list); placeCaretEnd(item); return; }
+  if (text === "> ") { const quote = document.createElement("blockquote"); const paragraph = document.createElement("p"); paragraph.append(document.createElement("br")); quote.append(paragraph); block.replaceWith(quote); placeCaretEnd(paragraph); return; }
+}
+function toggleRichTask(input: HTMLInputElement, update = updateRichNote) { const item = input.closest<HTMLElement>(".rich-task"); item?.classList.toggle("is-checked", input.checked); const editor = input.closest<HTMLElement>("[data-rich-editor]"); if (editor) update(editor); }
+function handleRichKeydown(event: KeyboardEvent, update = updateRichNote) {
+  const editor = event.currentTarget as HTMLElement; const block = currentRichBlock(editor); const task = (event.target as HTMLElement).closest<HTMLElement>(".rich-task");
+  if (slashOpen && ["ArrowDown","ArrowUp","Enter","Escape"].includes(event.key)) { event.preventDefault(); event.stopPropagation(); if (event.key === "ArrowDown") slashIndex = (slashIndex + 1) % commands.length; if (event.key === "ArrowUp") slashIndex = (slashIndex - 1 + commands.length) % commands.length; if (event.key === "Enter") { insertCommand(slashIndex); update(editor); return; } if (event.key === "Escape") slashOpen = false; updateSlashMenu(); return; }
+  if (event.key === "Enter" && task) { event.preventDefault(); const label = task.querySelector<HTMLElement>(".rich-task-label"); if (!(label?.textContent ?? "").trim()) { const paragraph = document.createElement("p"); paragraph.append(document.createElement("br")); const list = task.parentElement!; if (list.children.length === 1) list.replaceWith(paragraph); else task.replaceWith(paragraph); placeCaretEnd(paragraph); } else { const next = createTaskItem(); task.after(next); placeCaretInTaskLabel(next.querySelector<HTMLElement>(".rich-task-label")!); } update(editor); return; }
+  if (event.key === "Backspace" && block && ["H1","H2","H3","BLOCKQUOTE"].includes(block.tagName) && !(block.textContent ?? "").trim()) { event.preventDefault(); const paragraph = document.createElement("p"); paragraph.append(document.createElement("br")); block.replaceWith(paragraph); placeCaretEnd(paragraph); update(editor); return; }
+  if (event.key === "Tab" && !slashOpen) { const list = (event.target as HTMLElement).closest("li"); if (list) { event.preventDefault(); document.execCommand(event.shiftKey ? "outdent" : "indent"); update(editor); } }
+}
+function bindRichEditor(editor: HTMLElement, update: (element: HTMLElement) => void) {
+  editor.addEventListener("input", () => { transformMarkdownShortcut(editor); update(editor); }); editor.addEventListener("keydown", (event) => handleRichKeydown(event, update)); editor.addEventListener("change", (event) => { const checkbox = (event.target as HTMLElement).closest<HTMLInputElement>(".rich-task-check"); if (checkbox) toggleRichTask(checkbox, update); else update(editor); });
+  editor.addEventListener("click", (event) => { const checkbox = (event.target as HTMLElement).closest<HTMLInputElement>(".rich-task-check"); if (checkbox) window.setTimeout(() => toggleRichTask(checkbox, update)); });
+  editor.addEventListener("paste", (event) => { event.preventDefault(); const text = event.clipboardData?.getData("text/plain") ?? ""; document.execCommand("insertText", false, text); });
 }
 
 async function openDetachedNote(note: Note) {
@@ -445,23 +568,22 @@ function bindEvents() {
   document.querySelector("#attach-here")?.addEventListener("click", () => { if (state.selectedNoteId) void attachDetachedNote(state.selectedNoteId); });
   const search = document.querySelector<HTMLInputElement>("#search-input"); search?.addEventListener("input", () => { searchQuery = search.value; repairState(); refreshNoteList(); });
   const title = document.querySelector<HTMLInputElement>("#title-input"); title?.addEventListener("input", () => { const note = selectedNote(); if (!note) return; note.title = title.value; note.updated = now(); scheduleSave(); updateSelectedRowPreview(); });
-  title?.addEventListener("keydown", (event) => { if (event.isComposing) return; if (event.key === "Enter") { event.preventDefault(); const body = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); if (body) { body.focus(); body.setSelectionRange(body.value.length, body.value.length); } } else if (event.key === "Escape") { event.preventDefault(); document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus(); } });
+  title?.addEventListener("keydown", (event) => { if (event.isComposing) return; if (event.key === "Enter") { event.preventDefault(); const body = document.querySelector<HTMLElement>("[data-rich-editor]"); if (body) placeCaretEnd(body.lastElementChild as HTMLElement ?? body); } else if (event.key === "Escape") { event.preventDefault(); document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus(); } });
   title?.addEventListener("blur", reconcileNoteList);
-  const editor = document.querySelector<HTMLTextAreaElement>("#markdown-editor"); editor?.addEventListener("input", () => updateNote(editor)); editor?.addEventListener("keydown", handleEditorKeydown); editor?.addEventListener("blur", reconcileNoteList);
+  const editor = document.querySelector<HTMLElement>("[data-rich-editor]"); if (editor) { bindRichEditor(editor, updateRichNote); editor.addEventListener("blur", reconcileNoteList); }
   document.querySelectorAll<HTMLElement>("[data-command-index]").forEach((button) => button.addEventListener("click", () => insertCommand(Number(button.dataset.commandIndex))));
-  document.querySelectorAll<HTMLButtonElement>("[data-insert]").forEach((button) => button.addEventListener("click", () => insertFormatting(button.dataset.insert!)));
-  document.querySelectorAll<HTMLButtonElement>("[data-wrap]").forEach((button) => button.addEventListener("click", () => insertFormatting(button.dataset.wrap!, true, button.hasAttribute("data-link"))));
-  const toggleFocus = () => { focusMode = !focusMode; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#markdown-editor")?.focus()); };
+  document.querySelectorAll<HTMLButtonElement>("[data-block]").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
+  document.querySelectorAll<HTMLButtonElement>("[data-block]").forEach((button) => button.addEventListener("click", () => applyRichBlock(button.dataset.block as RichBlock)));
+  document.querySelectorAll<HTMLButtonElement>("[data-rich-command]").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
+  document.querySelectorAll<HTMLButtonElement>("[data-rich-command]").forEach((button) => button.addEventListener("click", () => applyRichInline(button.dataset.richCommand!)));
+  document.querySelector<HTMLButtonElement>("[data-rich-task]")?.addEventListener("mousedown", (event) => event.preventDefault());
+  document.querySelector<HTMLButtonElement>("[data-rich-task]")?.addEventListener("click", () => { const rich = document.querySelector<HTMLElement>("[data-rich-editor]"); if (rich) makeCurrentTask(rich); });
+  const toggleFocus = () => { focusMode = !focusMode; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-rich-editor]")?.focus()); };
   document.querySelector("#focus-mode")?.addEventListener("click", toggleFocus); document.querySelector("#expand-editor")?.addEventListener("click", toggleFocus);
   document.querySelector("#toolbar-more")?.addEventListener("click", () => { slashOpen = !slashOpen; slashIndex = 0; updateSlashMenu(); });
   bindTaskEvents(); bindSettingsEvents();
   document.querySelector("#close-help")?.addEventListener("click", () => { helpOpen = false; renderApp(); });
   document.querySelector("#help-overlay")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) { helpOpen = false; renderApp(); } });
-}
-function handleEditorKeydown(event: KeyboardEvent) {
-  const editor = event.currentTarget as HTMLTextAreaElement;
-  if (slashOpen && ["ArrowDown","ArrowUp","Enter","Escape"].includes(event.key)) { event.preventDefault(); event.stopPropagation(); if (event.key === "ArrowDown") slashIndex = (slashIndex + 1) % commands.length; if (event.key === "ArrowUp") slashIndex = (slashIndex - 1 + commands.length) % commands.length; if (event.key === "Enter") { insertCommand(slashIndex); return; } if (event.key === "Escape") slashOpen = false; updateSlashMenu(); }
-  if (event.key === "Tab" && !slashOpen) { event.preventDefault(); editor.setRangeText("  ", editor.selectionStart, editor.selectionEnd, "end"); updateNote(editor); }
 }
 function bindTaskEvents() {
   document.querySelector("#quick-task-form")?.addEventListener("submit", (event) => { event.preventDefault(); const input = document.querySelector<HTMLInputElement>("#quick-task-input")!; const text = input.value.trim(); if (!text) return; const timestamp = now(); state.todos.unshift({ id: uid("todo"), text, completed: false, created: timestamp, updated: timestamp }); void saveState(false); renderApp(); requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#quick-task-input")?.focus()); });
@@ -492,7 +614,7 @@ function cycleVisibleNote(direction: 1 | -1) {
   const active = document.activeElement; const region = active?.id === "title-input" ? "title" : active?.id === "markdown-editor" ? "body" : "row";
   const current = Math.max(0, rows.findIndex((row) => row.dataset.noteId === state.selectedNoteId)); const next = rows[(current + direction + rows.length) % rows.length];
   clearTimeout(saveTimer); void saveState(false); state.selectedNoteId = next.dataset.noteId!; renderApp();
-  requestAnimationFrame(() => { if (region === "title") document.querySelector<HTMLInputElement>("#title-input")?.focus(); else if (region === "body") document.querySelector<HTMLTextAreaElement>("#markdown-editor")?.focus(); else document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus(); });
+  requestAnimationFrame(() => { if (region === "title") document.querySelector<HTMLInputElement>("#title-input")?.focus(); else if (region === "body") document.querySelector<HTMLElement>("[data-rich-editor]")?.focus(); else document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(state.selectedNoteId)}"]`)?.focus(); });
 }
 document.addEventListener("pointerdown", (event) => { if (menuState && !(event.target as HTMLElement).closest("#context-menu") && !(event.target as HTMLElement).closest("[data-note-menu],[data-folder-menu],[data-todo-menu],#editor-menu,#list-menu")) closeMenu(false); });
 window.addEventListener("blur", () => closeMenu(false)); window.addEventListener("resize", () => closeMenu(false));
@@ -519,15 +641,15 @@ async function renderDetachedEditor(noteId: string) {
   try { note = isDesktopApp ? await invoke<Note | null>("load_note", { noteId }) : state.notes.find((item) => item.id === noteId) ?? null; } catch (error) { app.innerHTML = `<main class="detached-error"><i class="ph ph-warning-circle"></i><h1>Could not open this note</h1><p>${escapeHtml(String(error))}</p></main>`; return; }
   if (!note) { app.innerHTML = '<main class="detached-error"><i class="ph ph-note-blank"></i><h1>Note not found</h1><p>It may have been deleted in another window.</p></main>'; return; }
   note = { ...note, revision: note.revision ?? 0 }; let saveChain: Promise<boolean> = Promise.resolve(true); let saveTimerId = 0; let phase: "saving" | "saved" | "error" = "saved";
-  const shell = () => `<main class="detached-editor"><header class="detached-titlebar"><span class="detached-brand">Odo</span><span id="detached-save-state" class="detached-save-state ${phase}"><i class="ph ph-broadcast"></i>${phase === "saving" ? "Syncing…" : phase === "error" ? "Save failed" : "Live & saved"}</span><button class="attach-main-button" id="attach-main" aria-label="Attach this note to the main Odo window"><i class="ph ph-arrow-bend-up-left"></i>Attach to main window</button><kbd>${modLabel}+S</kbd></header><section class="detached-paper"><input id="detached-title" value="${attr(note!.title)}" aria-label="Note title"><textarea id="detached-body" aria-label="Note content" spellcheck="true">${escapeHtml(note!.content)}</textarea></section><footer class="detached-status"><span id="detached-count">${wordCount(note!.content)} words</span><span><i class="ph ph-broadcast"></i> Live sync</span><span>${modLabel}+W closes</span></footer></main>`;
+  const shell = () => `<main class="detached-editor"><header class="detached-titlebar"><span class="detached-brand">Odo</span><span id="detached-save-state" class="detached-save-state ${phase}"><i class="ph ph-broadcast"></i>${phase === "saving" ? "Syncing…" : phase === "error" ? "Save failed" : "Live & saved"}</span><button class="attach-main-button" id="attach-main" aria-label="Attach this note to the main Odo window"><i class="ph ph-arrow-bend-up-left"></i>Attach to main window</button><kbd>${modLabel}+S</kbd></header><section class="detached-paper"><input id="detached-title" value="${attr(note!.title)}" aria-label="Note title"><div id="detached-body" class="rich-editor detached-rich-editor" data-rich-editor contenteditable="true" role="textbox" aria-multiline="true" aria-label="Note content" spellcheck="true">${markdownToRich(note!.content)}</div></section><footer class="detached-status"><span id="detached-count">${wordCount(note!.content)} words</span><span><i class="ph ph-broadcast"></i> Live sync</span><span>${modLabel}+W closes</span></footer></main>`;
   const updatePhase = (next: typeof phase) => { phase = next; const node = document.querySelector<HTMLElement>("#detached-save-state"); if (node) { node.className = `detached-save-state ${phase}`; node.innerHTML = `<i class="ph ph-broadcast"></i>${phase === "saving" ? "Syncing…" : phase === "error" ? "Save failed" : "Live & saved"}`; } };
   const queueSave = (): Promise<boolean> => { if (!note) return Promise.resolve(false); clearTimeout(saveTimerId); updatePhase("saving"); saveChain = saveChain.catch(() => false).then(async () => { const snapshot = { ...note!, updated: now() }; note!.updated = snapshot.updated; try { if (isDesktopApp) note!.revision = await invoke<number>("save_note", { note: snapshot }); updatePhase("saved"); return true; } catch (error) { console.error("Could not save detached note:", error); updatePhase("error"); return false; } }); return saveChain; };
   const schedule = () => { clearTimeout(saveTimerId); updatePhase("saving"); saveTimerId = window.setTimeout(() => void queueSave(), 125); };
   const bindDetached = () => {
-    const title = document.querySelector<HTMLInputElement>("#detached-title")!; const body = document.querySelector<HTMLTextAreaElement>("#detached-body")!;
+    const title = document.querySelector<HTMLInputElement>("#detached-title")!; const body = document.querySelector<HTMLElement>("#detached-body")!;
     title.addEventListener("input", () => { note!.title = title.value; document.title = `${title.value || "Untitled"} — Odo`; schedule(); });
-    title.addEventListener("keydown", (event) => { if (event.isComposing) return; if (event.key === "Enter") { event.preventDefault(); body.focus(); body.setSelectionRange(body.value.length, body.value.length); } if (event.key === "Escape") { event.preventDefault(); body.focus(); } });
-    body.addEventListener("input", () => { note!.content = body.value; const count = document.querySelector<HTMLElement>("#detached-count"); if (count) count.textContent = `${wordCount(note!.content)} words`; schedule(); });
+    title.addEventListener("keydown", (event) => { if (event.isComposing) return; if (event.key === "Enter") { event.preventDefault(); placeCaretEnd(body.lastElementChild as HTMLElement ?? body); } if (event.key === "Escape") { event.preventDefault(); body.focus(); } });
+    bindRichEditor(body, (editor) => { note!.content = richToMarkdown(editor); const count = document.querySelector<HTMLElement>("#detached-count"); if (count) count.textContent = `${wordCount(note!.content)} words`; schedule(); });
     body.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); title.focus(); } });
     title.addEventListener("blur", () => void queueSave()); body.addEventListener("blur", () => void queueSave());
     document.querySelector("#attach-main")?.addEventListener("click", async (event) => { const button = event.currentTarget as HTMLButtonElement; clearTimeout(saveTimerId); button.disabled = true; const saved = await queueSave(); if (!saved) { button.disabled = false; return; } try { if (isDesktopApp) await invoke("attach_note_to_main", { noteId }); window.close(); } catch (error) { console.error("Could not attach detached note:", error); updatePhase("error"); button.disabled = false; } });
