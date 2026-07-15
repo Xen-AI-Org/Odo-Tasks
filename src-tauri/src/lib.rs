@@ -62,6 +62,16 @@ struct TodoCategory { id: String, name: String, color: String, #[serde(default)]
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct JournalEntry {
+    id: String,
+    date_key: String,
+    content: String,
+    created: String,
+    updated: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Workspace {
     folders: Vec<Folder>,
     notes: Vec<Note>,
@@ -69,6 +79,8 @@ struct Workspace {
     todos: Vec<Todo>,
     #[serde(default)]
     todo_categories: Vec<TodoCategory>,
+    #[serde(default)]
+    journal_entries: Vec<JournalEntry>,
     selected_folder_id: String,
     selected_note_id: String,
     #[serde(default = "default_sort_mode")]
@@ -162,6 +174,9 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
              );
              CREATE TABLE IF NOT EXISTS todo_categories (
                id TEXT PRIMARY KEY, name TEXT NOT NULL, color TEXT NOT NULL, icon TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS journal_entries (
+               id TEXT PRIMARY KEY, date_key TEXT NOT NULL UNIQUE, content TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, updated TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(|error| format!("Could not initialize the workspace database: {error}"))?;
@@ -203,6 +218,7 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
             "DELETE FROM folders;
              DELETE FROM todos;
              DELETE FROM todo_categories;
+             DELETE FROM journal_entries;
              CREATE TEMP TABLE IF NOT EXISTS incoming_note_ids (id TEXT PRIMARY KEY);
              DELETE FROM incoming_note_ids;",
         )
@@ -287,6 +303,12 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
                 ],
             )
             .map_err(|error| format!("Could not save a task: {error}"))?;
+    }
+    for (position, entry) in workspace.journal_entries.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO journal_entries (id, date_key, content, created, updated, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![entry.id, entry.date_key, entry.content, entry.created, entry.updated, position as i64],
+        ).map_err(|error| format!("Could not save a journal entry: {error}"))?;
     }
 
     transaction
@@ -384,6 +406,8 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .map_err(|error| format!("Could not decode tasks: {error}"))?;
     let mut category_statement = connection.prepare("SELECT id,name,color,icon FROM todo_categories ORDER BY position").map_err(|error| format!("Could not read task categories: {error}"))?;
     let todo_categories = category_statement.query_map([], |row| Ok(TodoCategory { id: row.get(0)?, name: row.get(1)?, color: row.get(2)?, icon: row.get(3)? })).map_err(|error| format!("Could not query task categories: {error}"))?.collect::<Result<Vec<_>, _>>().map_err(|error| format!("Could not decode categories: {error}"))?;
+    let mut journal_statement = connection.prepare("SELECT id,date_key,content,created,updated FROM journal_entries ORDER BY date_key DESC, position").map_err(|error| format!("Could not read journal entries: {error}"))?;
+    let journal_entries = journal_statement.query_map([], |row| Ok(JournalEntry { id: row.get(0)?, date_key: row.get(1)?, content: row.get(2)?, created: row.get(3)?, updated: row.get(4)? })).map_err(|error| format!("Could not query journal entries: {error}"))?.collect::<Result<Vec<_>, _>>().map_err(|error| format!("Could not decode journal entries: {error}"))?;
 
     let selected_folder_id = connection
         .query_row(
@@ -419,6 +443,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         notes,
         todos,
         todo_categories,
+        journal_entries,
         selected_folder_id,
         selected_note_id,
         sort_mode,
@@ -668,15 +693,16 @@ mod tests {
     fn workspace_round_trip_preserves_notes_folders_and_tasks() {
         let mut connection = Connection::open_in_memory().expect("open in-memory database");
         initialize_database(&connection).expect("initialize schema");
-        let input = r##"{
+        let input = r###"{
           "folders":[{"id":"inbox","name":"Inbox","parentId":null,"open":true,"icon":"ph-tray"}],
           "notes":[{"id":"note-1","folderId":"inbox","title":"Test","content":"Body","updated":"2026-07-15T00:00:00.000Z","status":"active","pinned":true}],
           "todos":[{"id":"todo-1","text":"Ship it","completed":false,"created":"2026-07-15T00:00:00.000Z","updated":"2026-07-15T00:00:00.000Z","categoryId":"work","priority":"high","effort":4,"color":"#7499b1","scheduledStart":"2026-07-15T09:00:00.000Z","durationMinutes":90}],
           "todoCategories":[{"id":"inbox","name":"Inbox","color":"#7b8e7c"},{"id":"work","name":"Work","color":"#7499b1"}],
+          "journalEntries":[{"id":"journal-1","dateKey":"2026-07-15","content":"## 9:30 AM\n\nA calm start.","created":"2026-07-15T09:30:00.000Z","updated":"2026-07-15T09:30:00.000Z"}],
           "selectedFolderId":"inbox",
           "selectedNoteId":"note-1",
           "sortMode":"manual", "plannerView":"4"
-        }"##;
+        }"###;
 
         write_workspace(&mut connection, input).expect("save workspace");
         let workspace = read_workspace(&connection)
@@ -691,6 +717,8 @@ mod tests {
         assert_eq!(workspace.todos[0].scheduled_start.as_deref(), Some("2026-07-15T09:00:00.000Z"));
         assert_eq!(workspace.todos[0].duration_minutes, 90);
         assert_eq!(workspace.todo_categories.len(), 2);
+        assert_eq!(workspace.journal_entries.len(), 1);
+        assert_eq!(workspace.journal_entries[0].date_key, "2026-07-15");
         assert_eq!(workspace.planner_view, "4");
         assert_eq!(workspace.selected_note_id, "note-1");
         assert_eq!(workspace.sort_mode, "manual");

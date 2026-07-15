@@ -4,15 +4,16 @@ import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 
 type NoteStatus = "active" | "archived" | "trash";
-type View = "notes" | "tasks" | "settings" | "archived" | "trash";
+type View = "notes" | "tasks" | "journal" | "settings" | "archived" | "trash";
 type SortMode = "newest" | "oldest" | "manual";
 type Folder = { id: string; name: string; parentId: string | null; open: boolean; icon?: string };
 type Note = { id: string; folderId: string; title: string; content: string; updated: string; status: NoteStatus; pinned?: boolean; revision: number };
 type Priority = "low" | "medium" | "high" | "urgent";
 type Todo = { id: string; text: string; completed: boolean; created: string; updated: string; categoryId: string; priority: Priority; effort: number; color: string; scheduledStart: string | null; durationMinutes: number };
 type TodoCategory = { id: string; name: string; color: string; icon?: string };
+type JournalEntry = { id: string; dateKey: string; content: string; created: string; updated: string };
 type PlannerView = "1" | "3" | "4" | "7";
-type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; todoCategories: TodoCategory[]; selectedFolderId: string; selectedNoteId: string; sortMode: SortMode; plannerView: PlannerView };
+type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; todoCategories: TodoCategory[]; journalEntries: JournalEntry[]; selectedFolderId: string; selectedNoteId: string; sortMode: SortMode; plannerView: PlannerView };
 type StorageInfo = { databasePath: string; backupDirectory: string };
 type SavePhase = "idle" | "saving" | "saved" | "error";
 type MenuItem = { label?: string; icon?: string; hint?: string; action?: string; disabled?: boolean; danger?: boolean; separator?: boolean };
@@ -40,7 +41,7 @@ const starterFolders: Folder[] = [
 const starterNotes: Note[] = [
   { id: "welcome", folderId: "inbox", title: "Welcome to Odo", updated: now(), status: "active", pinned: true, revision: 0, content: "## A calm place for your work\n\nCapture ideas, organize projects, and keep your day moving.\n\n- Press Ctrl+N for a new note\n- Press Ctrl+2 for Tasks\n- Type / on a new line for blocks" },
 ];
-const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], todoCategories: [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest", plannerView: "3" });
+const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], todoCategories: [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }], journalEntries: [], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest", plannerView: "3" });
 
 const escapeHtml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#039;");
 const attr = escapeHtml;
@@ -53,7 +54,8 @@ function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Works
   const categories = Array.isArray(input?.todoCategories) && input.todoCategories.length ? input.todoCategories : [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }];
   const todos = (Array.isArray(input?.todos) ? input.todos : []).map((todo) => ({ ...todo, categoryId: todo.categoryId || "inbox", priority: (todo.priority || "medium") as Priority, effort: todo.effort || 2, color: todo.color || "", scheduledStart: todo.scheduledStart || null, durationMinutes: todo.durationMinutes || 30 }));
   const plannerView: PlannerView = ["1", "3", "4", "7"].includes(input?.plannerView || "") ? input!.plannerView as PlannerView : "3";
-  return { folders, notes, todos, todoCategories: categories, selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "", sortMode, plannerView };
+  const journalEntries = (Array.isArray(input?.journalEntries) ? input.journalEntries : []).filter((entry): entry is JournalEntry => !!entry && typeof entry.dateKey === "string").map((entry) => ({ id: entry.id || uid("journal"), dateKey: entry.dateKey, content: entry.content || "", created: entry.created || now(), updated: entry.updated || entry.created || now() }));
+  return { folders, notes, todos, todoCategories: categories, journalEntries, selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "", sortMode, plannerView };
 }
 function initialState(): Workspace {
   if (!isDesktopApp) try { const saved = localStorage.getItem(STORAGE_KEY); if (saved) return normalizeWorkspace(JSON.parse(saved) as Workspace); } catch { localStorage.removeItem(STORAGE_KEY); }
@@ -93,6 +95,9 @@ let plannerDragTodoId = "";
 let plannerPopover: { x: number; y: number; returnId: string } | null = null;
 let plannerPointerDragging = false;
 let plannerPointerDrop: { date: string; minute: number } | null = null;
+let selectedJournalDate = "";
+let journalOpening = false;
+let journalSaveTimer = 0;
 
 const commands = [
   { label: "Text", detail: "Just start writing.", icon: "ph-text-t", value: "" },
@@ -176,7 +181,7 @@ function renderFolder(folder: Folder, depth = 0): string {
 function renderSidebar() {
   const remaining = state.todos.filter((todo) => !todo.completed).length;
   return `<aside class="folders-panel" aria-label="Workspace navigation"><header class="brand-row"><button class="wordmark" id="wordmark" title="Go to Inbox">Odo</button><button class="icon-button sidebar-toggle" title="${sidebarCollapsed ? "Show" : "Hide"} sidebar" aria-label="${sidebarCollapsed ? "Show" : "Hide"} sidebar"><i class="ph ph-sidebar-simple"></i></button></header>
-    <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button></nav>
+    <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button><button class="primary-link ${currentView === "journal" ? "is-selected" : ""}" data-view="journal" aria-label="Journal"><i class="ph ph-book-open-text"></i><span>Journal</span></button></nav>
     <div class="panel-label-row"><span>Folders</span><button class="icon-button" id="new-folder" title="New folder (${modLabel}+Shift+N)"><i class="ph ph-plus"></i></button></div><nav class="folder-tree" id="folder-tree">${state.folders.filter((folder) => folder.parentId === null && folder.id !== "inbox").map((folder) => renderFolder(folder)).join("")}</nav>
     <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
 }
@@ -306,6 +311,38 @@ function renderCalendarDayHeader(date: Date) { const today=dateKey(date)===dateK
 function renderCalendarColumn(date: Date) { const key=dateKey(date); const nowDate=new Date(); const isToday=key===dateKey(nowDate); const tasks=state.todos.filter(todo=>todo.scheduledStart && dateKey(new Date(todo.scheduledStart))===key); const slots=Array.from({length:48},(_,i)=>`<div class="calendar-slot" data-slot-date="${key}" data-slot-minute="${i*30}"></div>`).join(""); const current=isToday?`<div class="now-line" style="top:${(nowDate.getHours()*60+nowDate.getMinutes())/30*slotHeight}px"><span>Now</span></div>`:""; return `<div class="calendar-column" data-calendar-date="${key}">${slots}${tasks.map(renderCalendarTask).join("")}${current}</div>`; }
 function renderCalendarTask(todo: Todo) { const start=taskTime(todo)!; const category=categoryFor(todo); const minutes=start.getHours()*60+start.getMinutes(); const top=minutes/30*slotHeight; const height=Math.max(slotHeight,todo.durationMinutes/30*slotHeight); const ending=new Date(start.getTime()+todo.durationMinutes*60000); return `<article class="calendar-task ${todo.completed?"is-complete":""}" data-calendar-task="${attr(todo.id)}" data-todo-id="${attr(todo.id)}" tabindex="0" role="button" style="top:${top}px;height:${height}px;--task-color:${attr(todo.color||category.color)}"><div class="calendar-task-content"><span class="priority-band ${todo.priority}"></span><button class="calendar-check" data-toggle-todo="${attr(todo.id)}" aria-label="Complete task"><i class="ph ph-check"></i></button><div><small>${start.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})} – ${ending.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}</small><strong>${escapeHtml(todo.text)}</strong></div></div><span class="calendar-resize" data-resize-todo="${attr(todo.id)}" title="Resize duration"></span></article>`; }
 function renderPlannerProperties(todo: Todo) { const category=categoryFor(todo); const popover=plannerPopover ?? {x:window.innerWidth-315,y:90,returnId:todo.id}; return `<div class="planner-properties-backdrop" data-close-properties><section class="planner-properties" role="dialog" aria-modal="false" aria-label="Task properties" tabindex="-1" style="left:${popover.x}px;top:${popover.y}px"><header><div><span class="eyebrow">Task properties</span><h2>${escapeHtml(todo.text)}</h2></div><button class="icon-button" data-close-properties aria-label="Close"><i class="ph ph-x"></i></button></header><label>Category<select data-prop="categoryId">${state.todoCategories.map(c=>`<option value="${attr(c.id)}" ${c.id===todo.categoryId?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</select></label><div class="property-two"><label>Priority<select data-prop="priority">${["low","medium","high","urgent"].map(p=>`<option ${p===todo.priority?"selected":""}>${p}</option>`).join("")}</select></label><label>Effort<select data-prop="effort">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===todo.effort?"selected":""}>${n} / 5</option>`).join("")}</select></label></div><label>Color<input data-prop="color" type="color" value="${attr(todo.color||category.color)}"></label><label>Start<input data-prop="scheduledStart" type="datetime-local" value="${todo.scheduledStart?todo.scheduledStart.slice(0,16):""}"></label><label>Duration<select data-prop="durationMinutes">${[30,60,90,120,150,180,240].map(n=>`<option value="${n}" ${n===todo.durationMinutes?"selected":""}>${n} minutes</option>`).join("")}</select></label><footer><button class="secondary-button" data-unschedule>Unschedule</button><button class="secondary-button ${todo.completed?"":""}" data-toggle-todo="${attr(todo.id)}">${todo.completed?"Reopen":"Complete"}</button><button class="danger-button" data-delete-todo="${attr(todo.id)}">Delete</button></footer></section></div>`; }
+
+function journalDateLabel(key: string) { const date = new Date(`${key}T12:00:00`); return date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" }); }
+function journalTime(iso: string) { return new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", hour12: true }).replace(/\s([ap]m)$/i, (_match, marker: string) => ` ${marker.toUpperCase()}`); }
+function journalSessions(entry: JournalEntry) { return (entry.content.match(/^##\s+.+$/gm) || []).length; }
+function journalExcerpt(entry: JournalEntry) { return noteExcerpt(entry.content).slice(0, 170) || "An open page, waiting for a thought."; }
+function entryForDate(key: string) { return state.journalEntries.find((entry) => entry.dateKey === key); }
+function ensureJournalEntry(key: string) {
+  let entry = entryForDate(key);
+  if (!entry) { const timestamp = now(); entry = { id: uid("journal"), dateKey: key, content: "", created: timestamp, updated: timestamp }; state.journalEntries.push(entry); }
+  selectedJournalDate = key; return entry;
+}
+function appendJournalSession(entry: JournalEntry) {
+  const heading = `## ${journalTime(now())}`;
+  entry.content = `${entry.content.trimEnd()}${entry.content.trim() ? "\n\n" : ""}${heading}\n\n`;
+  entry.updated = now();
+}
+function openJournalToday(allowSession = true) {
+  const key = dateKey(new Date()); const existing = entryForDate(key); const gap = existing ? Date.now() - new Date(existing.updated).getTime() : Infinity;
+  const entry = ensureJournalEntry(key);
+  if (allowSession && (!existing || gap > 4 * 60_000) && !journalOpening) appendJournalSession(entry);
+  journalOpening = true; window.setTimeout(() => { journalOpening = false; }, 650);
+  void saveState(false); renderApp();
+  requestAnimationFrame(() => { const editor = document.querySelector<HTMLElement>("[data-journal-editor]"); if (editor) placeCaretEnd(editor.lastElementChild as HTMLElement ?? editor); });
+}
+function renderJournalCard(entry: JournalEntry) {
+  const selected = entry.dateKey === selectedJournalDate; const today = entry.dateKey === dateKey(new Date()); const sessions = journalSessions(entry);
+  return `<article class="journal-card ${selected ? "is-expanded" : ""} ${today ? "is-today" : ""} ${!entry.content.trim() ? "is-empty-day" : ""}" data-journal-card="${attr(entry.dateKey)}" aria-expanded="${selected}" tabindex="0"><header class="journal-card-header"><div><span class="journal-day">${escapeHtml(new Date(`${entry.dateKey}T12:00:00`).toLocaleDateString(undefined, { weekday: "short" }).toUpperCase())}</span><h2>${escapeHtml(journalDateLabel(entry.dateKey))}</h2></div><div class="journal-card-meta">${today ? '<span class="today-chip">Today</span>' : ""}<span><i class="ph ph-clock"></i>${sessions || "No"} ${sessions === 1 ? "session" : "sessions"}</span><time>${journalTime(entry.updated)}</time></div></header>${selected ? `<div class="journal-expanded"><div class="journal-session-rail"><span></span><small>Writing sessions are saved as you go</small></div><div class="journal-editor-wrap">${!entry.content.trim() ? '<p class="journal-begin">Begin this day with a small, honest note.</p>' : ""}<div class="rich-editor journal-rich-editor" data-rich-editor data-journal-editor contenteditable="true" role="textbox" aria-multiline="true" aria-label="Journal entry for ${attr(journalDateLabel(entry.dateKey))}" spellcheck="true">${markdownToRich(entry.content)}</div></div></div>` : `<button class="journal-card-preview" data-open-journal="${attr(entry.dateKey)}" aria-label="Open journal for ${attr(journalDateLabel(entry.dateKey))}"><p>${escapeHtml(journalExcerpt(entry))}</p><span>Open day <i class="ph ph-arrow-up-right"></i></span></button>`}</article>`;
+}
+function renderJournal() {
+  const selected = selectedJournalDate || dateKey(new Date()); const entries = [...state.journalEntries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+  return `<main class="journal-view" aria-label="Journal"><header class="journal-header"><div><span class="eyebrow">Private practice</span><h1>Journal</h1><p>A quiet record of your day, one honest session at a time.</p></div><div class="journal-actions"><button class="secondary-button" id="journal-prev" aria-label="Previous day"><i class="ph ph-caret-left"></i></button><button class="today-button" id="journal-today">Today</button><button class="secondary-button" id="journal-next" aria-label="Next day"><i class="ph ph-caret-right"></i></button><input id="journal-date" type="date" value="${attr(selected)}" aria-label="Jump to journal date"><button class="primary-button" id="journal-new-time"><i class="ph ph-pen-nib"></i>New timestamp</button></div></header><div class="journal-status" aria-live="polite"></div><section class="journal-timeline" aria-label="Journal timeline">${entries.length ? entries.map(renderJournalCard).join("") : '<div class="journal-empty"><i class="ph ph-book-open-text"></i><h2>Your first page is waiting</h2><p>Open today to begin a private daily practice.</p></div>'}</section></main>`;
+}
 function renderSettings() {
   return `<main class="wide-view settings-view"><header class="wide-header"><div><span class="eyebrow">Preferences</span><h1>Settings</h1><p>Make Odo feel at home on this computer.</p></div><button class="icon-button close-wide" data-go-inbox title="Back to notes"><i class="ph ph-x"></i></button></header><div class="settings-sheet">
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-database"></i><div><h2>Storage & backups</h2><p>${isDesktopApp ? "Your workspace is stored locally on this computer." : "Browser mode stores this workspace in local storage."}</p></div></div>${isDesktopApp ? `<div class="path-grid"><span>Database</span><code>${escapeHtml(storageInfo?.databasePath ?? "Loading…")}</code><span>Backups</span><code>${escapeHtml(storageInfo?.backupDirectory ?? "Loading…")}</code></div><button class="secondary-button" id="create-backup" ${storageError ? "disabled" : ""}><i class="ph ph-cloud-arrow-up"></i>Create backup</button>${storageError ? `<p class="inline-error">${escapeHtml(storageError)}</p>` : ""}` : '<div class="browser-note"><i class="ph ph-info"></i>Install and open the desktop app to create file backups.</div>'}</section>
@@ -340,7 +377,7 @@ function renderApp() {
   document.documentElement.classList.toggle("no-motion", !motionEnabled);
   const app = document.querySelector<HTMLElement>("#app")!;
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}`;
-  const content = currentView === "tasks" ? renderTasks() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor();
+  const content = currentView === "tasks" ? renderTasks() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor();
   app.innerHTML = `${renderSidebar()}${content}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
   updateSaveStatus(); bindEvents(); bindOdoDialog();
   if (currentView === "tasks") requestAnimationFrame(() => scrollPlannerToNow());
@@ -381,7 +418,7 @@ function createFolder(name: string) {
   if (parent) parent.open = true; state.folders.push(folder); state.selectedFolderId = folder.id; currentView = "notes"; state.selectedNoteId = ""; void saveState(false); renderApp();
 }
 function setView(view: View) {
-  currentView = view; focusMode = false; searchQuery = ""; repairState(); renderApp();
+  currentView = view; focusMode = false; searchQuery = ""; if (view === "journal") { openJournalToday(true); return; } repairState(); renderApp();
   if (view === "settings" && isDesktopApp && !storageInfo) void loadStorageInfo();
 }
 async function loadStorageInfo() {
@@ -789,9 +826,21 @@ function bindEvents() {
   const toggleFocus = () => { focusMode = !focusMode; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-rich-editor]")?.focus()); };
   document.querySelector("#focus-mode")?.addEventListener("click", toggleFocus); document.querySelector("#expand-editor")?.addEventListener("click", toggleFocus);
   document.querySelector("#toolbar-more")?.addEventListener("click", () => { slashOpen = !slashOpen; slashIndex = 0; updateSlashMenu(); });
-  bindTaskEvents(); bindSettingsEvents();
+  bindTaskEvents(); bindJournalEvents(); bindSettingsEvents();
   document.querySelector("#close-help")?.addEventListener("click", () => { helpOpen = false; renderApp(); });
   document.querySelector("#help-overlay")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) { helpOpen = false; renderApp(); } });
+}
+function bindJournalEvents() {
+  const selectDay = (key: string, focus = false) => { ensureJournalEntry(key); void saveState(false); renderApp(); if (focus) requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-journal-editor]")?.focus()); };
+  document.querySelector("#journal-today")?.addEventListener("click", () => openJournalToday(true));
+  document.querySelector("#journal-prev")?.addEventListener("click", () => { const date = new Date(`${(selectedJournalDate || dateKey(new Date()))}T12:00:00`); date.setDate(date.getDate() - 1); selectDay(dateKey(date)); });
+  document.querySelector("#journal-next")?.addEventListener("click", () => { const date = new Date(`${(selectedJournalDate || dateKey(new Date()))}T12:00:00`); date.setDate(date.getDate() + 1); selectDay(dateKey(date)); });
+  document.querySelector<HTMLInputElement>("#journal-date")?.addEventListener("change", (event) => { const key = (event.target as HTMLInputElement).value; if (key) selectDay(key); });
+  document.querySelector("#journal-new-time")?.addEventListener("click", () => { const entry = ensureJournalEntry(selectedJournalDate || dateKey(new Date())); appendJournalSession(entry); void saveState(false); renderApp(); requestAnimationFrame(() => { const editor = document.querySelector<HTMLElement>("[data-journal-editor]"); if (editor) placeCaretEnd(editor.lastElementChild as HTMLElement ?? editor); }); });
+  document.querySelectorAll<HTMLElement>("[data-journal-card]").forEach((card) => { const open = () => selectDay(card.dataset.journalCard!, false); card.addEventListener("click", (event) => { if ((event.target as HTMLElement).closest("[data-journal-editor],input,button")) return; if (card.dataset.journalCard !== selectedJournalDate) open(); }); card.addEventListener("keydown", (event) => { if (event.target !== card || (event.key !== "Enter" && event.key !== " ")) return; event.preventDefault(); open(); }); });
+  document.querySelectorAll<HTMLElement>("[data-open-journal]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); selectDay(button.dataset.openJournal!, true); }));
+  const editor = document.querySelector<HTMLElement>("[data-journal-editor]");
+  if (editor) bindRichEditor(editor, (rich) => { const entry = entryForDate(selectedJournalDate); if (!entry) return; entry.content = richToMarkdown(rich); entry.updated = now(); clearTimeout(journalSaveTimer); journalSaveTimer = window.setTimeout(() => void saveState(false), 350); const status = document.querySelector<HTMLElement>(".journal-status"); if (status) status.textContent = `Saved ${journalTime(entry.updated)}`; });
 }
 function bindTaskEvents() {
   document.querySelector("#quick-task-form")?.addEventListener("submit", (event) => { event.preventDefault(); const input = document.querySelector<HTMLInputElement>("#quick-task-input")!; const text = input.value.trim(); if (!text) return; addPlannerTodo(text); });
