@@ -220,6 +220,55 @@ fn validate_folder_parent(
     Ok(())
 }
 
+fn normalize_folder_parent_for_create(
+    connection: &Connection,
+    parent_id: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(parent_id) = parent_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let parent_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM folders WHERE id=?1)",
+            [&parent_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not validate the parent folder: {error}"))?;
+    Ok(parent_exists.then_some(parent_id))
+}
+
+const MAX_NOTE_TITLE_CHARS: usize = 1_000;
+
+fn validate_note_title(title: &str) -> Result<(), String> {
+    if title.trim().is_empty() {
+        return Err("Note title cannot be empty".into());
+    }
+    if title.chars().count() > MAX_NOTE_TITLE_CHARS {
+        return Err(format!(
+            "Note title cannot exceed {MAX_NOTE_TITLE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+fn backup_identifier(timestamp: i64) -> String {
+    format!("workspace-mcp-{timestamp}.sqlite3")
+}
+
+fn empty_paginated(collection: &str, offset: u32) -> Value {
+    let mut value = json!({
+        "limit": 0,
+        "offset": offset,
+        "hasMore": false,
+        "nextOffset": Value::Null,
+    });
+    value[collection] = json!([]);
+    value
+}
+
 fn delete_folder_tree(connection: &mut Connection, id: &str) -> Result<usize, String> {
     let transaction = connection
         .transaction()
@@ -525,6 +574,7 @@ pub struct GetNoteArgs {
 #[serde(rename_all = "camelCase")]
 pub struct CreateNoteArgs {
     pub folder_id: Option<String>,
+    #[schemars(length(min = 1, max = 1000))]
     pub title: String,
     pub content: Option<String>,
     pub pinned: Option<bool>,
@@ -535,6 +585,7 @@ pub struct CreateNoteArgs {
 pub struct UpdateNoteArgs {
     pub id: String,
     pub expected_revision: i64,
+    #[schemars(length(min = 1, max = 1000))]
     pub title: Option<String>,
     pub content: Option<String>,
     pub folder_id: Option<String>,
@@ -678,6 +729,7 @@ pub struct BatchOperation {
     pub folder_id: Option<String>,
     pub status: Option<String>,
     pub pinned: Option<bool>,
+    #[schemars(length(min = 1, max = 1000))]
     pub title: Option<String>,
     pub content: Option<String>,
     pub text: Option<String>,
@@ -849,6 +901,7 @@ impl OdoMcp {
         let title = args
             .title
             .unwrap_or_else(|| current["title"].as_str().unwrap_or_default().into());
+        validate_note_title(&title)?;
         let content = args
             .content
             .unwrap_or_else(|| current["content"].as_str().unwrap_or_default().into());
@@ -904,7 +957,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Create an immediate consistent SQLite backup in Odo's local backups directory"
+        description = "Create an immediate consistent SQLite backup in Odo's private local backups directory and return an opaque backupId without exposing the filesystem path"
     )]
     async fn workspace_backup(&self) -> Result<CallToolResult, McpError> {
         tool_result((|| {
@@ -916,7 +969,8 @@ impl OdoMcp {
                 .join("backups");
             fs::create_dir_all(&directory)
                 .map_err(|e| format!("Could not create backup directory: {e}"))?;
-            let destination = directory.join(format!("workspace-mcp-{}.sqlite3", now_epoch()));
+            let backup_id = backup_identifier(now_epoch());
+            let destination = directory.join(&backup_id);
             connection
                 .backup("main", &destination, None)
                 .map_err(|e| format!("Could not create backup: {e}"))?;
@@ -928,7 +982,7 @@ impl OdoMcp {
                 "success",
                 "",
             );
-            Ok(json!({"path":destination,"created":true}))
+            Ok(json!({"backupId":backup_id,"created":true}))
         })())
     }
 
@@ -942,12 +996,17 @@ impl OdoMcp {
         tool_result((|| {
             let query = args.query.trim();
             if query.is_empty() {
-                return Err("query must not be empty".into());
+                return Err("Query must not be empty".into());
             }
             let c = self.connection()?;
             let pattern = format!("%{query}%");
-            let limit = args.limit.unwrap_or(50).clamp(1, 200);
+            let limit = args.limit.unwrap_or(50).min(200);
             let offset = args.offset.unwrap_or(0);
+            if limit == 0 {
+                let mut page = empty_paginated("results", offset);
+                page["query"] = Value::String(query.to_string());
+                return Ok(page);
+            }
             let mut statement = c.prepare(
                 "SELECT kind,id,label,excerpt,status,revision,completed,scheduled_start,date_key FROM (
                    SELECT 'note' AS kind,id,title AS label,substr(content,1,240) AS excerpt,status,revision,NULL AS completed,NULL AS scheduled_start,NULL AS date_key,updated AS sort_key
@@ -1017,7 +1076,10 @@ impl OdoMcp {
                         let id = operation
                             .id
                             .unwrap_or_else(|| format!("note-{}", uuid::Uuid::new_v4()));
-                        tx.execute("INSERT INTO notes(id,folder_id,title,content,updated,status,pinned,position,revision) VALUES(?1,?2,?3,?4,?5,'active',?6,(SELECT COALESCE(MAX(position),-1)+1 FROM notes),0)",params![id,operation.folder_id.unwrap_or_else(||"inbox".into()),operation.title.unwrap_or_else(||"Untitled".into()),operation.content.unwrap_or_default(),now_iso(),operation.pinned.unwrap_or(false)]).map_err(|e|format!("Batch item {index}: {e}"))?;
+                        let title = operation.title.unwrap_or_else(|| "Untitled".into());
+                        validate_note_title(&title)
+                            .map_err(|error| format!("Batch item {index}: {error}"))?;
+                        tx.execute("INSERT INTO notes(id,folder_id,title,content,updated,status,pinned,position,revision) VALUES(?1,?2,?3,?4,?5,'active',?6,(SELECT COALESCE(MAX(position),-1)+1 FROM notes),0)",params![id,operation.folder_id.unwrap_or_else(||"inbox".into()),title,operation.content.unwrap_or_default(),now_iso(),operation.pinned.unwrap_or(false)]).map_err(|e|format!("Batch item {index}: {e}"))?;
                         json!({"id":id,"revision":0})
                     }
                     "notes.update" | "notes.move" | "notes.status" | "notes.pin" => {
@@ -1032,7 +1094,10 @@ impl OdoMcp {
                         if !matches!(status.as_str(), "active" | "archived" | "trash") {
                             return Err(format!("Batch item {index}: invalid note status"));
                         }
-                        tx.execute("UPDATE notes SET folder_id=?2,title=?3,content=?4,status=?5,pinned=?6,updated=?7,revision=revision+1 WHERE id=?1 AND revision=?8",params![id,operation.folder_id.unwrap_or(current.0),operation.title.unwrap_or(current.1),operation.content.unwrap_or(current.2),status,operation.pinned.unwrap_or(current.4),now_iso(),expected]).map_err(|e|e.to_string())?;
+                        let title = operation.title.unwrap_or(current.1);
+                        validate_note_title(&title)
+                            .map_err(|error| format!("Batch item {index}: {error}"))?;
+                        tx.execute("UPDATE notes SET folder_id=?2,title=?3,content=?4,status=?5,pinned=?6,updated=?7,revision=revision+1 WHERE id=?1 AND revision=?8",params![id,operation.folder_id.unwrap_or(current.0),title,operation.content.unwrap_or(current.2),status,operation.pinned.unwrap_or(current.4),now_iso(),expected]).map_err(|e|e.to_string())?;
                         json!({"id":id,"revision":expected+1})
                     }
                     "tasks.create" => {
@@ -1118,7 +1183,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Create a folder, optionally nested under an existing parent folder, and return the complete created folder object. Missing parent IDs are rejected. icon defaults to ph-folder and must be one of the exact 50 values from folders_list.allowedIcons; archive, trash, delete, add, edit, and other action icons are reserved and rejected."
+        description = "Create a folder, optionally nested under an existing parent folder, and return the complete created folder object. A missing, empty, or unknown parentId is normalized to the workspace root. icon defaults to ph-folder and must be one of the exact 50 values from folders_list.allowedIcons; archive, trash, delete, add, edit, and other action icons are reserved and rejected."
     )]
     async fn folders_create(
         &self,
@@ -1129,10 +1194,10 @@ impl OdoMcp {
             if args.name.trim().is_empty() {
                 return Err("Folder name cannot be empty".into());
             }
-            validate_folder_parent(&c, None, args.parent_id.as_deref())?;
+            let parent_id = normalize_folder_parent_for_create(&c, args.parent_id)?;
             let icon = validate_folder_icon(args.icon)?;
             let id = format!("folder-{}", uuid::Uuid::new_v4());
-            c.execute("INSERT INTO folders(id,name,parent_id,is_open,icon,position) VALUES(?1,?2,?3,1,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM folders))",params![id,args.name.trim(),args.parent_id,icon]).map_err(|e|format!("Could not create folder: {e}"))?;
+            c.execute("INSERT INTO folders(id,name,parent_id,is_open,icon,position) VALUES(?1,?2,?3,1,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM folders))",params![id,args.name.trim(),parent_id,icon]).map_err(|e|format!("Could not create folder: {e}"))?;
             bump_change(&c)?;
             audit(
                 &c,
@@ -1251,8 +1316,11 @@ impl OdoMcp {
     ) -> Result<CallToolResult, McpError> {
         tool_result((|| {
             let c = self.connection()?;
-            let limit = args.limit.unwrap_or(100).clamp(1, 500);
+            let limit = args.limit.unwrap_or(100).min(500);
             let offset = args.offset.unwrap_or(0);
+            if limit == 0 {
+                return Ok(empty_paginated("notes", offset));
+            }
             let mut sql="SELECT id,folder_id,title,content,updated,status,pinned,revision FROM notes WHERE 1=1".to_string();
             let mut values: Vec<String> = vec![];
             if let Some(v) = args.folder_id {
@@ -1283,7 +1351,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Read a complete note including Markdown content and the revision required for safe updates. Provide exactly one lookup field: id for an exact note ID, or title for a case-insensitive exact title. Duplicate titles are rejected with matching IDs so the caller can disambiguate."
+        description = "Read a complete note including Markdown content and the revision required for safe updates. Provide exactly one lookup field: id or title. id first checks an exact note ID, then falls back to a case-insensitive exact title for clients that put a known title in the id field. title performs the same title lookup. Duplicate titles are rejected with matching IDs so the caller can disambiguate."
     )]
     async fn notes_get(
         &self,
@@ -1292,7 +1360,15 @@ impl OdoMcp {
         tool_result((|| {
             let connection = self.connection()?;
             match (args.id, args.title) {
-                (Some(id), None) if !id.trim().is_empty() => Self::note_json(&connection, &id),
+                (Some(id), None) if !id.trim().is_empty() => {
+                    match Self::note_json(&connection, &id) {
+                        Ok(note) => Ok(note),
+                        Err(error) if error == format!("Note '{id}' was not found") => {
+                            Self::note_json_by_title(&connection, id.trim())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
                 (None, Some(title)) if !title.trim().is_empty() => {
                     Self::note_json_by_title(&connection, title.trim())
                 }
@@ -1302,13 +1378,16 @@ impl OdoMcp {
         })())
     }
 
-    #[tool(description = "Create a Markdown note in a folder; defaults to Inbox")]
+    #[tool(
+        description = "Create a Markdown note in a folder and return the complete note object; defaults to Inbox. title is required, cannot be blank, and must contain at most 1,000 characters."
+    )]
     async fn notes_create(
         &self,
         Parameters(args): Parameters<CreateNoteArgs>,
     ) -> Result<CallToolResult, McpError> {
         let result = (|| {
             let c = self.connection()?;
+            validate_note_title(&args.title)?;
             let id = format!("note-{}", uuid::Uuid::new_v4());
             let folder = args.folder_id.unwrap_or_else(|| "inbox".into());
             let updated = now_iso();
@@ -1332,7 +1411,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Safely update note fields using expectedRevision; rejects stale writes instead of overwriting newer edits"
+        description = "Safely update note fields using expectedRevision and return the complete updated note; rejects stale writes instead of overwriting newer edits. If title is supplied, it cannot be blank and must contain at most 1,000 characters."
     )]
     async fn notes_update(
         &self,
@@ -1351,7 +1430,9 @@ impl OdoMcp {
         tool_result(result)
     }
 
-    #[tool(description = "Append Markdown to a note atomically using expectedRevision")]
+    #[tool(
+        description = "Append Markdown to a note atomically using expectedRevision. The separator is inserted after the existing content and before the new text; it defaults to two newlines."
+    )]
     async fn notes_append(
         &self,
         Parameters(args): Parameters<ModifyNoteArgs>,
@@ -1382,7 +1463,9 @@ impl OdoMcp {
         tool_result(result)
     }
 
-    #[tool(description = "Prepend Markdown to a note atomically using expectedRevision")]
+    #[tool(
+        description = "Prepend Markdown to a note atomically using expectedRevision. The separator is inserted after the new text and before the existing content; it defaults to two newlines."
+    )]
     async fn notes_prepend(
         &self,
         Parameters(args): Parameters<ModifyNoteArgs>,
@@ -1548,8 +1631,11 @@ impl OdoMcp {
     ) -> Result<CallToolResult, McpError> {
         tool_result((|| {
             let c = self.connection()?;
-            let limit = args.limit.unwrap_or(100).clamp(1, 500);
+            let limit = args.limit.unwrap_or(100).min(500);
             let offset = args.offset.unwrap_or(0);
+            if limit == 0 {
+                return Ok(empty_paginated("tasks", offset));
+            }
             let mut sql="SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes FROM todos WHERE 1=1".to_string();
             let mut values: Vec<String> = vec![];
             if let Some(completed) = args.completed {
@@ -1922,7 +2008,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "List the redacted MCP activity audit retained for the previous 60 days, newest first. Paginate with limit (default 100, max 1000) and offset (default 0)."
+        description = "List the redacted MCP activity audit retained for the previous 60 days, newest first. Content fields are redacted in the audit log for privacy. Paginate with limit (default 100, max 1000) and offset (default 0)."
     )]
     async fn activity_list(
         &self,
@@ -1930,8 +2016,13 @@ impl OdoMcp {
     ) -> Result<CallToolResult, McpError> {
         tool_result((|| {
             let c = self.connection()?;
-            let limit = args.limit.unwrap_or(100).clamp(1, 1000);
+            let limit = args.limit.unwrap_or(100).min(1000);
             let offset = args.offset.unwrap_or(0);
+            if limit == 0 {
+                let mut page = empty_paginated("activity", offset);
+                page["retentionDays"] = json!(60);
+                return Ok(page);
+            }
             let mut s=c.prepare("SELECT id,created_at,transport,operation,target_id,outcome,detail FROM mcp_activity ORDER BY id DESC LIMIT ?1 OFFSET ?2").map_err(|e|e.to_string())?;
             let mut rows=s.query_map(params![limit+1,offset],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"createdAt":r.get::<_,i64>(1)?,"transport":r.get::<_,String>(2)?,"operation":r.get::<_,String>(3)?,"targetId":r.get::<_,Option<String>>(4)?,"outcome":r.get::<_,String>(5)?,"detail":r.get::<_,String>(6)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
             let has_more = rows.len() > limit as usize;
@@ -2015,9 +2106,9 @@ impl ServerHandler for OdoMcp {
             resources: vec![
                 Resource::new("odo://workspace", "Odo workspace summary").with_description("Counts for folders, notes, planner tasks, and journal entries in the local workspace.").with_mime_type("text/markdown"),
                 Resource::new("odo://folders", "Odo folder tree").with_description("The complete nested folder index with parent IDs and validated icons.").with_mime_type("text/markdown"),
-                Resource::new("odo://notes", "Odo notes index").with_description("A compact index of notes with folder, status, pin, timestamp, and revision metadata.").with_mime_type("text/markdown"),
+                Resource::new("odo://notes", "Odo notes index").with_description("A compact index of notes with folder, status, pin, timestamp, and revision metadata. Read a complete note through the advertised odo://notes/{id} resource template.").with_mime_type("text/markdown"),
                 Resource::new("odo://tasks", "Odo planner tasks").with_description("All planner tasks with completion, category, priority, effort, and scheduling metadata.").with_mime_type("text/markdown"),
-                Resource::new("odo://journal", "Odo journal index").with_description("A newest-first index of journal days with compact excerpts and timestamps.").with_mime_type("text/markdown"),
+                Resource::new("odo://journal", "Odo journal index").with_description("A newest-first index of journal days with compact excerpts and timestamps. Read a complete day through the advertised odo://journal/{date} resource template.").with_mime_type("text/markdown"),
                 Resource::new("odo://activity", "Odo MCP activity (60 days)").with_description("The redacted MCP operation audit retained for the previous 60 days.").with_mime_type("text/markdown"),
             ],
             ..Default::default()
@@ -2327,6 +2418,66 @@ mod tests {
         assert!(icons.contains(&Value::String("ph-folder".into())));
         assert!(!icons.contains(&Value::String("ph-trash".into())));
     }
+
+    #[test]
+    fn note_titles_must_be_non_blank_and_at_most_one_thousand_characters() {
+        assert_eq!(
+            validate_note_title("").unwrap_err(),
+            "Note title cannot be empty"
+        );
+        assert_eq!(
+            validate_note_title(" \n\t").unwrap_err(),
+            "Note title cannot be empty"
+        );
+        validate_note_title(&"a".repeat(MAX_NOTE_TITLE_CHARS)).unwrap();
+        assert_eq!(
+            validate_note_title(&"🦀".repeat(MAX_NOTE_TITLE_CHARS + 1)).unwrap_err(),
+            "Note title cannot exceed 1000 characters"
+        );
+    }
+
+    #[test]
+    fn zero_limit_page_is_empty_and_terminal_at_the_requested_offset() {
+        let page = empty_paginated("notes", 37);
+        assert_eq!(page["notes"], json!([]));
+        assert_eq!(page["limit"], 0);
+        assert_eq!(page["offset"], 37);
+        assert_eq!(page["hasMore"], false);
+        assert!(page["nextOffset"].is_null());
+    }
+
+    #[test]
+    fn missing_folder_parent_is_normalized_to_root_on_create() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE folders (id TEXT PRIMARY KEY, parent_id TEXT);
+                 INSERT INTO folders VALUES ('inbox',NULL);
+                 INSERT INTO folders VALUES ('projects',NULL);",
+            )
+            .unwrap();
+        assert_eq!(
+            normalize_folder_parent_for_create(&connection, Some("projects".into())).unwrap(),
+            Some("projects".into())
+        );
+        assert_eq!(
+            normalize_folder_parent_for_create(&connection, Some("missing".into())).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_folder_parent_for_create(&connection, Some("  ".into())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn backup_identifier_does_not_expose_a_filesystem_path() {
+        let identifier = backup_identifier(1_784_158_320);
+        assert_eq!(identifier, "workspace-mcp-1784158320.sqlite3");
+        assert!(!identifier.contains('/'));
+        assert!(!identifier.contains('\\'));
+        assert!(!identifier.contains("Users"));
+    }
 }
 
 pub async fn run_stdio(path: PathBuf) -> Result<(), String> {
@@ -2403,7 +2554,9 @@ pub async fn run_http(
     let service = StreamableHttpService::new(
         move || Ok(prototype.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token()),
+        StreamableHttpServerConfig::default()
+            .with_sse_retry(None)
+            .with_cancellation_token(cancel.child_token()),
     );
     let security = SecurityState {
         token: config.auth_enabled.then_some(config.token.clone()),
