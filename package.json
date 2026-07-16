@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "check": "npm run build && cargo check --manifest-path src-tauri/Cargo.toml",
+    "test:mcp": "cargo build --manifest-path src-tauri/Cargo.toml && node scripts/test-mcp-conformance.mjs",
     "openspec": "openspec",
     "spec:list": "openspec list",
     "preview": "vite preview",

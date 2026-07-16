@@ -16,6 +16,9 @@ type JournalEntry = { id: string; dateKey: string; content: string; created: str
 type PlannerView = "1" | "3" | "4" | "7";
 type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; todoCategories: TodoCategory[]; journalEntries: JournalEntry[]; selectedFolderId: string; selectedNoteId: string; sortMode: SortMode; plannerView: PlannerView };
 type StorageInfo = { databasePath: string; backupDirectory: string };
+type McpConfig = { enabled: boolean; host: string; port: number; authEnabled: boolean; token: string; permanentDeleteEnabled: boolean; startAtLogin: boolean };
+type McpStatus = { running: boolean; endpoint: string | null; error: string | null };
+type McpSettings = { config: McpConfig; status: McpStatus; maskedToken: string; httpSnippet: string; stdioSnippet: string };
 type SavePhase = "idle" | "saving" | "saved" | "error";
 type MenuItem = { label?: string; icon?: string; hint?: string; action?: string; disabled?: boolean; danger?: boolean; separator?: boolean };
 type MenuState = { items: MenuItem[]; x: number; y: number; trigger: HTMLElement | null } | null;
@@ -30,6 +33,14 @@ const isMac = navigator.platform.toLowerCase().includes("mac");
 const modLabel = isMac ? "Cmd" : "Ctrl";
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 const now = () => new Date().toISOString();
+const ALLOWED_FOLDER_ICONS = new Set([
+  "ph-folder", "ph-briefcase", "ph-user-circle", "ph-book", "ph-book-open", "ph-notebook", "ph-file-text", "ph-lightbulb", "ph-star", "ph-heart",
+  "ph-house", "ph-buildings", "ph-bank", "ph-graduation-cap", "ph-flask", "ph-code", "ph-terminal-window", "ph-globe", "ph-map-pin", "ph-airplane",
+  "ph-car", "ph-bicycle", "ph-camera", "ph-image", "ph-music-note", "ph-film-strip", "ph-game-controller", "ph-palette", "ph-paint-brush", "ph-tree",
+  "ph-leaf", "ph-flower", "ph-sun", "ph-moon", "ph-cloud", "ph-mountains", "ph-coffee", "ph-cooking-pot", "ph-barbell", "ph-basketball",
+  "ph-soccer-ball", "ph-paw-print", "ph-gift", "ph-shopping-bag", "ph-currency-dollar", "ph-chart-line-up", "ph-calendar-blank", "ph-clock", "ph-tag", "ph-planet",
+]);
+const safeFolderIcon = (icon: string | undefined, isInbox = false) => isInbox ? "ph-tray" : icon && ALLOWED_FOLDER_ICONS.has(icon) ? icon : "ph-folder";
 
 const starterFolders: Folder[] = [
   { id: "inbox", name: "Inbox", parentId: null, open: true, icon: "ph-tray" },
@@ -48,7 +59,7 @@ const escapeHtml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g,
 const attr = escapeHtml;
 function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Workspace {
   const fallback = starterWorkspace();
-  const folders = Array.isArray(input?.folders) ? input.folders : fallback.folders;
+  const folders = (Array.isArray(input?.folders) ? input.folders : fallback.folders).map((folder) => ({ ...folder, icon: safeFolderIcon(folder.icon, folder.id === "inbox") }));
   if (!folders.some((folder) => folder.id === "inbox")) folders.unshift({ id: "inbox", name: "Inbox", parentId: null, open: true, icon: "ph-tray" });
   const notes = (Array.isArray(input?.notes) ? input.notes : fallback.notes).map((note) => ({ ...note, revision: note.revision ?? 0 }));
   const sortMode: SortMode = input?.sortMode === "manual" || input?.sortMode === "oldest" ? input.sortMode : "newest";
@@ -84,6 +95,10 @@ const detachedNoteIds = new Set<string>();
 let newRowId = "";
 let storageInfo: StorageInfo | null = null;
 let storageError = "";
+let mcpSettings: McpSettings | null = null;
+let mcpSettingsError = "";
+let lastMcpChangeVersion = -1;
+let reloadingWorkspace = false;
 let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
 let draggingNoteId = "";
 let suppressRowActivationUntil = 0;
@@ -177,7 +192,7 @@ async function restoreDesktopWorkspace() {
 function renderFolder(folder: Folder, depth = 0): string {
   const children = state.folders.filter((candidate) => candidate.parentId === folder.id);
   const toggle = children.length ? `<button class="folder-toggle" data-toggle-folder="${attr(folder.id)}" aria-label="${folder.open ? "Collapse" : "Expand"} ${attr(folder.name)}"><i class="ph ph-caret-${folder.open ? "down" : "right"}"></i></button>` : '<span class="folder-toggle-spacer"></span>';
-  return `<div class="folder-branch"><div class="folder-row ${currentView === "notes" && state.selectedFolderId === folder.id ? "is-selected" : ""}" data-folder-id="${attr(folder.id)}" data-drop-kind="folder" data-drop-id="${attr(folder.id)}" style="--depth:${depth}" role="button" tabindex="0" aria-dropeffect="move" aria-label="Move a note to ${attr(folder.name)}. ${folderCount(folder.id)} notes">${toggle}<i class="ph ${folder.icon ?? "ph-folder"} folder-icon"></i><span class="folder-name">${escapeHtml(folder.name)}</span><span class="folder-count">${folderCount(folder.id)}</span><span class="drop-cue" aria-hidden="true">Move here</span><button class="row-more" data-folder-menu="${attr(folder.id)}" aria-label="Folder actions"><i class="ph ph-dots-three"></i></button></div>${folder.open ? children.map((child) => renderFolder(child, depth + 1)).join("") : ""}</div>`;
+  return `<div class="folder-branch"><div class="folder-row ${currentView === "notes" && state.selectedFolderId === folder.id ? "is-selected" : ""}" data-folder-id="${attr(folder.id)}" data-drop-kind="folder" data-drop-id="${attr(folder.id)}" style="--depth:${depth}" role="button" tabindex="0" aria-dropeffect="move" aria-label="Move a note to ${attr(folder.name)}. ${folderCount(folder.id)} notes">${toggle}<i class="ph ${safeFolderIcon(folder.icon, folder.id === "inbox")} folder-icon"></i><span class="folder-name">${escapeHtml(folder.name)}</span><span class="folder-count">${folderCount(folder.id)}</span><span class="drop-cue" aria-hidden="true">Move here</span><button class="row-more" data-folder-menu="${attr(folder.id)}" aria-label="Folder actions"><i class="ph ph-dots-three"></i></button></div>${folder.open ? children.map((child) => renderFolder(child, depth + 1)).join("") : ""}</div>`;
 }
 function renderSidebar() {
   const remaining = state.todos.filter((todo) => !todo.completed).length;
@@ -435,8 +450,29 @@ function renderJournal() {
   const selected = selectedJournalDate || dateKey(new Date()); const entries = [...state.journalEntries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
   return `<main class="journal-view" aria-label="Journal"><header class="journal-header"><div><span class="eyebrow">Private practice</span><h1>Journal</h1><p>A quiet record of your day, one honest session at a time.</p></div><div class="journal-actions"><button class="secondary-button" id="journal-prev" aria-label="Previous day"><i class="ph ph-caret-left"></i></button><button class="today-button" id="journal-today">Today</button><button class="secondary-button" id="journal-next" aria-label="Next day"><i class="ph ph-caret-right"></i></button><input id="journal-date" type="date" value="${attr(selected)}" aria-label="Jump to journal date"><button class="primary-button" id="journal-new-time"><i class="ph ph-pen-nib"></i>New timestamp</button></div></header><div class="journal-status" aria-live="polite"></div><section class="journal-timeline" aria-label="Journal timeline">${entries.length ? entries.map(renderJournalCard).join("") : '<div class="journal-empty"><i class="ph ph-book-open-text"></i><h2>Your first page is waiting</h2><p>Open today to begin a private daily practice.</p></div>'}</section></main>`;
 }
+function renderMcpSettings() {
+  if (!isDesktopApp) return `<section class="settings-section"><div class="settings-copy"><i class="ph ph-plugs-connected"></i><div><h2>Odo MCP Server</h2><p>The MCP server is available in the installed desktop app.</p></div></div></section>`;
+  if (!mcpSettings) return `<section class="settings-section"><div class="settings-copy"><i class="ph ph-plugs-connected"></i><div><h2>Odo MCP Server</h2><p>${mcpSettingsError ? escapeHtml(mcpSettingsError) : "Loading server settings…"}</p></div></div></section>`;
+  const { config, status } = mcpSettings;
+  const stateLabel = status.error ? "Error" : status.running ? "Running" : config.enabled ? "Starting" : "Stopped";
+  return `<section class="settings-section mcp-settings"><div class="settings-copy"><i class="ph ph-plugs-connected"></i><div><h2>Odo MCP Server</h2><p>Give MCP clients full backend access to notes, folders, tasks, and journals.</p></div><span class="server-state ${status.error ? "is-error" : status.running ? "is-running" : ""}"><span></span>${stateLabel}</span></div>
+    ${status.error ? `<p class="inline-error"><i class="ph ph-warning-circle"></i>${escapeHtml(status.error)}</p>` : ""}
+    <form id="mcp-settings-form" class="mcp-form">
+      <label class="switch-row"><span>MCP Server<small>Start or stop both HTTP and new stdio sessions</small></span><input id="mcp-enabled" type="checkbox" ${config.enabled ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label>
+      <div class="mcp-field-grid"><label>Bind address<input id="mcp-host" value="${attr(config.host)}" spellcheck="false" required></label><label>Preferred port<input id="mcp-port" type="number" min="1" max="65535" value="${config.port}" required></label></div>
+      <label class="switch-row"><span>Bearer token authentication<small>Optional; works with HTTP headers and stdio environment configuration</small></span><input id="mcp-auth" type="checkbox" ${config.authEnabled ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label>
+      <div class="token-field"><label>Access token<input id="mcp-token" type="password" value="${attr(config.token)}" autocomplete="off" spellcheck="false" aria-describedby="masked-token"></label><button type="button" class="secondary-button" id="generate-mcp-token"><i class="ph ph-arrows-clockwise"></i>Generate</button></div><small id="masked-token" class="masked-token">Displayed as ${escapeHtml(mcpSettings.maskedToken)} after saving</small>
+      <label class="switch-row"><span>Allow permanent note deletion<small>Without this, MCP can only move notes to recoverable Trash</small></span><input id="mcp-permanent-delete" type="checkbox" ${config.permanentDeleteEnabled ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label>
+      <label class="switch-row"><span>Start Odo at login<small>Off by default; keeps the menu-bar server available after sign-in</small></span><input id="mcp-start-login" type="checkbox" ${config.startAtLogin ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label>
+      <div class="mcp-actions"><button type="submit" class="primary-button"><i class="ph ph-floppy-disk"></i>Save server settings</button><span>${status.endpoint ? escapeHtml(status.endpoint) : "Server is not listening"}</span></div>
+    </form>
+    <details class="client-snippets"><summary>Client configuration snippets</summary><div><h3>Streamable HTTP</h3><pre>${escapeHtml(mcpSettings.httpSnippet)}</pre><h3>stdio</h3><pre>${escapeHtml(mcpSettings.stdioSnippet)}</pre><p>Different clients place the same MCP server object in different configuration files. Odo provides the snippet without modifying them.</p></div></details>
+    <p class="activity-retention"><i class="ph ph-clock-counter-clockwise"></i>MCP activity metadata is retained for 60 days. Note bodies, journal content, and tokens are excluded.</p>
+  </section>`;
+}
 function renderSettings() {
   return `<main class="wide-view settings-view"><header class="wide-header"><div><span class="eyebrow">Preferences</span><h1>Settings</h1><p>Make Odo feel at home on this computer.</p></div><button class="icon-button close-wide" data-go-inbox title="Back to notes"><i class="ph ph-x"></i></button></header><div class="settings-sheet">
+    ${renderMcpSettings()}
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-database"></i><div><h2>Storage & backups</h2><p>${isDesktopApp ? "Your workspace is stored locally on this computer." : "Browser mode stores this workspace in local storage."}</p></div></div>${isDesktopApp ? `<div class="path-grid"><span>Database</span><code>${escapeHtml(storageInfo?.databasePath ?? "Loading…")}</code><span>Backups</span><code>${escapeHtml(storageInfo?.backupDirectory ?? "Loading…")}</code></div><button class="secondary-button" id="create-backup" ${storageError ? "disabled" : ""}><i class="ph ph-cloud-arrow-up"></i>Create backup</button>${storageError ? `<p class="inline-error">${escapeHtml(storageError)}</p>` : ""}` : '<div class="browser-note"><i class="ph ph-info"></i>Install and open the desktop app to create file backups.</div>'}</section>
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-sparkle"></i><div><h2>Appearance & motion</h2><p>Keep transitions calm, quick, and comfortable.</p></div></div><label class="switch-row"><span>Interface motion<small>Menus, panels, and task feedback</small></span><input id="motion-toggle" type="checkbox" ${motionEnabled ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label></section>
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-keyboard"></i><div><h2>Keyboard shortcuts</h2><p>Everything important stays within reach.</p></div></div><div class="shortcut-grid">${[["New note",`${modLabel}+N`],["New folder",`${modLabel}+Shift+N`],["Search",`${modLabel}+K`],["Tasks",`${modLabel}+2`],["Next note",`${modLabel}+Tab`],["Previous note",`${modLabel}+Shift+Tab`],["Save",`${modLabel}+S`],["Focus mode",`${modLabel}+Shift+F`]].map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join("")}</div><button class="secondary-button" id="show-help"><i class="ph ph-question"></i>View all shortcuts</button></section></div></main>`;
@@ -511,11 +547,20 @@ function createFolder(name: string) {
 }
 function setView(view: View) {
   currentView = view; focusMode = false; searchQuery = ""; if (view === "journal") { openJournalToday(true); return; } repairState(); renderApp();
-  if (view === "settings" && isDesktopApp && !storageInfo) void loadStorageInfo();
+  if (view === "settings" && isDesktopApp) {
+    if (!storageInfo) void loadStorageInfo();
+    void loadMcpSettings();
+  }
 }
 async function loadStorageInfo() {
   try { storageInfo = await invoke<StorageInfo>("get_storage_info"); storageError = ""; }
   catch (error) { storageError = `Could not read storage information: ${String(error)}`; }
+  if (currentView === "settings") renderApp();
+}
+async function loadMcpSettings() {
+  if (!isDesktopApp) return;
+  try { mcpSettings = await invoke<McpSettings>("get_mcp_settings"); mcpSettingsError = ""; }
+  catch (error) { mcpSettingsError = `Could not load MCP settings: ${String(error)}`; }
   if (currentView === "settings") renderApp();
 }
 
@@ -977,6 +1022,26 @@ function bindSettingsEvents() {
   document.querySelector("#motion-toggle")?.addEventListener("change", (event) => { motionEnabled = (event.target as HTMLInputElement).checked; localStorage.setItem(MOTION_KEY, String(motionEnabled)); document.documentElement.classList.toggle("no-motion", !motionEnabled); });
   document.querySelector("#show-help")?.addEventListener("click", () => { helpOpen = true; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#close-help")?.focus()); });
   document.querySelector("#create-backup")?.addEventListener("click", async (event) => { const button = event.currentTarget as HTMLButtonElement; button.disabled = true; button.innerHTML = '<i class="ph ph-circle-notch"></i>Creating…'; try { const path = await invoke<string>("create_backup"); await noticeOdo("Backup created", "Your SQLite workspace backup is ready.", path); } catch (error) { await noticeOdo("Backup failed", `Could not create a backup: ${String(error)}`); } finally { renderApp(); } });
+  const readMcpForm = (): McpConfig | null => {
+    if (!mcpSettings) return null;
+    return {
+      enabled: document.querySelector<HTMLInputElement>("#mcp-enabled")?.checked ?? mcpSettings.config.enabled,
+      host: document.querySelector<HTMLInputElement>("#mcp-host")?.value.trim() || "127.0.0.1",
+      port: Number(document.querySelector<HTMLInputElement>("#mcp-port")?.value || 8765),
+      authEnabled: document.querySelector<HTMLInputElement>("#mcp-auth")?.checked ?? false,
+      token: document.querySelector<HTMLInputElement>("#mcp-token")?.value.trim() || mcpSettings.config.token,
+      permanentDeleteEnabled: document.querySelector<HTMLInputElement>("#mcp-permanent-delete")?.checked ?? false,
+      startAtLogin: document.querySelector<HTMLInputElement>("#mcp-start-login")?.checked ?? false,
+    };
+  };
+  const saveMcpForm = async () => {
+    const config = readMcpForm(); if (!config) return;
+    try { await invoke("update_mcp_settings", { config }); await loadMcpSettings(); }
+    catch (error) { await noticeOdo("MCP settings were not saved", String(error)); await loadMcpSettings(); }
+  };
+  document.querySelector("#mcp-settings-form")?.addEventListener("submit", (event) => { event.preventDefault(); void saveMcpForm(); });
+  document.querySelector("#mcp-enabled")?.addEventListener("change", () => void saveMcpForm());
+  document.querySelector("#generate-mcp-token")?.addEventListener("click", async () => { const input = document.querySelector<HTMLInputElement>("#mcp-token"); if (input) { input.value = await invoke<string>("generate_mcp_token"); input.focus(); input.select(); } });
 }
 
 function isTypingTarget(target: EventTarget | null) { const element = target as HTMLElement | null; return !!element?.closest("input, textarea, select, [contenteditable=true]"); }
@@ -1031,7 +1096,40 @@ async function renderDetachedEditor(noteId: string) {
 }
 
 async function bootstrap() {
-  if (detachedNoteId) { await renderDetachedEditor(detachedNoteId); return; }
-  renderApp(); if (isDesktopApp) { await restoreDesktopWorkspace(); (await invoke<string[]>("list_detached_notes")).forEach((id) => detachedNoteIds.add(id)); renderApp(); await listen<Note>("note-updated", (event) => patchLiveNote(event.payload)); await listen<string>("note-detached", (event) => { detachedNoteIds.add(event.payload); if (state.selectedNoteId === event.payload) renderApp(); }); await listen<string>("note-attached", (event) => { detachedNoteIds.delete(event.payload); if (state.selectedNoteId === event.payload) renderApp(); }); }
+  if (detachedNoteId) {
+    if (isDesktopApp) await listen("workspace-changed", () => location.reload());
+    await renderDetachedEditor(detachedNoteId); return;
+  }
+  renderApp(); if (isDesktopApp) {
+    await restoreDesktopWorkspace();
+    lastMcpChangeVersion = await invoke<number>("get_mcp_change_version").catch(() => -1);
+    (await invoke<string[]>("list_detached_notes")).forEach((id) => detachedNoteIds.add(id)); renderApp();
+    await listen<Note>("note-updated", (event) => patchLiveNote(event.payload));
+    await listen<string>("note-detached", (event) => { detachedNoteIds.add(event.payload); if (state.selectedNoteId === event.payload) renderApp(); });
+    await listen<string>("note-attached", (event) => { detachedNoteIds.delete(event.payload); if (state.selectedNoteId === event.payload) renderApp(); });
+    await listen("workspace-changed", () => void reloadWorkspaceAfterMcpChange());
+    await listen("mcp-status-changed", () => { if (currentView === "settings") void loadMcpSettings(); });
+    await listen("open-settings", () => setView("settings"));
+    window.setInterval(() => void pollMcpChanges(), 500);
+  }
+}
+async function reloadWorkspaceAfterMcpChange() {
+  if (!isDesktopApp || reloadingWorkspace) return;
+  reloadingWorkspace = true;
+  clearTimeout(saveTimer); clearTimeout(journalSaveTimer);
+  try {
+    const workspace = await invoke<string | null>("load_workspace");
+    if (workspace) { state = normalizeWorkspace(JSON.parse(workspace) as Workspace); repairState(); renderApp(); }
+    lastMcpChangeVersion = await invoke<number>("get_mcp_change_version").catch(() => lastMcpChangeVersion);
+  } catch (error) { console.error("Could not apply an MCP workspace change:", error); }
+  finally { reloadingWorkspace = false; }
+}
+async function pollMcpChanges() {
+  if (!isDesktopApp || reloadingWorkspace) return;
+  try {
+    const version = await invoke<number>("get_mcp_change_version");
+    if (lastMcpChangeVersion < 0) lastMcpChangeVersion = version;
+    else if (version !== lastMcpChangeVersion) await reloadWorkspaceAfterMcpChange();
+  } catch { /* Odo may be shutting down. */ }
 }
 void bootstrap();
