@@ -107,7 +107,6 @@ let sortInsertionSide: "before" | "after" = "before";
 let dragImage: HTMLElement | null = null;
 let plannerDate = new Date(); plannerDate.setHours(0, 0, 0, 0);
 let taskMenuTodoId = "";
-let plannerDragTodoId = "";
 let plannerPopover: { x: number; y: number; returnId: string } | null = null;
 let plannerPointerDragging = false;
 let plannerPointerDrop: { date: string; minute: number } | null = null;
@@ -504,11 +503,19 @@ function renderApp() {
   repairState(); closeMenu(false);
   document.documentElement.classList.toggle("no-motion", !motionEnabled);
   const app = document.querySelector<HTMLElement>("#app")!;
+  const previousPlannerScroll = currentView === "tasks" ? document.querySelector<HTMLElement>("#calendar-scroll") : null;
+  const plannerScrollPosition = previousPlannerScroll ? { top: previousPlannerScroll.scrollTop, left: previousPlannerScroll.scrollLeft } : null;
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}`;
   const content = currentView === "tasks" ? renderTasks() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor();
   app.innerHTML = `${renderSidebar()}${content}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
   updateSaveStatus(); bindEvents(); bindOdoDialog();
-  if (currentView === "tasks") requestAnimationFrame(() => scrollPlannerToNow());
+  if (currentView === "tasks") {
+    const plannerScroll = document.querySelector<HTMLElement>("#calendar-scroll");
+    if (plannerScrollPosition && plannerScroll) {
+      plannerScroll.scrollTop = plannerScrollPosition.top;
+      plannerScroll.scrollLeft = plannerScrollPosition.left;
+    } else requestAnimationFrame(() => scrollPlannerToNow());
+  }
   if (newRowId) requestAnimationFrame(() => { document.querySelector(`[data-note-id="${CSS.escape(newRowId)}"]`)?.classList.remove("is-new"); newRowId = ""; });
 }
 window.setInterval(() => {
@@ -987,10 +994,9 @@ function bindTaskEvents() {
   document.querySelector<HTMLSelectElement>("#planner-view")?.addEventListener("change", (event)=>{ state.plannerView=(event.target as HTMLSelectElement).value as PlannerView; void saveState(false); renderApp(); });
   document.querySelector<HTMLInputElement>("#planner-date")?.addEventListener("change", (event)=>{ const value=(event.target as HTMLInputElement).value; if(value) { plannerDate=new Date(`${value}T00:00:00`); renderApp(); } });
   document.querySelectorAll<HTMLElement>("[data-toggle-todo]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); toggleTodo(button.dataset.toggleTodo!); }));
-  document.querySelectorAll<HTMLElement>("[data-todo-id]").forEach((row) => { row.addEventListener("click", (event)=> { if(plannerPointerDragging || (event.target as HTMLElement).closest("button")) return; openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("contextmenu", (event) => { event.preventDefault(); openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("keydown", handleTaskKeydown); row.addEventListener("pointerdown", (event)=> { if(!(event.target as HTMLElement).closest("button")) startPlannerPointerDrag(event, row); }); row.addEventListener("dragstart", (event)=> { plannerDragTodoId=row.dataset.todoId!; event.dataTransfer?.setData("text/plain",plannerDragTodoId); if(event.dataTransfer) event.dataTransfer.effectAllowed="move"; row.classList.add("is-dragging"); }); row.addEventListener("dragend",()=>{plannerDragTodoId=""; document.querySelectorAll(".is-drop-target").forEach(node=>node.classList.remove("is-drop-target"));}); });
+  document.querySelectorAll<HTMLElement>(".planner-task-card[data-todo-id]").forEach((row) => { row.removeAttribute("draggable"); row.addEventListener("click", (event)=> { if(plannerPointerDragging || (event.target as HTMLElement).closest("button")) return; openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("contextmenu", (event) => { event.preventDefault(); openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("keydown", handleTaskKeydown); row.addEventListener("pointerdown", (event)=> { if(!(event.target as HTMLElement).closest("button")) startPlannerPointerDrag(event, row); }); });
   document.querySelectorAll<HTMLElement>("[data-todo-menu]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); openPlannerProperties(button.dataset.todoMenu!, button); }));
-  document.querySelectorAll<HTMLElement>(".calendar-slot").forEach(slot=> { slot.addEventListener("dragover", event=>{ if(!plannerDragTodoId) return; event.preventDefault(); slot.classList.add("is-drop-target"); }); slot.addEventListener("dragleave",()=>slot.classList.remove("is-drop-target")); slot.addEventListener("drop",event=>{ event.preventDefault(); const todo=state.todos.find(t=>t.id===plannerDragTodoId); if(!todo) return; todo.scheduledStart=localStart(new Date(`${slot.dataset.slotDate}T00:00:00`),Number(slot.dataset.slotMinute)); todo.durationMinutes=todo.durationMinutes||30; todo.updated=now(); announcePlanner(`${todo.text} scheduled.`); plannerDragTodoId=""; void saveState(false); renderApp(); }); });
-  document.querySelectorAll<HTMLElement>("[data-calendar-task]").forEach(block=> { block.addEventListener("dragstart",event=>{plannerDragTodoId=block.dataset.todoId!; event.dataTransfer?.setData("text/plain",plannerDragTodoId); block.classList.add("is-dragging");}); block.addEventListener("pointerdown",event=>{ if(!(event.target as HTMLElement).closest("button,[data-resize-todo]")) startPlannerPointerDrag(event,block); }); block.addEventListener("click",event=>{if(!plannerPointerDragging && !(event.target as HTMLElement).closest("button,[data-resize-todo]"))openPlannerProperties(block.dataset.todoId!,block);}); block.addEventListener("contextmenu",event=>{event.preventDefault();openPlannerProperties(block.dataset.todoId!,block);}); block.addEventListener("keydown",handleTaskKeydown); });
+  document.querySelectorAll<HTMLElement>("[data-calendar-task]").forEach(block=> { block.addEventListener("pointerdown",event=>{ if(!(event.target as HTMLElement).closest("button,[data-resize-todo]")) startPlannerPointerDrag(event,block); }); block.addEventListener("click",event=>{if(!plannerPointerDragging && !(event.target as HTMLElement).closest("button,[data-resize-todo]"))openPlannerProperties(block.dataset.todoId!,block);}); block.addEventListener("contextmenu",event=>{event.preventDefault();openPlannerProperties(block.dataset.todoId!,block);}); block.addEventListener("keydown",handleTaskKeydown); });
   document.querySelectorAll<HTMLElement>("[data-resize-todo]").forEach(handle=>handle.addEventListener("pointerdown", startResize));
   document.querySelectorAll<HTMLElement>("[data-close-properties]").forEach(node=>node.addEventListener("click",(event)=>{if(event.target===node || (event.target as HTMLElement).closest("[data-close-properties]")) closePlannerProperties();}));
   document.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-prop]").forEach(input=>input.addEventListener("change",()=>{const todo=state.todos.find(t=>t.id===taskMenuTodoId); if(!todo) return; const field=input.dataset.prop as keyof Todo; let value:string|number|null=input.value; if(field==="effort"||field==="durationMinutes") value=Number(value); if(field==="scheduledStart") value=input.value ? new Date(input.value).toISOString() : null; (todo as unknown as Record<string,string|number|null>)[field]=value; todo.updated=now(); void saveState(false); renderApp();}));
