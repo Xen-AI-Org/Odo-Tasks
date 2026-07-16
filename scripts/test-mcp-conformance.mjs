@@ -139,9 +139,9 @@ try {
   const tools = new Map(listedTools.tools.map((entry) => [entry.name, entry]));
   const requiredTools = [
     "activity_list", "batch_apply", "folders_create", "folders_update", "journal_delete",
-    "journal_get", "notes_append", "notes_create", "notes_get", "notes_list",
+    "journal_get", "journal_upsert", "notes_append", "notes_create", "notes_get", "notes_list",
     "notes_prepend", "notes_update", "search", "tasks_create", "tasks_list",
-    "tasks_update", "workspace_backup",
+    "tasks_update", "categories_update", "workspace_backup",
   ];
   for (const name of requiredTools) assert(tools.has(name), `Missing tool ${name}`);
   for (const name of ["notes_list", "tasks_list", "search", "activity_list"]) {
@@ -158,6 +158,20 @@ try {
   assert.deepEqual(Object.keys(tools.get("journal_delete").inputSchema.properties), ["dateKey"]);
   assert.equal(tools.get("notes_create").inputSchema.properties.title.minLength, 1);
   assert.equal(tools.get("notes_create").inputSchema.properties.title.maxLength, 1000);
+  const taskCreateSchema = tools.get("tasks_create").inputSchema.properties;
+  assert.equal(taskCreateSchema.text.minLength, 1);
+  assert.deepEqual(taskCreateSchema.priority.enum, ["low", "medium", "high"]);
+  assert.equal(taskCreateSchema.effort.minimum, 1);
+  assert.equal(taskCreateSchema.effort.maximum, 5);
+  assert.equal(taskCreateSchema.color.pattern, "^#[0-9A-Fa-f]{6}$");
+  assert.equal(taskCreateSchema.scheduledStart.format, "date-time");
+  assert.equal(taskCreateSchema.durationMinutes.minimum, 1);
+  assert.equal(taskCreateSchema.durationMinutes.maximum, 1440);
+  assert.equal(tools.get("tasks_update").inputSchema.properties.effort.minimum, 1);
+  assert.equal(tools.get("tasks_update").inputSchema.properties.effort.maximum, 5);
+  assert.equal(tools.get("journal_upsert").inputSchema.properties.dateKey.pattern, "^\\d{4}-\\d{2}-\\d{2}$");
+  assert.equal(tools.get("folders_create").inputSchema.properties.name.maxLength, 1000);
+  assert.match(tools.get("folders_create").inputSchema.properties.parentId.description, /unknown values create the folder at the root/i);
 
   const prompts = (await rpc("prompts/list")).prompts;
   assert.equal(prompts.length, 5);
@@ -184,6 +198,10 @@ try {
   await toolFails("notes_create", { title: "x".repeat(1001) }, /1000|1,000|validation/i);
   const note = await toolOk("notes_create", { title: "UniqueTitle12345XYZ", content: "base" });
   assert.equal(note.title, "UniqueTitle12345XYZ");
+  await toolFails("batch_apply", {
+    operations: [{ operation: "notes.pin", id: note.id, pinned: true }],
+  }, /expectedRevision/);
+  assert.equal((await toolOk("notes_get", { id: note.id })).revision, note.revision);
   assert.equal((await toolOk("notes_get", { title: "uniquetitle12345xyz" })).id, note.id);
   assert.equal((await toolOk("notes_get", { id: "UniqueTitle12345XYZ" })).id, note.id);
   const listedWithoutContent = await toolOk("notes_list", { limit: 1 });
@@ -218,16 +236,31 @@ try {
   assert.equal(rootFolder.parentId, null);
   assert.equal(rootFolder.name, "Root fallback");
   await toolFails("folders_create", { name: "Bad icon", icon: "ph-trash" }, /not allowed|validation/i);
+  await toolFails("folders_create", { name: "x".repeat(1001) }, /1000|1,000|validation/i);
   const childFolder = await toolOk("folders_create", { name: "Child", parentId: rootFolder.id });
+  await toolFails("folders_update", { id: childFolder.id, name: "x".repeat(1001) }, /1000|1,000|validation/i);
   const updatedFolder = await toolOk("folders_update", { id: childFolder.id, name: "Child renamed" });
   assert.equal(updatedFolder.name, "Child renamed");
   assert.equal(updatedFolder.parentId, rootFolder.id);
   await toolFails("folders_update", { id: rootFolder.id, parentId: childFolder.id }, /circular/);
   assert.equal(typeof (await toolOk("workspace_summary")).folders, "number");
 
-  const task = await toolOk("tasks_create", { text: "Protocol searchable task" });
+  await toolFails("tasks_create", { text: "" }, /Task text cannot be empty|validation/i);
+  await toolFails("tasks_create", { text: "Bad priority", priority: "super-urgent" }, /priority.*low.*medium.*high|validation/i);
+  await toolFails("tasks_create", { text: "Bad date", scheduledStart: "not-a-date" }, /scheduledStart.*ISO-8601|validation/i);
+  await toolFails("tasks_create", { text: "Bad color", color: "not-a-color" }, /color.*hex|validation/i);
+  await toolFails("tasks_create", { text: "Bad duration", durationMinutes: -30 }, /durationMinutes.*greater than zero|validation/i);
+  const task = await toolOk("tasks_create", {
+    text: "Protocol searchable task", priority: "high", effort: 999, color: "#A1b2C3",
+    scheduledStart: "2026-07-15T19:41:00-05:00", durationMinutes: 999999,
+  });
   assert.equal(task.text, "Protocol searchable task");
   assert.equal(task.completed, false);
+  assert.equal(task.priority, "high");
+  assert.equal(task.effort, 5);
+  assert.equal(task.color, "#A1b2C3");
+  assert.equal(task.scheduledStart, "2026-07-15T19:41:00-05:00");
+  assert.equal(task.durationMinutes, 1440);
   const updatedTask = await toolOk("tasks_update", { id: task.id, text: "Protocol updated task", completed: true });
   assert.equal(updatedTask.text, "Protocol updated task");
   assert.equal(updatedTask.completed, true);
@@ -239,6 +272,17 @@ try {
   const category = await toolOk("categories_create", { name: "Protocol category", color: "#123456", icon: "ph-star" });
   assert.equal(category.name, "Protocol category");
   assert.equal(category.color, "#123456");
+  const updatedCategory = await toolOk("categories_update", {
+    id: category.id, name: "Protocol category updated", color: "#654321", icon: "ph-book",
+  });
+  assert.deepEqual(updatedCategory, {
+    id: category.id, name: "Protocol category updated", color: "#654321", icon: "ph-book", position: category.position,
+  });
+  for (const dateKey of ["", "07/15/2026", "2026-13-45"]) {
+    await toolFails("journal_upsert", { dateKey, content: "junk" }, /dateKey.*valid date.*YYYY-MM-DD|validation/i);
+  }
+  const journal = await toolOk("journal_upsert", { dateKey: "2028-02-29", content: "Leap day" });
+  assert.equal(journal.dateKey, "2028-02-29");
   const backup = await toolOk("workspace_backup");
   assert.equal(backup.created, true);
   assert.equal(typeof backup.backupId, "string");

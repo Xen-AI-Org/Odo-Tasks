@@ -6,6 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{DateTime, NaiveDate};
 use rmcp::{
     handler::server::{
         router::{prompt::PromptRouter, tool::ToolRouter},
@@ -241,6 +242,8 @@ fn normalize_folder_parent_for_create(
 }
 
 const MAX_NOTE_TITLE_CHARS: usize = 1_000;
+const MAX_FOLDER_NAME_CHARS: usize = 1_000;
+const MAX_TASK_DURATION_MINUTES: i64 = 24 * 60;
 
 fn validate_note_title(title: &str) -> Result<(), String> {
     if title.trim().is_empty() {
@@ -252,6 +255,104 @@ fn validate_note_title(title: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn validate_folder_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Folder name cannot be empty".into());
+    }
+    if name.chars().count() > MAX_FOLDER_NAME_CHARS {
+        return Err(format!(
+            "Folder name cannot exceed {MAX_FOLDER_NAME_CHARS} characters"
+        ));
+    }
+    Ok(name)
+}
+
+fn validate_journal_date_key(date_key: &str) -> Result<(), String> {
+    let bytes = date_key.as_bytes();
+    let exact_shape = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+    if !exact_shape || NaiveDate::parse_from_str(date_key, "%Y-%m-%d").is_err() {
+        return Err("Journal dateKey must be a valid date in YYYY-MM-DD format".into());
+    }
+    Ok(())
+}
+
+fn validate_task_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("Task text cannot be empty".into());
+    }
+    Ok(())
+}
+
+fn validate_task_priority(priority: Option<String>) -> Result<String, String> {
+    let priority = priority.unwrap_or_else(|| "medium".into());
+    if !matches!(priority.as_str(), "low" | "medium" | "high") {
+        return Err("Task priority must be one of: low, medium, high".into());
+    }
+    Ok(priority)
+}
+
+fn validate_task_color(color: Option<String>) -> Result<String, String> {
+    let Some(color) = color else {
+        return Ok(String::new());
+    };
+    if color.len() != 7
+        || !color.starts_with('#')
+        || !color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("Task color must be a six-digit hex color such as #7b8e7c".into());
+    }
+    Ok(color)
+}
+
+fn validate_scheduled_start(scheduled_start: Option<String>) -> Result<Option<String>, String> {
+    let Some(scheduled_start) = scheduled_start else {
+        return Ok(None);
+    };
+    if DateTime::parse_from_rfc3339(&scheduled_start).is_err() {
+        return Err("Task scheduledStart must be a timezone-qualified ISO-8601 timestamp".into());
+    }
+    Ok(Some(scheduled_start))
+}
+
+fn normalize_task_duration(duration_minutes: Option<i64>) -> Result<i64, String> {
+    let duration = duration_minutes.unwrap_or(30);
+    if duration <= 0 {
+        return Err("Task durationMinutes must be greater than zero".into());
+    }
+    Ok(duration.min(MAX_TASK_DURATION_MINUTES))
+}
+
+fn task_priority_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<String>::json_schema(generator);
+    schema.insert("enum".into(), json!(["low", "medium", "high"]));
+    schema
+}
+
+fn task_color_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<String>::json_schema(generator);
+    schema.insert("pattern".into(), json!(r"^#[0-9A-Fa-f]{6}$"));
+    schema
+}
+
+fn scheduled_start_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<String>::json_schema(generator);
+    schema.insert("format".into(), json!("date-time"));
+    schema
+}
+
+fn journal_date_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = String::json_schema(generator);
+    schema.insert("pattern".into(), json!(r"^\d{4}-\d{2}-\d{2}$"));
+    schema
 }
 
 fn backup_identifier(timestamp: i64) -> String {
@@ -605,7 +706,9 @@ pub struct ModifyNoteArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateFolderArgs {
+    #[schemars(length(min = 1, max = 1000))]
     pub name: String,
+    /// Optional parent folder ID. Missing, empty, or unknown values create the folder at the root with parentId null.
     pub parent_id: Option<String>,
     /// Optional icon from the exact 50-value allowlist returned by folders_list.allowedIcons. Action icons are reserved.
     #[schemars(schema_with = "folder_icon_schema")]
@@ -616,6 +719,7 @@ pub struct CreateFolderArgs {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateFolderArgs {
     pub id: String,
+    #[schemars(length(min = 1, max = 1000))]
     pub name: Option<String>,
     pub parent_id: Option<String>,
     /// Set true to move the folder to the root. Cannot be combined with parentId.
@@ -641,12 +745,23 @@ pub struct ListTasksArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskArgs {
+    #[schemars(length(min = 1))]
     pub text: String,
     pub category_id: Option<String>,
+    /// One of low, medium, or high. Defaults to medium.
+    #[schemars(schema_with = "task_priority_schema")]
     pub priority: Option<String>,
+    /// Effort from 1 through 5. Out-of-range values are clamped to that range.
+    #[schemars(range(min = 1, max = 5))]
     pub effort: Option<i64>,
+    /// Optional six-digit hexadecimal color in #RRGGBB form.
+    #[schemars(schema_with = "task_color_schema")]
     pub color: Option<String>,
+    /// Optional timezone-qualified ISO-8601 timestamp.
+    #[schemars(schema_with = "scheduled_start_schema")]
     pub scheduled_start: Option<String>,
+    /// Positive duration in minutes. Values above 1,440 are clamped to one day.
+    #[schemars(range(min = 1, max = 1440))]
     pub duration_minutes: Option<i64>,
 }
 
@@ -658,6 +773,8 @@ pub struct UpdateTaskArgs {
     pub completed: Option<bool>,
     pub category_id: Option<String>,
     pub priority: Option<String>,
+    /// Effort from 1 through 5. Out-of-range values are clamped to that range.
+    #[schemars(range(min = 1, max = 5))]
     pub effort: Option<i64>,
     pub color: Option<String>,
     pub scheduled_start: Option<String>,
@@ -685,6 +802,7 @@ pub struct CategoryUpdateArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct JournalArgs {
+    #[schemars(schema_with = "journal_date_schema")]
     pub date_key: String,
     pub content: Option<String>,
     pub append: Option<bool>,
@@ -693,6 +811,7 @@ pub struct JournalArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct JournalDateArgs {
+    #[schemars(schema_with = "journal_date_schema")]
     pub date_key: String,
 }
 
@@ -1191,13 +1310,11 @@ impl OdoMcp {
     ) -> Result<CallToolResult, McpError> {
         let result = (|| {
             let c = self.connection()?;
-            if args.name.trim().is_empty() {
-                return Err("Folder name cannot be empty".into());
-            }
+            let name = validate_folder_name(&args.name)?;
             let parent_id = normalize_folder_parent_for_create(&c, args.parent_id)?;
             let icon = validate_folder_icon(args.icon)?;
             let id = format!("folder-{}", uuid::Uuid::new_v4());
-            c.execute("INSERT INTO folders(id,name,parent_id,is_open,icon,position) VALUES(?1,?2,?3,1,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM folders))",params![id,args.name.trim(),parent_id,icon]).map_err(|e|format!("Could not create folder: {e}"))?;
+            c.execute("INSERT INTO folders(id,name,parent_id,is_open,icon,position) VALUES(?1,?2,?3,1,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM folders))",params![id,name,parent_id,icon]).map_err(|e|format!("Could not create folder: {e}"))?;
             bump_change(&c)?;
             audit(
                 &c,
@@ -1237,7 +1354,10 @@ impl OdoMcp {
             if args.clear_parent.unwrap_or(false) && args.parent_id.is_some() {
                 return Err("clearParent cannot be combined with parentId".into());
             }
-            let name = args.name.unwrap_or(current.0);
+            let name = match args.name {
+                Some(name) => validate_folder_name(&name)?.to_string(),
+                None => current.0,
+            };
             let parent = if args.clear_parent.unwrap_or(false) {
                 None
             } else {
@@ -1672,17 +1792,22 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Create a planner task with category, priority, effort, color, optional schedule, and duration; returns the complete created task object"
+        description = "Create a planner task and return the complete object. Text must not be blank; priority is low, medium, or high; explicit color uses #RRGGBB; scheduledStart is a timezone-qualified ISO-8601 timestamp; effort is clamped to 1–5; durationMinutes must be positive and is clamped to 1,440."
     )]
     async fn tasks_create(
         &self,
         Parameters(args): Parameters<CreateTaskArgs>,
     ) -> Result<CallToolResult, McpError> {
         let result = (|| {
+            validate_task_text(&args.text)?;
+            let priority = validate_task_priority(args.priority)?;
+            let color = validate_task_color(args.color)?;
+            let scheduled_start = validate_scheduled_start(args.scheduled_start)?;
+            let duration_minutes = normalize_task_duration(args.duration_minutes)?;
             let c = self.connection()?;
             let id = format!("todo-{}", uuid::Uuid::new_v4());
             let stamp = now_iso();
-            c.execute("INSERT INTO todos(id,text,completed,created,updated,position,category_id,priority,effort,color,scheduled_start,duration_minutes) VALUES(?1,?2,0,?3,?3,(SELECT COALESCE(MAX(position),-1)+1 FROM todos),?4,?5,?6,?7,?8,?9)",params![id,args.text,stamp,args.category_id.unwrap_or_else(||"inbox".into()),args.priority.unwrap_or_else(||"medium".into()),args.effort.unwrap_or(2).clamp(1,5),args.color.unwrap_or_default(),args.scheduled_start,args.duration_minutes.unwrap_or(30).max(30)]).map_err(|e|e.to_string())?;
+            c.execute("INSERT INTO todos(id,text,completed,created,updated,position,category_id,priority,effort,color,scheduled_start,duration_minutes) VALUES(?1,?2,0,?3,?3,(SELECT COALESCE(MAX(position),-1)+1 FROM todos),?4,?5,?6,?7,?8,?9)",params![id,args.text,stamp,args.category_id.unwrap_or_else(||"inbox".into()),priority,args.effort.unwrap_or(2).clamp(1,5),color,scheduled_start,duration_minutes]).map_err(|e|e.to_string())?;
             bump_change(&c)?;
             audit(
                 &c,
@@ -1810,7 +1935,9 @@ impl OdoMcp {
         tool_result(result)
     }
 
-    #[tool(description = "Rename or recolor a planner task category")]
+    #[tool(
+        description = "Rename or recolor a planner task category and return the complete updated category object"
+    )]
     async fn categories_update(
         &self,
         Parameters(args): Parameters<CategoryUpdateArgs>,
@@ -1845,7 +1972,7 @@ impl OdoMcp {
                 "success",
                 "",
             );
-            Ok(json!({"id":args.id}))
+            Self::category_json(&c, &args.id)
         })();
         if result.is_ok() {
             self.changed(&["odo://tasks".into()]).await;
@@ -1920,6 +2047,7 @@ impl OdoMcp {
         Parameters(args): Parameters<JournalArgs>,
     ) -> Result<CallToolResult, McpError> {
         let result = (|| {
+            validate_journal_date_key(&args.date_key)?;
             let c = self.connection()?;
             let existing: Option<(String, String, String)> = c
                 .query_row(
@@ -2434,6 +2562,93 @@ mod tests {
             validate_note_title(&"🦀".repeat(MAX_NOTE_TITLE_CHARS + 1)).unwrap_err(),
             "Note title cannot exceed 1000 characters"
         );
+    }
+
+    #[test]
+    fn folder_names_must_be_non_blank_and_at_most_one_thousand_characters() {
+        assert_eq!(
+            validate_folder_name(" \n\t").unwrap_err(),
+            "Folder name cannot be empty"
+        );
+        assert_eq!(validate_folder_name("  Projects  ").unwrap(), "Projects");
+        validate_folder_name(&"a".repeat(MAX_FOLDER_NAME_CHARS)).unwrap();
+        assert_eq!(
+            validate_folder_name(&"🦀".repeat(MAX_FOLDER_NAME_CHARS + 1)).unwrap_err(),
+            "Folder name cannot exceed 1000 characters"
+        );
+    }
+
+    #[test]
+    fn journal_dates_require_exact_real_calendar_dates() {
+        for invalid in ["", "07/15/2026", "2026-13-45", "2026-02-29", "2026-7-15"] {
+            assert_eq!(
+                validate_journal_date_key(invalid).unwrap_err(),
+                "Journal dateKey must be a valid date in YYYY-MM-DD format"
+            );
+        }
+        validate_journal_date_key("2026-07-15").unwrap();
+        validate_journal_date_key("2028-02-29").unwrap();
+    }
+
+    #[test]
+    fn task_creation_values_are_validated_and_bounded() {
+        assert_eq!(
+            validate_task_text(" \n").unwrap_err(),
+            "Task text cannot be empty"
+        );
+        assert_eq!(validate_task_priority(None).unwrap(), "medium");
+        assert_eq!(
+            validate_task_priority(Some("super-urgent".into())).unwrap_err(),
+            "Task priority must be one of: low, medium, high"
+        );
+        assert_eq!(
+            validate_task_color(Some("#A1b2C3".into())).unwrap(),
+            "#A1b2C3"
+        );
+        assert!(validate_task_color(Some("not-a-color".into())).is_err());
+        assert!(validate_scheduled_start(Some("not-a-date".into())).is_err());
+        assert!(validate_scheduled_start(Some("2026-07-15T19:41:00".into())).is_err());
+        assert_eq!(
+            validate_scheduled_start(Some("2026-07-15T19:41:00-05:00".into())).unwrap(),
+            Some("2026-07-15T19:41:00-05:00".into())
+        );
+        assert!(normalize_task_duration(Some(-30)).is_err());
+        assert!(normalize_task_duration(Some(0)).is_err());
+        assert_eq!(normalize_task_duration(None).unwrap(), 30);
+        assert_eq!(
+            normalize_task_duration(Some(999_999)).unwrap(),
+            MAX_TASK_DURATION_MINUTES
+        );
+    }
+
+    #[test]
+    fn mutation_schemas_advertise_validation_contracts() {
+        let task_schema =
+            serde_json::to_value(rmcp::schemars::schema_for!(CreateTaskArgs)).unwrap();
+        let task = &task_schema["properties"];
+        assert_eq!(task["text"]["minLength"], 1);
+        assert_eq!(task["priority"]["enum"], json!(["low", "medium", "high"]));
+        assert_eq!(task["effort"]["minimum"], 1);
+        assert_eq!(task["effort"]["maximum"], 5);
+        assert_eq!(task["color"]["pattern"], r"^#[0-9A-Fa-f]{6}$");
+        assert_eq!(task["scheduledStart"]["format"], "date-time");
+        assert_eq!(task["durationMinutes"]["minimum"], 1);
+        assert_eq!(task["durationMinutes"]["maximum"], 1440);
+
+        let journal_schema =
+            serde_json::to_value(rmcp::schemars::schema_for!(JournalArgs)).unwrap();
+        assert_eq!(
+            journal_schema["properties"]["dateKey"]["pattern"],
+            r"^\d{4}-\d{2}-\d{2}$"
+        );
+
+        let folder_schema =
+            serde_json::to_value(rmcp::schemars::schema_for!(CreateFolderArgs)).unwrap();
+        assert_eq!(folder_schema["properties"]["name"]["maxLength"], 1000);
+        assert!(folder_schema["properties"]["parentId"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("unknown values create the folder at the root"));
     }
 
     #[test]
