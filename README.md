@@ -43,6 +43,8 @@ Useful commands:
 - `npm run dev` starts the frontend in a browser.
 - `npm run build` type-checks and builds the frontend.
 - `npm run check` builds the frontend and checks the Rust crate.
+- `npx playwright install chromium` installs the browser used by end-to-end tests.
+- `npm run test:e2e` runs the browser regression suite.
 - `npm run tauri build` creates a desktop application bundle.
 
 ## OpenSpec
