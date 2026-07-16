@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 const CONFIG_KEY: &str = "mcp_config_v1";
+const FOLDER_HIERARCHY_REPAIR_KEY: &str = "mcp_folder_hierarchy_repaired_v2";
 const RETENTION_SECONDS: i64 = 60 * 24 * 60 * 60;
 pub const DEFAULT_FOLDER_ICON: &str = "ph-folder";
 pub const ALLOWED_FOLDER_ICONS: [&str; 50] = [
@@ -110,6 +111,149 @@ fn folder_icon_schema(generator: &mut SchemaGenerator) -> Schema {
         ),
     );
     schema
+}
+
+pub fn invalid_folder_parent_ids(folders: &[(String, Option<String>)]) -> Vec<String> {
+    let ids = folders
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<HashSet<_>>();
+    let mut parents = folders.iter().cloned().collect::<HashMap<_, _>>();
+    let mut invalid = Vec::new();
+
+    for (id, parent) in folders {
+        if (id == "inbox" && parent.is_some())
+            || parent.as_deref() == Some(id.as_str())
+            || parent
+                .as_deref()
+                .is_some_and(|parent| !ids.contains(parent))
+        {
+            parents.insert(id.clone(), None);
+            invalid.push(id.clone());
+        }
+    }
+
+    for (id, _) in folders {
+        let mut path = HashSet::new();
+        let mut cursor = id.clone();
+        loop {
+            if !path.insert(cursor.clone()) {
+                if !invalid.contains(&cursor) {
+                    invalid.push(cursor.clone());
+                }
+                parents.insert(cursor, None);
+                break;
+            }
+            match parents.get(&cursor).cloned().flatten() {
+                Some(parent) => cursor = parent,
+                None => break,
+            }
+        }
+    }
+    invalid
+}
+
+fn repair_folder_hierarchy(connection: &Connection) -> Result<usize, String> {
+    let mut statement = connection
+        .prepare("SELECT id,parent_id FROM folders ORDER BY position,id")
+        .map_err(|error| format!("Could not inspect the folder hierarchy: {error}"))?;
+    let folders = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| format!("Could not read the folder hierarchy: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Could not decode the folder hierarchy: {error}"))?;
+    drop(statement);
+    let invalid_ids = invalid_folder_parent_ids(&folders);
+    for id in &invalid_ids {
+        connection
+            .execute("UPDATE folders SET parent_id=NULL WHERE id=?1", [id])
+            .map_err(|error| format!("Could not repair folder '{id}': {error}"))?;
+    }
+    Ok(invalid_ids.len())
+}
+
+fn validate_folder_parent(
+    connection: &Connection,
+    folder_id: Option<&str>,
+    parent_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    if folder_id == Some("inbox") {
+        return Err("Inbox must remain a root folder".into());
+    }
+    if folder_id == Some(parent_id) {
+        return Err("A folder cannot be its own parent".into());
+    }
+    let parent_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM folders WHERE id=?1)",
+            [parent_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not validate the parent folder: {error}"))?;
+    if !parent_exists {
+        return Err(format!("Parent folder '{parent_id}' was not found"));
+    }
+    if let Some(folder_id) = folder_id {
+        let creates_cycle: bool = connection
+            .query_row(
+                "WITH RECURSIVE ancestors(id,parent_id) AS (
+                   SELECT id,parent_id FROM folders WHERE id=?1
+                   UNION
+                   SELECT f.id,f.parent_id FROM folders f JOIN ancestors a ON f.id=a.parent_id
+                 )
+                 SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=?2)",
+                params![parent_id, folder_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Could not validate the folder hierarchy: {error}"))?;
+        if creates_cycle {
+            return Err(format!(
+                "Moving folder '{folder_id}' under '{parent_id}' would create a circular folder reference"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn delete_folder_tree(connection: &mut Connection, id: &str) -> Result<usize, String> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Could not start folder deletion: {error}"))?;
+    transaction
+        .execute(
+            "WITH RECURSIVE tree(id) AS (
+               SELECT ?1
+               UNION
+               SELECT f.id FROM folders f JOIN tree t ON f.parent_id=t.id
+             )
+             UPDATE notes SET folder_id='inbox',status='trash',updated=strftime('%Y-%m-%dT%H:%M:%fZ','now'),revision=revision+1
+             WHERE folder_id IN tree",
+            [id],
+        )
+        .map_err(|error| format!("Could not move folder notes to Trash: {error}"))?;
+    let deleted = transaction
+        .execute(
+            "WITH RECURSIVE tree(id) AS (
+               SELECT ?1
+               UNION
+               SELECT f.id FROM folders f JOIN tree t ON f.parent_id=t.id
+             )
+             DELETE FROM folders WHERE id IN tree",
+            [id],
+        )
+        .map_err(|error| format!("Could not delete the folder tree: {error}"))?;
+    if deleted == 0 {
+        return Err("Folder not found".into());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("Could not finish folder deletion: {error}"))?;
+    Ok(deleted)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +366,22 @@ pub fn ensure_support_schema(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("Could not inspect folder storage: {error}"))?;
     if folders_exist {
+        let hierarchy_repaired: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_state WHERE key=?1)",
+                [FOLDER_HIERARCHY_REPAIR_KEY],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Could not read folder repair state: {error}"))?;
+        if !hierarchy_repaired {
+            let repaired = repair_folder_hierarchy(connection)?;
+            connection
+                .execute(
+                    "INSERT INTO app_state(key,value) VALUES(?1,?2)",
+                    params![FOLDER_HIERARCHY_REPAIR_KEY, repaired.to_string()],
+                )
+                .map_err(|error| format!("Could not save folder repair state: {error}"))?;
+        }
         let mut statement = connection
             .prepare("SELECT id, icon FROM folders WHERE id <> 'inbox'")
             .map_err(|error| format!("Could not inspect folder icons: {error}"))?;
@@ -407,6 +567,8 @@ pub struct UpdateFolderArgs {
     pub id: String,
     pub name: Option<String>,
     pub parent_id: Option<String>,
+    /// Set true to move the folder to the root. Cannot be combined with parentId.
+    pub clear_parent: Option<bool>,
     /// Optional replacement icon from the exact 50-value allowlist returned by folders_list.allowedIcons. Action icons are reserved.
     #[schemars(schema_with = "folder_icon_schema")]
     pub icon: Option<String>,
@@ -956,7 +1118,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Create a folder, optionally nested under another folder, and return the complete created folder object. icon defaults to ph-folder and must be one of the exact 50 values from folders_list.allowedIcons; archive, trash, delete, add, edit, and other action icons are reserved and rejected."
+        description = "Create a folder, optionally nested under an existing parent folder, and return the complete created folder object. Missing parent IDs are rejected. icon defaults to ph-folder and must be one of the exact 50 values from folders_list.allowedIcons; archive, trash, delete, add, edit, and other action icons are reserved and rejected."
     )]
     async fn folders_create(
         &self,
@@ -967,6 +1129,7 @@ impl OdoMcp {
             if args.name.trim().is_empty() {
                 return Err("Folder name cannot be empty".into());
             }
+            validate_folder_parent(&c, None, args.parent_id.as_deref())?;
             let icon = validate_folder_icon(args.icon)?;
             let id = format!("folder-{}", uuid::Uuid::new_v4());
             c.execute("INSERT INTO folders(id,name,parent_id,is_open,icon,position) VALUES(?1,?2,?3,1,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM folders))",params![id,args.name.trim(),args.parent_id,icon]).map_err(|e|format!("Could not create folder: {e}"))?;
@@ -989,7 +1152,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Rename, move, or change the icon of an existing folder and return the complete updated folder object. A supplied icon must be one of the exact 50 values from folders_list.allowedIcons; action icons are reserved and rejected."
+        description = "Rename, move, or change the icon of an existing folder and return the complete updated folder object. parentId must reference an existing folder and is rejected if it would create a circular hierarchy; set clearParent=true to move a folder to the root. A supplied icon must be one of the exact 50 values from folders_list.allowedIcons; action icons are reserved and rejected."
     )]
     async fn folders_update(
         &self,
@@ -1006,8 +1169,16 @@ impl OdoMcp {
                 .optional()
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "Folder not found".to_string())?;
+            if args.clear_parent.unwrap_or(false) && args.parent_id.is_some() {
+                return Err("clearParent cannot be combined with parentId".into());
+            }
             let name = args.name.unwrap_or(current.0);
-            let parent = args.parent_id.or(current.1);
+            let parent = if args.clear_parent.unwrap_or(false) {
+                None
+            } else {
+                args.parent_id.or(current.1)
+            };
+            validate_folder_parent(&c, Some(&args.id), parent.as_deref())?;
             let icon = match args.icon {
                 Some(icon) => validate_folder_icon(Some(icon))?,
                 None if args.id == "inbox" => current.2.unwrap_or_else(|| "ph-tray".into()),
@@ -1037,7 +1208,7 @@ impl OdoMcp {
     }
 
     #[tool(
-        description = "Delete a folder tree, moving every contained note to Inbox and Trash so the operation remains recoverable"
+        description = "Delete a folder tree with cycle-safe traversal, moving every contained note to Inbox and Trash so the operation remains recoverable even if legacy data contains circular folder references"
     )]
     async fn folders_delete(
         &self,
@@ -1048,13 +1219,7 @@ impl OdoMcp {
                 return Err("Inbox cannot be deleted".into());
             }
             let mut c = self.connection()?;
-            let tx = c.transaction().map_err(|e| e.to_string())?;
-            tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION ALL SELECT f.id FROM folders f JOIN tree t ON f.parent_id=t.id) UPDATE notes SET folder_id='inbox',status='trash',updated=strftime('%Y-%m-%dT%H:%M:%fZ','now'),revision=revision+1 WHERE folder_id IN tree",[&args.id]).map_err(|e|e.to_string())?;
-            let deleted=tx.execute("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION ALL SELECT f.id FROM folders f JOIN tree t ON f.parent_id=t.id) DELETE FROM folders WHERE id IN tree",[&args.id]).map_err(|e|e.to_string())?;
-            if deleted == 0 {
-                return Err("Folder not found".into());
-            }
-            tx.commit().map_err(|e| e.to_string())?;
+            let deleted = delete_folder_tree(&mut c, &args.id)?;
             bump_change(&c)?;
             audit(
                 &c,
@@ -2014,10 +2179,10 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE folders (id TEXT PRIMARY KEY, icon TEXT);
-                 INSERT INTO folders(id,icon) VALUES ('inbox','ph-tray');
-                 INSERT INTO folders(id,icon) VALUES ('bad','ph-trash');
-                 INSERT INTO folders(id,icon) VALUES ('good','ph-book');",
+                "CREATE TABLE folders (id TEXT PRIMARY KEY, parent_id TEXT, icon TEXT, position INTEGER);
+                 INSERT INTO folders(id,parent_id,icon,position) VALUES ('inbox',NULL,'ph-tray',0);
+                 INSERT INTO folders(id,parent_id,icon,position) VALUES ('bad',NULL,'ph-trash',1);
+                 INSERT INTO folders(id,parent_id,icon,position) VALUES ('good',NULL,'ph-book',2);",
             )
             .unwrap();
         ensure_support_schema(&connection).unwrap();
@@ -2039,6 +2204,109 @@ mod tests {
         assert_eq!(bad, DEFAULT_FOLDER_ICON);
         assert_eq!(good, "ph-book");
         assert_eq!(inbox, "ph-tray");
+    }
+
+    #[test]
+    fn support_schema_repairs_cycles_and_orphaned_parents_once() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE folders (id TEXT PRIMARY KEY, parent_id TEXT, icon TEXT, position INTEGER);
+                 INSERT INTO folders VALUES ('inbox',NULL,'ph-tray',0);
+                 INSERT INTO folders VALUES ('a','c','ph-folder',1);
+                 INSERT INTO folders VALUES ('b','a','ph-folder',2);
+                 INSERT INTO folders VALUES ('c','b','ph-folder',3);
+                 INSERT INTO folders VALUES ('orphan','missing','ph-folder',4);",
+            )
+            .unwrap();
+        ensure_support_schema(&connection).unwrap();
+        let parent = |id: &str| {
+            connection
+                .query_row("SELECT parent_id FROM folders WHERE id=?1", [id], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(parent("a"), None);
+        assert_eq!(parent("b").as_deref(), Some("a"));
+        assert_eq!(parent("c").as_deref(), Some("b"));
+        assert_eq!(parent("orphan"), None);
+        let repair_marker: String = connection
+            .query_row(
+                "SELECT value FROM app_state WHERE key=?1",
+                [FOLDER_HIERARCHY_REPAIR_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repair_marker, "2");
+    }
+
+    #[test]
+    fn folder_parent_validation_rejects_cycles_and_missing_parents() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE folders (id TEXT PRIMARY KEY, parent_id TEXT);
+                 INSERT INTO folders VALUES ('inbox',NULL);
+                 INSERT INTO folders VALUES ('a',NULL);
+                 INSERT INTO folders VALUES ('b','a');",
+            )
+            .unwrap();
+        assert!(validate_folder_parent(&connection, Some("a"), Some("b"))
+            .unwrap_err()
+            .contains("circular"));
+        assert!(
+            validate_folder_parent(&connection, Some("a"), Some("missing"))
+                .unwrap_err()
+                .contains("not found")
+        );
+        assert!(validate_folder_parent(&connection, Some("a"), Some("a"))
+            .unwrap_err()
+            .contains("own parent"));
+        validate_folder_parent(&connection, Some("b"), None).unwrap();
+    }
+
+    #[test]
+    fn cyclic_folder_delete_finishes_and_releases_the_write_lock() {
+        let path =
+            std::env::temp_dir().join(format!("odo-cycle-delete-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_millis(500))
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE folders (id TEXT PRIMARY KEY, parent_id TEXT);
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, folder_id TEXT, status TEXT, updated TEXT, revision INTEGER);
+                 INSERT INTO folders VALUES ('a','c');
+                 INSERT INTO folders VALUES ('b','a');
+                 INSERT INTO folders VALUES ('c','b');
+                 INSERT INTO notes VALUES ('note','b','active','',0);",
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(delete_folder_tree(&mut connection, "a").unwrap(), 3);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let note: (String, String, i64) = connection
+            .query_row(
+                "SELECT folder_id,status,revision FROM notes WHERE id='note'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(note, ("inbox".into(), "trash".into(), 1));
+        let second = Connection::open(&path).unwrap();
+        second
+            .busy_timeout(std::time::Duration::from_millis(500))
+            .unwrap();
+        second
+            .execute_batch("BEGIN IMMEDIATE; CREATE TABLE lock_probe(id INTEGER); COMMIT;")
+            .unwrap();
+        drop(second);
+        drop(connection);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 
     #[test]

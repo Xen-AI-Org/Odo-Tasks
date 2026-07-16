@@ -270,6 +270,18 @@ pub fn initialize_database(connection: &Connection) -> Result<(), String> {
 fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), String> {
     let workspace: Workspace = serde_json::from_str(contents)
         .map_err(|error| format!("The workspace data is invalid: {error}"))?;
+    let folder_parents = workspace
+        .folders
+        .iter()
+        .map(|folder| (folder.id.clone(), folder.parent_id.clone()))
+        .collect::<Vec<_>>();
+    let invalid_folders = mcp::invalid_folder_parent_ids(&folder_parents);
+    if !invalid_folders.is_empty() {
+        return Err(format!(
+            "The workspace contains missing, self-referencing, or circular folder parents: {}",
+            invalid_folders.join(", ")
+        ));
+    }
     let transaction = connection
         .transaction()
         .map_err(|error| format!("Could not start the save transaction: {error}"))?;
@@ -1190,5 +1202,28 @@ mod tests {
         assert_eq!(workspace.notes[0].title, "New");
         assert_eq!(workspace.notes[0].content, "New body");
         assert_eq!(workspace.notes[0].revision, 3);
+    }
+
+    #[test]
+    fn workspace_save_rejects_circular_folder_parents_before_starting_a_transaction() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory database");
+        initialize_database(&connection).expect("initialize schema");
+        let circular = r#"{
+          "folders":[
+            {"id":"inbox","name":"Inbox","parentId":null,"open":true,"icon":"ph-tray"},
+            {"id":"a","name":"A","parentId":"c","open":true,"icon":"ph-folder"},
+            {"id":"b","name":"B","parentId":"a","open":true,"icon":"ph-folder"},
+            {"id":"c","name":"C","parentId":"b","open":true,"icon":"ph-folder"}
+          ],
+          "notes":[],
+          "todos":[],
+          "selectedFolderId":"inbox",
+          "selectedNoteId":""
+        }"#;
+        let error = write_workspace(&mut connection, circular).unwrap_err();
+        assert!(error.contains("circular folder parents"));
+        connection
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .expect("rejected save must not leave a write lock");
     }
 }
