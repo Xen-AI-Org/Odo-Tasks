@@ -27,6 +27,7 @@ type DialogState = { options: DialogOptions; trigger: HTMLElement | null; resolv
 
 const STORAGE_KEY = "odo-notes-workspace-v2";
 const MOTION_KEY = "odo-motion-enabled";
+const NOTE_DRAG_TYPE = "application/x-odo-note";
 const isDesktopApp = "__TAURI_INTERNALS__" in window;
 const detachedNoteId = new URLSearchParams(location.search).get("note");
 const isMac = navigator.platform.toLowerCase().includes("mac");
@@ -207,7 +208,7 @@ function renderNotesPanel() {
 function renderNoteRows() {
   const notes = visibleNotes();
   if (!notes.length) return `<div class="empty-state"><span class="empty-icon"><i class="ph ${currentView === "trash" ? "ph-trash" : currentView === "archived" ? "ph-archive-tray" : "ph-note-blank"}"></i></span><strong>${searchQuery ? "No matching notes" : currentView === "trash" ? "Trash is empty" : currentView === "archived" ? "Nothing archived" : "A clear page awaits"}</strong><p>${searchQuery ? "Try a different search." : "Capture a thought and give it somewhere to grow."}</p>${currentView === "notes" && !searchQuery ? '<button class="primary-button" data-create-note>Create a note</button>' : ""}</div>`;
-  return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""} ${note.id === newRowId ? "is-new" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}" draggable="true" aria-label="${attr(note.title || "Untitled")}. Drag to a folder, Archive, or Trash."><div class="note-heading"><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${linkedPlainText(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
+  return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""} ${note.id === newRowId ? "is-new" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}" draggable="true" aria-label="${attr(note.title || "Untitled")}. Drag to a folder, Archive, or Trash."><div class="note-heading"><i class="ph ph-dots-six-vertical note-drag-handle" aria-hidden="true"></i><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${linkedPlainText(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
 }
 function slashMenuHtml() { return `<div class="slash-menu ${slashOpen ? "is-open" : ""}" id="slash-menu" role="listbox">${commands.map((command, index) => `<button class="slash-command ${index === slashIndex ? "is-active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === slashIndex}"><span class="command-icon"><i class="ph ${command.icon}"></i></span><span><strong>${command.label}</strong><small>${command.detail}</small></span>${index === 0 ? "<kbd>Enter</kbd>" : ""}</button>`).join("")}</div>`; }
 type RichBlock = "P" | "H1" | "H2" | "H3" | "BLOCKQUOTE" | "PRE" | "UL" | "OL";
@@ -765,12 +766,16 @@ function clearDragVisuals() {
   dragImage?.remove(); dragImage = null;
   draggingNoteId = "";
 }
-function createDragImage(note: Note, event: DragEvent) {
+function createDragPreview(note: Note) {
   const card = document.createElement("div"); card.className = "note-drag-image"; card.setAttribute("aria-hidden", "true");
   const title = document.createElement("strong"); title.textContent = note.title || "Untitled";
   const excerpt = document.createElement("span"); excerpt.textContent = noteExcerpt(note.content);
   const mark = document.createElement("i"); mark.className = "ph ph-note-blank";
   card.append(mark, title, excerpt); document.body.append(card); dragImage = card;
+  return card;
+}
+function createDragImage(note: Note, event: DragEvent) {
+  const card = createDragPreview(note);
   if (event.dataTransfer) event.dataTransfer.setDragImage(card, 22, 18);
 }
 function openFolderPath(folderId: string) {
@@ -852,9 +857,73 @@ async function reorderDroppedNote(noteId: string, targetId: string, side: "befor
   announceDrag(`Placed “${source.title || "Untitled"}” ${side} “${orderedVisible[targetIndex].title || "Untitled"}”. Manual order is on.`);
 }
 
+function bindPointerFolderDrag(row: HTMLElement) {
+  row.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" || event.button !== 0 || (event.target as HTMLElement).closest("button,a[href]")) return;
+    const noteId = row.dataset.noteId;
+    const note = state.notes.find((item) => item.id === noteId);
+    if (!noteId || !note) return;
+
+    const pointerId = event.pointerId;
+    const origin = { x: event.clientX, y: event.clientY };
+    let started = false;
+    let activeTarget: HTMLElement | null = null;
+
+    const targetAt = (x: number, y: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-drop-kind="folder"]') ?? null;
+    const updateTarget = (x: number, y: number) => {
+      const nextTarget = targetAt(x, y);
+      if (nextTarget === activeTarget) return;
+      activeTarget?.classList.remove("is-drop-target");
+      activeTarget = nextTarget;
+      activeTarget?.classList.add("is-drop-target");
+      if (activeTarget) announceDrag(`Move here: ${dropDestinationLabel("folder", activeTarget.dataset.dropId)}.`);
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", cancel);
+    };
+    const move = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      if (!started && Math.hypot(moveEvent.clientX - origin.x, moveEvent.clientY - origin.y) < 8) return;
+      if (!started) {
+        started = true;
+        draggingNoteId = noteId;
+        row.classList.add("is-dragging");
+        const preview = createDragPreview(note); preview.classList.add("is-pointer-drag-image");
+        announceDrag(`Moving “${note.title || "Untitled"}”. Choose a folder.`);
+      }
+      moveEvent.preventDefault();
+      if (dragImage) { dragImage.style.left = `${moveEvent.clientX + 16}px`; dragImage.style.top = `${moveEvent.clientY + 16}px`; }
+      updateTarget(moveEvent.clientX, moveEvent.clientY);
+    };
+    const finish = (upEvent: PointerEvent) => {
+      if (upEvent.pointerId !== pointerId) return;
+      cleanup();
+      const destination = started ? targetAt(upEvent.clientX, upEvent.clientY) : null;
+      const folderId = destination?.dataset.dropId;
+      if (started) suppressRowActivationUntil = Date.now() + 260;
+      clearDragVisuals();
+      if (folderId) void moveDroppedNote(noteId, "folder", folderId);
+      else if (started) announceDrag("Move cancelled. The note was not changed.");
+    };
+    const cancel = (cancelEvent: PointerEvent) => {
+      if (cancelEvent.pointerId !== pointerId) return;
+      cleanup();
+      if (started) suppressRowActivationUntil = Date.now() + 260;
+      clearDragVisuals();
+      if (started) announceDrag("Move cancelled. The note was not changed.");
+    };
+
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", cancel);
+  });
+}
+
 function bindDropTargets() {
   document.querySelectorAll<HTMLElement>("[data-drop-kind]").forEach((target) => {
-    const acceptsDrag = (event: DragEvent) => !!draggingNoteId || !!event.dataTransfer?.types.includes("text/plain");
+    const acceptsDrag = (event: DragEvent) => !!draggingNoteId || !!event.dataTransfer?.types.includes(NOTE_DRAG_TYPE);
     target.addEventListener("dragenter", (event) => {
       if (!acceptsDrag(event)) return;
       event.preventDefault();
@@ -875,7 +944,7 @@ function bindDropTargets() {
     target.addEventListener("drop", (event) => {
       if (!acceptsDrag(event)) return;
       event.preventDefault();
-      const noteId = draggingNoteId || event.dataTransfer?.getData("application/x-odo-note") || event.dataTransfer?.getData("text/plain");
+      const noteId = draggingNoteId || event.dataTransfer?.getData(NOTE_DRAG_TYPE);
       const kind = target.dataset.dropKind as "folder" | "archive" | "trash";
       const folderId = target.dataset.dropId;
       clearDragVisuals();
@@ -886,11 +955,12 @@ function bindDropTargets() {
 
 function bindNoteRows() {
   document.querySelectorAll<HTMLElement>("[data-note-id]").forEach((row) => {
+    bindPointerFolderDrag(row);
     row.addEventListener("dragstart", (event) => {
       if ((event.target as HTMLElement).closest("button,a[href]")) { event.preventDefault(); return; }
       const id = row.dataset.noteId!;
       draggingNoteId = id;
-      if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("application/x-odo-note", id); event.dataTransfer.setData("text/plain", id); }
+      if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(NOTE_DRAG_TYPE, id); }
       row.classList.add("is-dragging");
       const note = state.notes.find((item) => item.id === id);
       if (note) createDragImage(note, event);
