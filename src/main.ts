@@ -14,7 +14,9 @@ type Todo = { id: string; text: string; completed: boolean; created: string; upd
 type TodoCategory = { id: string; name: string; color: string; icon?: string };
 type JournalEntry = { id: string; dateKey: string; content: string; created: string; updated: string };
 type PlannerView = "1" | "3" | "4" | "7";
-type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; todoCategories: TodoCategory[]; journalEntries: JournalEntry[]; selectedFolderId: string; selectedNoteId: string; sortMode: SortMode; plannerView: PlannerView };
+type PinType = "note" | "task" | "folder";
+type Pin = { id: string; type: PinType };
+type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; todoCategories: TodoCategory[]; journalEntries: JournalEntry[]; pins: Pin[]; selectedFolderId: string; selectedNoteId: string; sortMode: SortMode; plannerView: PlannerView };
 type StorageInfo = { databasePath: string; backupDirectory: string };
 type McpConfig = { enabled: boolean; host: string; port: number; authEnabled: boolean; token: string; permanentDeleteEnabled: boolean; startAtLogin: boolean };
 type McpStatus = { running: boolean; endpoint: string | null; error: string | null };
@@ -28,6 +30,7 @@ type DialogState = { options: DialogOptions; trigger: HTMLElement | null; resolv
 const STORAGE_KEY = "odo-notes-workspace-v2";
 const MOTION_KEY = "odo-motion-enabled";
 const NOTE_DRAG_TYPE = "application/x-odo-note";
+const FOLDER_DRAG_TYPE = "application/x-odo-folder";
 const isDesktopApp = "__TAURI_INTERNALS__" in window;
 const detachedNoteId = new URLSearchParams(location.search).get("note");
 const isMac = navigator.platform.toLowerCase().includes("mac");
@@ -54,7 +57,7 @@ const starterFolders: Folder[] = [
 const starterNotes: Note[] = [
   { id: "welcome", folderId: "inbox", title: "Welcome to Odo", updated: now(), status: "active", pinned: true, revision: 0, content: "## A calm place for your work\n\nCapture ideas, organize projects, and keep your day moving.\n\n- Press Ctrl+N for a new note\n- Press Ctrl+2 for Tasks\n- Type / on a new line for blocks" },
 ];
-const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], todoCategories: [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }], journalEntries: [], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest", plannerView: "3" });
+const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], todoCategories: [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }], journalEntries: [], pins: [], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest", plannerView: "3" });
 
 const escapeHtml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#039;");
 const attr = escapeHtml;
@@ -68,7 +71,8 @@ function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Works
   const todos = (Array.isArray(input?.todos) ? input.todos : []).map((todo) => ({ ...todo, categoryId: todo.categoryId || "inbox", priority: (todo.priority || "medium") as Priority, effort: todo.effort || 2, color: todo.color || "", scheduledStart: todo.scheduledStart || null, durationMinutes: todo.durationMinutes || 30 }));
   const plannerView: PlannerView = ["1", "3", "4", "7"].includes(input?.plannerView || "") ? input!.plannerView as PlannerView : "3";
   const journalEntries = (Array.isArray(input?.journalEntries) ? input.journalEntries : []).filter((entry): entry is JournalEntry => !!entry && typeof entry.dateKey === "string").map((entry) => ({ id: entry.id || uid("journal"), dateKey: entry.dateKey, content: entry.content || "", created: entry.created || now(), updated: entry.updated || entry.created || now() }));
-  return { folders, notes, todos, todoCategories: categories, journalEntries, selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "", sortMode, plannerView };
+  const pins = (Array.isArray(input?.pins) ? input.pins : fallback.pins).filter((pin): pin is Pin => !!pin && typeof pin.id === "string" && ["note", "task", "folder"].includes(pin.type));
+  return { folders, notes, todos, todoCategories: categories, journalEntries, pins, selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "", sortMode, plannerView };
 }
 function initialState(): Workspace {
   if (!isDesktopApp) try { const saved = localStorage.getItem(STORAGE_KEY); if (saved) return normalizeWorkspace(JSON.parse(saved) as Workspace); } catch { localStorage.removeItem(STORAGE_KEY); }
@@ -102,15 +106,22 @@ let lastMcpChangeVersion = -1;
 let reloadingWorkspace = false;
 let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
 let draggingNoteId = "";
+let draggingFolderId = "";
 let suppressRowActivationUntil = 0;
 let sortInsertionTargetId = "";
 let sortInsertionSide: "before" | "after" = "before";
+let folderDropTargetId = "";
+let folderDropInsertion: "before" | "after" | "inside" = "inside";
 let dragImage: HTMLElement | null = null;
 let plannerDate = new Date(); plannerDate.setHours(0, 0, 0, 0);
 let taskMenuTodoId = "";
 let plannerPopover: { x: number; y: number; returnId: string } | null = null;
 let plannerPointerDragging = false;
 let plannerPointerDrop: { date: string; minute: number } | null = null;
+let plannerInboxTab: "inbox" | "scheduled" = "inbox";
+const matchesInboxTab = (todo: Todo) => plannerInboxTab === "scheduled" ? !!todo.scheduledStart : !todo.scheduledStart;
+let pinPickerOpen = false;
+let pinPickerQuery = "";
 let selectedJournalDate = "";
 let journalOpening = false;
 let journalSaveTimer = 0;
@@ -133,7 +144,8 @@ function currentFolder(): Folder { return state.folders.find((folder) => folder.
 function selectedNote(): Note | undefined { return state.notes.find((note) => note.id === state.selectedNoteId); }
 function statusForView(): NoteStatus { return currentView === "archived" ? "archived" : currentView === "trash" ? "trash" : "active"; }
 function visibleNotes(): Note[] {
-  const folderIds = currentView === "notes" ? descendants(state.selectedFolderId) : null;
+  const journalIds = new Set(descendants("journal"));
+  const folderIds = currentView === "notes" ? descendants(state.selectedFolderId).filter((id) => !journalIds.has(id)) : null;
   const notes = state.notes.filter((note) => note.status === statusForView()).filter((note) => !folderIds || folderIds.includes(note.folderId)).filter((note) => `${note.title} ${note.content}`.toLowerCase().includes(searchQuery.toLowerCase()));
   if (state.sortMode === "manual") return notes;
   return notes.sort((a, b) => {
@@ -143,12 +155,12 @@ function visibleNotes(): Note[] {
   });
 }
 function repairState() {
-  if (!state.folders.some((folder) => folder.id === state.selectedFolderId)) state.selectedFolderId = "inbox";
+  if (!state.folders.some((folder) => folder.id === state.selectedFolderId) || state.selectedFolderId === "journal") state.selectedFolderId = "inbox";
   const note = selectedNote();
   if (!note || (currentView === "notes" && (note.status !== "active" || !descendants(state.selectedFolderId).includes(note.folderId))) || (currentView === "archived" && note.status !== "archived") || (currentView === "trash" && note.status !== "trash")) state.selectedNoteId = visibleNotes()[0]?.id ?? "";
 }
 function folderCount(id: string) { const ids = descendants(id); return state.notes.filter((note) => ids.includes(note.folderId) && note.status === "active").length; }
-function viewTitle() { return currentView === "archived" ? "Archive" : currentView === "trash" ? "Trash" : currentFolder().name; }
+function viewTitle() { return currentView === "archived" ? "Archive" : currentView === "trash" ? "Trash" : (currentView === "notes" && state.selectedFolderId === "inbox" ? "Notes" : currentFolder().name); }
 function noteExcerpt(content: string) { return content.replace(/[#>*`|\[\]-]/g, " ").replace(/\s+/g, " ").trim().slice(0, 82) || "Empty note"; }
 function formatListDate(iso: string) {
   const date = new Date(iso); const today = new Date(); const yesterday = new Date(); yesterday.setDate(today.getDate() - 1);
@@ -190,16 +202,64 @@ async function restoreDesktopWorkspace() {
 }
 
 function renderFolder(folder: Folder, depth = 0): string {
+  if (folder.id === "journal") return "";
   const children = state.folders.filter((candidate) => candidate.parentId === folder.id);
   const toggle = children.length ? `<button class="folder-toggle" data-toggle-folder="${attr(folder.id)}" aria-label="${folder.open ? "Collapse" : "Expand"} ${attr(folder.name)}"><i class="ph ph-caret-${folder.open ? "down" : "right"}"></i></button>` : '<span class="folder-toggle-spacer"></span>';
-  return `<div class="folder-branch"><div class="folder-row ${currentView === "notes" && state.selectedFolderId === folder.id ? "is-selected" : ""}" data-folder-id="${attr(folder.id)}" data-drop-kind="folder" data-drop-id="${attr(folder.id)}" style="--depth:${depth}" role="button" tabindex="0" aria-dropeffect="move" aria-label="Move a note to ${attr(folder.name)}. ${folderCount(folder.id)} notes">${toggle}<i class="ph ${safeFolderIcon(folder.icon, folder.id === "inbox")} folder-icon"></i><span class="folder-name">${escapeHtml(folder.name)}</span><span class="folder-count">${folderCount(folder.id)}</span><span class="drop-cue" aria-hidden="true">Move here</span><button class="row-more" data-folder-menu="${attr(folder.id)}" aria-label="Folder actions"><i class="ph ph-dots-three"></i></button></div>${folder.open ? children.map((child) => renderFolder(child, depth + 1)).join("") : ""}</div>`;
+  const draggable = folder.id === "inbox" ? 'draggable="false"' : 'draggable="true"';
+  return `<div class="folder-branch"><div class="folder-row ${currentView === "notes" && state.selectedFolderId === folder.id ? "is-selected" : ""}" ${draggable} data-folder-id="${attr(folder.id)}" data-drop-kind="folder" data-drop-id="${attr(folder.id)}" style="--depth:${depth}" role="button" tabindex="0" aria-dropeffect="move" aria-label="Move a note to ${attr(folder.name)}. ${folderCount(folder.id)} notes">${toggle}<i class="ph ${safeFolderIcon(folder.icon, folder.id === "inbox")} folder-icon"></i><span class="folder-name">${escapeHtml(folder.name)}</span><span class="folder-count">${folderCount(folder.id)}</span><span class="drop-cue" aria-hidden="true">Move here</span><button class="row-more" data-folder-menu="${attr(folder.id)}" aria-label="Folder actions"><i class="ph ph-dots-three"></i></button></div>${folder.open ? children.map((child) => renderFolder(child, depth + 1)).join("") : ""}</div>`;
+}
+function pinItem(id: string, type: PinType) {
+  state.pins = state.pins.filter((pin) => !(pin.id === id && pin.type === type));
+  state.pins.unshift({ id, type });
+  void saveState(false); renderApp();
+}
+function unpinItem(id: string, type: PinType) {
+  state.pins = state.pins.filter((pin) => !(pin.id === id && pin.type === type));
+  void saveState(false); renderApp();
+}
+function openPin(pin: Pin) {
+  if (pin.type === "note") {
+    const note = state.notes.find((n) => n.id === pin.id);
+    if (note) { currentView = "notes"; state.selectedFolderId = note.folderId; state.selectedNoteId = note.id; openFolderPath(note.folderId); }
+  } else if (pin.type === "folder") {
+    currentView = "notes"; state.selectedFolderId = pin.id; openFolderPath(pin.id);
+  } else if (pin.type === "task") {
+    currentView = "tasks";
+  }
+  repairState(); void saveState(false); renderApp();
+}
+function pinLabel(pin: Pin) {
+  if (pin.type === "note") return state.notes.find((n) => n.id === pin.id)?.title || "Untitled";
+  if (pin.type === "folder") return state.folders.find((f) => f.id === pin.id)?.name || "Folder";
+  return state.todos.find((t) => t.id === pin.id)?.text || "Task";
+}
+function pinSuggestions() {
+  const query = pinPickerQuery.toLowerCase();
+  const pinnedIds = new Set(state.pins.map((p) => `${p.type}:${p.id}`));
+  const noteMatches = state.notes.filter((n) => n.status === "active" && !pinnedIds.has(`note:${n.id}`) && `${n.title} ${n.content}`.toLowerCase().includes(query)).slice(0, 15).map((n) => ({ id: n.id, type: "note" as PinType, title: n.title || "Untitled" }));
+  const folderMatches = state.folders.filter((f) => f.id !== "inbox" && !pinnedIds.has(`folder:${f.id}`) && f.name.toLowerCase().includes(query)).slice(0, 8).map((f) => ({ id: f.id, type: "folder" as PinType, title: f.name }));
+  const taskMatches = state.todos.filter((t) => !t.completed && !pinnedIds.has(`task:${t.id}`) && t.text.toLowerCase().includes(query)).slice(0, 8).map((t) => ({ id: t.id, type: "task" as PinType, title: t.text }));
+  return [...noteMatches, ...folderMatches, ...taskMatches];
+}
+function renderPin(pin: Pin) {
+  const title = pinLabel(pin);
+  return `<button class="pin-row" data-pin-id="${attr(pin.id)}" data-pin-type="${pin.type}" title="${attr(title)}"><i class="ph ${pin.type === "note" ? "ph-note-blank" : pin.type === "folder" ? "ph-folder" : "ph-check-square"}"></i><span>${attr(title)}</span></button>`;
+}
+function renderPinPicker() {
+  const suggestions = pinSuggestions();
+  return `<div class="pin-picker"><input id="pin-search" type="search" placeholder="Search notes, tasks, projects…" value="${attr(pinPickerQuery)}" autocomplete="off" aria-label="Search to pin"><div class="pin-suggestions">${suggestions.map((s) => `<button class="pin-suggestion" data-pin-suggestion="${attr(s.id)}" data-pin-type="${s.type}"><i class="ph ${s.type === "note" ? "ph-note-blank" : s.type === "folder" ? "ph-folder" : "ph-check-square"}"></i><span>${attr(s.title)}</span></button>`).join("") || '<p class="pin-empty">No matches</p>'}</div></div>`;
 }
 function renderSidebar() {
   const remaining = state.todos.filter((todo) => !todo.completed).length;
   return `<aside class="folders-panel" aria-label="Workspace navigation"><header class="brand-row"><button class="wordmark" id="wordmark" title="Go to Inbox">Odo</button><button class="icon-button sidebar-toggle" title="${sidebarCollapsed ? "Show" : "Hide"} sidebar" aria-label="${sidebarCollapsed ? "Show" : "Hide"} sidebar"><i class="ph ph-sidebar-simple"></i></button></header>
     <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button><button class="primary-link ${currentView === "journal" ? "is-selected" : ""}" data-view="journal" aria-label="Journal"><i class="ph ph-book-open-text"></i><span>Journal</span></button></nav>
+    <div class="pinned-section" data-drop-kind="pin"><div class="panel-label-row"><span>Pinned</span><button class="icon-button" id="pin-add" title="Pin a note, task, or project" aria-label="Pin a note, task, or project"><i class="ph ph-push-pin"></i></button></div><nav class="pin-list">${state.pins.map(renderPin).join("") || '<p class="pin-empty">Drag notes, tasks, or projects here</p>'}</nav>${pinPickerOpen ? renderPinPicker() : ""}</div>
     <div class="panel-label-row"><span>Folders</span><button class="icon-button" id="new-folder" title="New folder (${modLabel}+Shift+N)"><i class="ph ph-plus"></i></button></div><nav class="folder-tree" id="folder-tree">${state.folders.filter((folder) => folder.parentId === null && folder.id !== "inbox").map((folder) => renderFolder(folder)).join("")}</nav>
     <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
+}
+function renderTasksMini() {
+  const tasks = state.todos.filter((todo) => !todo.completed && !todo.scheduledStart);
+  return `<aside class="tasks-mini"><header class="tasks-mini-header"><h2>Tasks</h2><span>${tasks.length}</span></header><div class="tasks-mini-list">${state.todoCategories.map((category) => { const categoryTasks = tasks.filter((todo) => todo.categoryId === category.id); return `<section class="tasks-mini-category"><h3>${escapeHtml(category.name)}</h3>${categoryTasks.map(renderPlannerTodo).join("") || '<p class="tasks-empty">No open tasks</p>'}</section>`; }).join("")}</div></aside>`;
 }
 function renderNotesPanel() {
   const ordering = state.sortMode === "manual" ? "manual order" : state.sortMode === "newest" ? "newest first" : "oldest first";
@@ -208,7 +268,7 @@ function renderNotesPanel() {
 function renderNoteRows() {
   const notes = visibleNotes();
   if (!notes.length) return `<div class="empty-state"><span class="empty-icon"><i class="ph ${currentView === "trash" ? "ph-trash" : currentView === "archived" ? "ph-archive-tray" : "ph-note-blank"}"></i></span><strong>${searchQuery ? "No matching notes" : currentView === "trash" ? "Trash is empty" : currentView === "archived" ? "Nothing archived" : "A clear page awaits"}</strong><p>${searchQuery ? "Try a different search." : "Capture a thought and give it somewhere to grow."}</p>${currentView === "notes" && !searchQuery ? '<button class="primary-button" data-create-note>Create a note</button>' : ""}</div>`;
-  return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""} ${note.id === newRowId ? "is-new" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}" draggable="true" aria-label="${attr(note.title || "Untitled")}. Drag to a folder, Archive, or Trash."><div class="note-heading"><i class="ph ph-dots-six-vertical note-drag-handle" aria-hidden="true"></i><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${linkedPlainText(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
+  return notes.map((note) => `<div class="note-row ${note.id === state.selectedNoteId ? "is-selected" : ""} ${note.id === newRowId ? "is-new" : ""}" data-note-id="${attr(note.id)}" role="button" tabindex="${note.id === state.selectedNoteId ? "0" : "-1"}" draggable="false" aria-label="${attr(note.title || "Untitled")}. Drag to a folder, Archive, or Trash."><div class="note-heading"><i class="ph ph-dots-six-vertical note-drag-handle" aria-hidden="true"></i><span class="note-title-wrap">${note.pinned ? '<i class="ph ph-push-pin pin-icon"></i>' : ""}<span class="note-title">${linkedPlainText(note.title || "Untitled")}</span></span><time>${formatListDate(note.updated)}</time><button class="row-more" data-note-menu="${attr(note.id)}" aria-label="Note actions"><i class="ph ph-dots-three"></i></button></div><span class="note-excerpt">${escapeHtml(noteExcerpt(note.content))}</span></div>`).join("");
 }
 function slashMenuHtml() { return `<div class="slash-menu ${slashOpen ? "is-open" : ""}" id="slash-menu" role="listbox">${commands.map((command, index) => `<button class="slash-command ${index === slashIndex ? "is-active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === slashIndex}"><span class="command-icon"><i class="ph ${command.icon}"></i></span><span><strong>${command.label}</strong><small>${command.detail}</small></span>${index === 0 ? "<kbd>Enter</kbd>" : ""}</button>`).join("")}</div>`; }
 type RichBlock = "P" | "H1" | "H2" | "H3" | "BLOCKQUOTE" | "PRE" | "UL" | "OL";
@@ -409,15 +469,25 @@ const dayStart = (offset: number) => { const date = new Date(plannerDate); date.
 const localStart = (date: Date, minutes: number) => { const value = new Date(date); value.setMinutes(minutes,0,0); return value.toISOString(); };
 const taskTime = (todo: Todo) => todo.scheduledStart ? new Date(todo.scheduledStart) : null;
 function renderTasks() {
-  const days = Number(state.plannerView); const active = state.todos.filter((todo) => !todo.completed); const rangeEnd = dayStart(days - 1);
+  const days = Number(state.plannerView); const active = state.todos.filter((todo) => !todo.completed && matchesInboxTab(todo)); const rangeEnd = dayStart(days - 1);
   const title = days === 1 ? plannerDate.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"}) : `${plannerDate.toLocaleDateString(undefined,{month:"short",day:"numeric"})} – ${rangeEnd.toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric"})}`;
-  return `<main class="planner-view" aria-label="Task planner"><aside class="planner-inbox"><header><div><span class="eyebrow">Daily workspace</span><h1>Tasks</h1></div><button class="icon-button" id="add-category" title="Add category" aria-label="Add category"><i class="ph ph-plus"></i></button></header><form id="quick-task-form" class="planner-quick-add"><i class="ph ph-plus"></i><input id="quick-task-input" autocomplete="off" placeholder="Add a task…" aria-label="New task"><kbd>Enter</kbd></form><div class="planner-inbox-meta"><span>${active.length} open</span><span>${state.todos.filter(t=>t.scheduledStart && !t.completed).length} scheduled</span></div><div class="planner-categories">${state.todoCategories.map(category => { const tasks = state.todos.filter(todo=>todo.categoryId===category.id); return `<section class="planner-category" data-category-id="${attr(category.id)}"><header><span class="category-dot" style="--category:${attr(category.color)}"></span><strong>${escapeHtml(category.name)}</strong><small>${tasks.filter(t=>!t.completed).length}</small><button data-category-add="${attr(category.id)}" aria-label="Add ${attr(category.name)} task"><i class="ph ph-plus"></i></button></header><div class="planner-task-list">${tasks.filter(todo=>!todo.completed).map(renderPlannerTodo).join("") || '<p class="planner-empty">No open tasks</p>'}</div></section>`; }).join("")}</div><section class="planner-complete"><button id="toggle-completed" aria-expanded="${!completedCollapsed}"><i class="ph ph-caret-${completedCollapsed?"right":"down"}"></i> Completed <small>${state.todos.filter(t=>t.completed).length}</small></button>${completedCollapsed?"":`<div>${state.todos.filter(t=>t.completed).map(renderPlannerTodo).join("")}</div>`}</section></aside><section class="planner-calendar"><header class="planner-toolbar"><div><button class="icon-button" data-planner-nav="prev" aria-label="Previous dates"><i class="ph ph-caret-left"></i></button><button class="today-button" data-planner-nav="today">Today</button><button class="icon-button" data-planner-nav="next" aria-label="Next dates"><i class="ph ph-caret-right"></i></button><h2>${title}</h2></div><div><input id="planner-date" type="date" value="${dateKey(plannerDate)}" aria-label="Jump to date"><select id="planner-view" aria-label="Calendar view">${[["1","1 day"],["3","3 days"],["4","4 days"],["7","Week"]].map(([value,label])=>`<option value="${value}" ${state.plannerView===value?"selected":""}>${label}</option>`).join("")}</select></div></header><div class="calendar-scroll" id="calendar-scroll"><div class="calendar-grid" style="--days:${days}"><div class="calendar-days"><div class="time-gutter"></div>${Array.from({length:days},(_,index)=>renderCalendarDayHeader(dayStart(index))).join("")}</div><div class="calendar-body"><div class="time-axis">${Array.from({length:24},(_,hour)=>`<span style="top:${hour*2*slotHeight}px">${String(hour).padStart(2,"0")}:00</span>`).join("")}</div><div class="calendar-columns">${Array.from({length:days},(_,index)=>renderCalendarColumn(dayStart(index))).join("")}</div></div></div></div></section>${taskMenuTodoId ? renderPlannerProperties(state.todos.find(t=>t.id===taskMenuTodoId)!) : ""}<div class="planner-live" aria-live="polite"></div></main>`;
+  return `<main class="planner-view" aria-label="Task planner"><aside class="planner-inbox"><header><div><span class="eyebrow">Daily workspace</span><h1>Tasks</h1></div><button class="icon-button" id="add-category" title="Add category" aria-label="Add category"><i class="ph ph-plus"></i></button></header><nav class="planner-tabs"><button class="${plannerInboxTab==="inbox"?"is-active":""}" data-task-tab="inbox">Inbox</button><button class="${plannerInboxTab==="scheduled"?"is-active":""}" data-task-tab="scheduled">Scheduled</button></nav><form id="quick-task-form" class="planner-quick-add"><i class="ph ph-plus"></i><input id="quick-task-input" autocomplete="off" placeholder="Add a task…" aria-label="New task"><kbd>Enter</kbd></form><div class="planner-inbox-meta"><span>${active.length} open</span><span>${state.todos.filter(t=>t.scheduledStart && !t.completed).length} scheduled</span></div><div class="planner-categories">${state.todoCategories.map(category => { const tasks = state.todos.filter(todo=>todo.categoryId===category.id && matchesInboxTab(todo)); return `<section class="planner-category" data-category-id="${attr(category.id)}"><header><span class="category-dot" style="--category:${attr(category.color)}"></span><strong>${escapeHtml(category.name)}</strong><small>${tasks.filter(t=>!t.completed).length}</small><button data-category-add="${attr(category.id)}" aria-label="Add ${attr(category.name)} task"><i class="ph ph-plus"></i></button></header><div class="planner-task-list">${tasks.filter(todo=>!todo.completed).map(renderPlannerTodo).join("") || '<p class="planner-empty">No open tasks</p>'}</div></section>`; }).join("")}</div><section class="planner-complete"><button id="toggle-completed" aria-expanded="${!completedCollapsed}"><i class="ph ph-caret-${completedCollapsed?"right":"down"}"></i> Completed <small>${state.todos.filter(t=>t.completed).length}</small></button>${completedCollapsed?"":`<div>${state.todos.filter(t=>t.completed).map(renderPlannerTodo).join("")}</div>`}</section></aside><section class="planner-calendar"><header class="planner-toolbar"><div><button class="icon-button" data-planner-nav="prev" aria-label="Previous dates"><i class="ph ph-caret-left"></i></button><button class="today-button" data-planner-nav="today">Today</button><button class="icon-button" data-planner-nav="next" aria-label="Next dates"><i class="ph ph-caret-right"></i></button><h2>${title}</h2></div><div><input id="planner-date" type="date" value="${dateKey(plannerDate)}" aria-label="Jump to date"><select id="planner-view" aria-label="Calendar view">${[["1","1 day"],["3","3 days"],["4","4 days"],["7","Week"]].map(([value,label])=>`<option value="${value}" ${state.plannerView===value?"selected":""}>${label}</option>`).join("")}</select></div></header><div class="calendar-scroll" id="calendar-scroll"><div class="calendar-grid" style="--days:${days}"><div class="calendar-days"><div class="time-gutter"></div>${Array.from({length:days},(_,index)=>renderCalendarDayHeader(dayStart(index))).join("")}</div><div class="calendar-body"><div class="time-axis">${Array.from({length:24},(_,hour)=>`<span style="top:${hour*2*slotHeight}px">${String(hour).padStart(2,"0")}:00</span>`).join("")}</div><div class="calendar-columns">${Array.from({length:days},(_,index)=>renderCalendarColumn(dayStart(index))).join("")}</div></div></div></div></section>${taskMenuTodoId ? renderPlannerProperties(state.todos.find(t=>t.id===taskMenuTodoId)!) : ""}<div class="planner-live" aria-live="polite"></div></main>`;
 }
-function renderPlannerTodo(todo: Todo) { const category = categoryFor(todo); const time = taskTime(todo); return `<article class="planner-task-card ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><div><strong>${escapeHtml(todo.text)}</strong><small><span class="priority-dot ${todo.priority}"></span>${"•".repeat(todo.effort)}${"·".repeat(5-todo.effort)} ${time?` · ${time.toLocaleDateString(undefined,{month:"short",day:"numeric"})}`:" · Unscheduled"}</small></div><span class="task-chip" style="--category:${attr(todo.color||category.color)}">${escapeHtml(category.name)}</span><button class="task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
-function renderCalendarDayHeader(date: Date) { const today=dateKey(date)===dateKey(new Date()); return `<div class="calendar-day-header ${today?"is-today":""}"><span>${date.toLocaleDateString(undefined,{weekday:"short"})}</span><strong>${date.getDate()}</strong></div>`; }
+function renderPlannerTodo(todo: Todo) { const category = categoryFor(todo); const time = taskTime(todo); const timeLabel = time ? ` · ${time.toLocaleDateString(undefined,{month:"short",day:"numeric"})} · ${time.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}` : " · Unscheduled"; return `<article class="planner-task-card ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><div><strong>${escapeHtml(todo.text)}</strong><small><span class="priority-dot ${todo.priority}"></span>${"•".repeat(todo.effort)}${"·".repeat(5-todo.effort)} ${timeLabel}</small></div><span class="task-chip" style="--category:${attr(todo.color||category.color)}">${escapeHtml(category.name)}</span><button class="task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
+function renderCalendarDayHeader(date: Date) {
+  const today = dateKey(date) === dateKey(new Date());
+  const key = dateKey(date);
+  const dayTasks = state.todos.filter(todo => todo.scheduledStart && dateKey(new Date(todo.scheduledStart)) === key && !todo.completed);
+  const taskLines = dayTasks.map(todo => {
+    const t = new Date(todo.scheduledStart!);
+    const category = categoryFor(todo);
+    return `<div class="day-task-line" data-todo-id="${attr(todo.id)}"><span class="day-task-time">${t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</span><span class="day-task-text">${escapeHtml(todo.text)}</span><span class="day-task-dot" style="--category:${attr(todo.color || category.color)}"></span></div>`;
+  }).join("");
+  return `<div class="calendar-day-header ${today ? "is-today" : ""}"><div class="calendar-day-label"><span>${date.toLocaleDateString(undefined, { weekday: "short" })}</span><strong>${date.getDate()}</strong></div>${taskLines ? `<div class="day-task-lines">${taskLines}</div>` : ""}</div>`;
+}
 function renderCalendarColumn(date: Date) { const key=dateKey(date); const nowDate=new Date(); const isToday=key===dateKey(nowDate); const tasks=state.todos.filter(todo=>todo.scheduledStart && dateKey(new Date(todo.scheduledStart))===key); const slots=Array.from({length:48},(_,i)=>`<div class="calendar-slot" data-slot-date="${key}" data-slot-minute="${i*30}"></div>`).join(""); const current=isToday?`<div class="now-line" style="top:${(nowDate.getHours()*60+nowDate.getMinutes())/30*slotHeight}px"><span>Now</span></div>`:""; return `<div class="calendar-column" data-calendar-date="${key}">${slots}${tasks.map(renderCalendarTask).join("")}${current}</div>`; }
 function renderCalendarTask(todo: Todo) { const start=taskTime(todo)!; const category=categoryFor(todo); const minutes=start.getHours()*60+start.getMinutes(); const top=minutes/30*slotHeight; const height=Math.max(slotHeight,todo.durationMinutes/30*slotHeight); const ending=new Date(start.getTime()+todo.durationMinutes*60000); return `<article class="calendar-task ${todo.completed?"is-complete":""}" data-calendar-task="${attr(todo.id)}" data-todo-id="${attr(todo.id)}" tabindex="0" role="button" style="top:${top}px;height:${height}px;--task-color:${attr(todo.color||category.color)}"><div class="calendar-task-content"><span class="priority-band ${todo.priority}"></span><button class="calendar-check" data-toggle-todo="${attr(todo.id)}" aria-label="Complete task"><i class="ph ph-check"></i></button><div><small>${start.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})} – ${ending.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}</small><strong>${escapeHtml(todo.text)}</strong></div></div><span class="calendar-resize" data-resize-todo="${attr(todo.id)}" title="Resize duration"></span></article>`; }
-function renderPlannerProperties(todo: Todo) { const category=categoryFor(todo); const popover=plannerPopover ?? {x:window.innerWidth-315,y:90,returnId:todo.id}; return `<div class="planner-properties-backdrop" data-close-properties><section class="planner-properties" role="dialog" aria-modal="false" aria-label="Task properties" tabindex="-1" style="left:${popover.x}px;top:${popover.y}px"><header><div><span class="eyebrow">Task properties</span><h2>${escapeHtml(todo.text)}</h2></div><button class="icon-button" data-close-properties aria-label="Close"><i class="ph ph-x"></i></button></header><label>Category<select data-prop="categoryId">${state.todoCategories.map(c=>`<option value="${attr(c.id)}" ${c.id===todo.categoryId?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</select></label><div class="property-two"><label>Priority<select data-prop="priority">${["low","medium","high","urgent"].map(p=>`<option ${p===todo.priority?"selected":""}>${p}</option>`).join("")}</select></label><label>Effort<select data-prop="effort">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===todo.effort?"selected":""}>${n} / 5</option>`).join("")}</select></label></div><label>Color<input data-prop="color" type="color" value="${attr(todo.color||category.color)}"></label><label>Start<input data-prop="scheduledStart" type="datetime-local" value="${todo.scheduledStart?todo.scheduledStart.slice(0,16):""}"></label><label>Duration<select data-prop="durationMinutes">${[30,60,90,120,150,180,240].map(n=>`<option value="${n}" ${n===todo.durationMinutes?"selected":""}>${n} minutes</option>`).join("")}</select></label><footer><button class="secondary-button" data-unschedule>Unschedule</button><button class="secondary-button ${todo.completed?"":""}" data-toggle-todo="${attr(todo.id)}">${todo.completed?"Reopen":"Complete"}</button><button class="danger-button" data-delete-todo="${attr(todo.id)}">Delete</button></footer></section></div>`; }
+function renderPlannerProperties(todo: Todo) { const category=categoryFor(todo); const popover=plannerPopover ?? {x:window.innerWidth-315,y:90,returnId:todo.id}; return `<div class="planner-properties-backdrop"><section class="planner-properties" role="dialog" aria-modal="false" aria-label="Task properties" tabindex="-1" style="left:${popover.x}px;top:${popover.y}px"><header><div><span class="eyebrow">Task properties</span><h2>${escapeHtml(todo.text)}</h2></div><button class="icon-button" data-close-properties aria-label="Close"><i class="ph ph-x"></i></button></header><label>Category<select data-prop="categoryId">${state.todoCategories.map(c=>`<option value="${attr(c.id)}" ${c.id===todo.categoryId?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</select></label><div class="property-two"><label>Priority<select data-prop="priority">${["low","medium","high","urgent"].map(p=>`<option ${p===todo.priority?"selected":""}>${p}</option>`).join("")}</select></label><label>Effort<select data-prop="effort">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===todo.effort?"selected":""}>${n} / 5</option>`).join("")}</select></label></div><label>Color<input data-prop="color" type="color" value="${attr(todo.color||category.color)}"></label><label>Start<input data-prop="scheduledStart" type="datetime-local" value="${todo.scheduledStart?todo.scheduledStart.slice(0,16):""}"></label><label>Duration<select data-prop="durationMinutes">${[15,30,45,60,90,120,150,180,240].map(n=>`<option value="${n}" ${n===todo.durationMinutes?"selected":""}>${n} minutes</option>`).join("")}</select></label><footer><button class="secondary-button" data-unschedule>Unschedule</button><button class="secondary-button ${todo.completed?"":""}" data-toggle-todo="${attr(todo.id)}">${todo.completed?"Reopen":"Complete"}</button><button class="danger-button" data-delete-todo="${attr(todo.id)}">Delete</button></footer></section></div>`; }
 
 function journalDateLabel(key: string) { const date = new Date(`${key}T12:00:00`); return date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" }); }
 function journalTime(iso: string) { return new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", hour12: true }).replace(/\s([ap]m)$/i, (_match, marker: string) => ` ${marker.toUpperCase()}`); }
@@ -433,6 +503,17 @@ function appendJournalSession(entry: JournalEntry) {
   const heading = `## ${journalTime(now())}`;
   entry.content = `${entry.content.trimEnd()}${entry.content.trim() ? "\n\n" : ""}${heading}\n\n`;
   entry.updated = now();
+}
+function cleanEmptyJournalSessions(content: string): string {
+  const blocks = content.split(/(?=^##\s+)/m);
+  const cleaned = blocks.filter((block) => {
+    const trimmed = block.trim();
+    if (!trimmed.startsWith("## ")) return true;
+    const lines = trimmed.split("\n");
+    const body = lines.slice(1).join("").trim();
+    return body.length > 0;
+  });
+  return cleaned.join("").trim();
 }
 function openJournalToday(allowSession = true) {
   const key = dateKey(new Date()); const existing = entryForDate(key); const gap = existing ? Date.now() - new Date(existing.updated).getTime() : Infinity;
@@ -506,8 +587,9 @@ function renderApp() {
   const app = document.querySelector<HTMLElement>("#app")!;
   const previousPlannerScroll = currentView === "tasks" ? document.querySelector<HTMLElement>("#calendar-scroll") : null;
   const plannerScrollPosition = previousPlannerScroll ? { top: previousPlannerScroll.scrollTop, left: previousPlannerScroll.scrollLeft } : null;
-  app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}`;
-  const content = currentView === "tasks" ? renderTasks() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor();
+  const isInbox = currentView === "notes" && state.selectedFolderId === "inbox";
+  app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}${isInbox ? " view-inbox" : ""}`;
+  const content = currentView === "tasks" ? renderTasks() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : (isInbox ? renderTasksMini() : "") + renderNotesPanel() + renderEditor();
   app.innerHTML = `${renderSidebar()}${content}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
   updateSaveStatus(); bindEvents(); bindOdoDialog();
   if (currentView === "tasks") {
@@ -765,6 +847,9 @@ function clearDragVisuals() {
   clearDropTargetVisuals(); clearSortInsertion();
   dragImage?.remove(); dragImage = null;
   draggingNoteId = "";
+  draggingFolderId = "";
+  folderDropTargetId = "";
+  folderDropInsertion = "inside";
 }
 function createDragPreview(note: Note) {
   const card = document.createElement("div"); card.className = "note-drag-image"; card.setAttribute("aria-hidden", "true");
@@ -776,7 +861,10 @@ function createDragPreview(note: Note) {
 }
 function createDragImage(note: Note, event: DragEvent) {
   const card = createDragPreview(note);
-  if (event.dataTransfer) event.dataTransfer.setDragImage(card, 22, 18);
+  if (event.dataTransfer) {
+    try { event.dataTransfer.setDragImage(card, 22, 18); }
+    catch { /* Some webviews do not support a custom drag image. */ }
+  }
 }
 function openFolderPath(folderId: string) {
   let cursor = state.folders.find((folder) => folder.id === folderId);
@@ -859,7 +947,7 @@ async function reorderDroppedNote(noteId: string, targetId: string, side: "befor
 
 function bindPointerFolderDrag(row: HTMLElement) {
   row.addEventListener("pointerdown", (event) => {
-    if (event.pointerType === "mouse" || event.button !== 0 || (event.target as HTMLElement).closest("button,a[href]")) return;
+    if (event.button !== 0 || (event.target as HTMLElement).closest("button,a[href]")) return;
     const noteId = row.dataset.noteId;
     const note = state.notes.find((item) => item.id === noteId);
     if (!noteId || !note) return;
@@ -867,16 +955,33 @@ function bindPointerFolderDrag(row: HTMLElement) {
     const pointerId = event.pointerId;
     const origin = { x: event.clientX, y: event.clientY };
     let started = false;
-    let activeTarget: HTMLElement | null = null;
+    let activeDrop: HTMLElement | null = null;
+    let activeNote: HTMLElement | null = null;
+    let activeSide: "before" | "after" = "before";
 
-    const targetAt = (x: number, y: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-drop-kind="folder"]') ?? null;
-    const updateTarget = (x: number, y: number) => {
-      const nextTarget = targetAt(x, y);
-      if (nextTarget === activeTarget) return;
-      activeTarget?.classList.remove("is-drop-target");
-      activeTarget = nextTarget;
-      activeTarget?.classList.add("is-drop-target");
-      if (activeTarget) announceDrag(`Move here: ${dropDestinationLabel("folder", activeTarget.dataset.dropId)}.`);
+    const dropAt = (x: number, y: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-drop-kind]") ?? null;
+    const noteAt = (x: number, y: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-note-id]") ?? null;
+
+    const updateDrop = (x: number, y: number) => {
+      const next = dropAt(x, y);
+      if (next === activeDrop) return;
+      activeDrop?.classList.remove("is-drop-target");
+      activeDrop = next;
+      activeDrop?.classList.add("is-drop-target");
+      if (activeDrop) announceDrag(`Move here: ${dropDestinationLabel(activeDrop.dataset.dropKind!, activeDrop.dataset.dropId)}.`);
+    };
+    const updateNote = (x: number, y: number) => {
+      const next = noteAt(x, y);
+      if (next && next !== row) {
+        if (activeNote && activeNote !== next) { activeNote.classList.remove("is-sort-target"); delete activeNote.dataset.sortInsertion; }
+        activeNote = next;
+        const rect = activeNote.getBoundingClientRect();
+        activeSide = y < rect.top + rect.height / 2 ? "before" : "after";
+        activeNote.classList.add("is-sort-target");
+        activeNote.dataset.sortInsertion = activeSide;
+      } else if (!next || next === row) {
+        if (activeNote) { activeNote.classList.remove("is-sort-target"); delete activeNote.dataset.sortInsertion; activeNote = null; }
+      }
     };
     const cleanup = () => {
       window.removeEventListener("pointermove", move);
@@ -888,23 +993,34 @@ function bindPointerFolderDrag(row: HTMLElement) {
       if (!started && Math.hypot(moveEvent.clientX - origin.x, moveEvent.clientY - origin.y) < 8) return;
       if (!started) {
         started = true;
+        row.draggable = false;
         draggingNoteId = noteId;
         row.classList.add("is-dragging");
+        document.documentElement.classList.add("is-note-dragging");
         const preview = createDragPreview(note); preview.classList.add("is-pointer-drag-image");
-        announceDrag(`Moving “${note.title || "Untitled"}”. Choose a folder.`);
+        announceDrag(`Moving “${note.title || "Untitled"}”. Choose a folder, Archive, or Trash.`);
       }
       moveEvent.preventDefault();
+      window.getSelection()?.removeAllRanges();
       if (dragImage) { dragImage.style.left = `${moveEvent.clientX + 16}px`; dragImage.style.top = `${moveEvent.clientY + 16}px`; }
-      updateTarget(moveEvent.clientX, moveEvent.clientY);
+      updateDrop(moveEvent.clientX, moveEvent.clientY);
+      updateNote(moveEvent.clientX, moveEvent.clientY);
     };
     const finish = (upEvent: PointerEvent) => {
       if (upEvent.pointerId !== pointerId) return;
       cleanup();
-      const destination = started ? targetAt(upEvent.clientX, upEvent.clientY) : null;
-      const folderId = destination?.dataset.dropId;
+      const targetDrop = started ? dropAt(upEvent.clientX, upEvent.clientY) : null;
+      const targetNote = started ? noteAt(upEvent.clientX, upEvent.clientY) : null;
       if (started) suppressRowActivationUntil = Date.now() + 260;
       clearDragVisuals();
-      if (folderId) void moveDroppedNote(noteId, "folder", folderId);
+      row.draggable = true;
+      document.documentElement.classList.remove("is-note-dragging");
+      if (targetDrop) {
+        const kind = targetDrop.dataset.dropKind as "folder" | "archive" | "trash" | "pin";
+        if (kind === "pin") void pinItem(noteId, "note");
+        else void moveDroppedNote(noteId, kind, targetDrop.dataset.dropId);
+      }
+      else if (targetNote && targetNote !== row) { const rect = targetNote.getBoundingClientRect(); const side = upEvent.clientY < rect.top + rect.height / 2 ? "before" : "after"; void reorderDroppedNote(noteId, targetNote.dataset.noteId!, side); }
       else if (started) announceDrag("Move cancelled. The note was not changed.");
     };
     const cancel = (cancelEvent: PointerEvent) => {
@@ -912,6 +1028,8 @@ function bindPointerFolderDrag(row: HTMLElement) {
       cleanup();
       if (started) suppressRowActivationUntil = Date.now() + 260;
       clearDragVisuals();
+      row.draggable = true;
+      document.documentElement.classList.remove("is-note-dragging");
       if (started) announceDrag("Move cancelled. The note was not changed.");
     };
 
@@ -923,7 +1041,12 @@ function bindPointerFolderDrag(row: HTMLElement) {
 
 function bindDropTargets() {
   document.querySelectorAll<HTMLElement>("[data-drop-kind]").forEach((target) => {
-    const acceptsDrag = (event: DragEvent) => !!draggingNoteId || !!event.dataTransfer?.types.includes(NOTE_DRAG_TYPE);
+    const acceptsDrag = (event: DragEvent) => {
+      const types = Array.from(event.dataTransfer?.types ?? []);
+      const isPin = target.dataset.dropKind === "pin";
+      if (isPin) return !!draggingNoteId || !!draggingFolderId || types.includes(NOTE_DRAG_TYPE) || types.includes(FOLDER_DRAG_TYPE) || types.includes("text/plain");
+      return !!draggingNoteId || types.includes(NOTE_DRAG_TYPE) || types.includes("text/plain");
+    };
     target.addEventListener("dragenter", (event) => {
       if (!acceptsDrag(event)) return;
       event.preventDefault();
@@ -944,11 +1067,14 @@ function bindDropTargets() {
     target.addEventListener("drop", (event) => {
       if (!acceptsDrag(event)) return;
       event.preventDefault();
-      const noteId = draggingNoteId || event.dataTransfer?.getData(NOTE_DRAG_TYPE);
-      const kind = target.dataset.dropKind as "folder" | "archive" | "trash";
-      const folderId = target.dataset.dropId;
+      const noteId = draggingNoteId || event.dataTransfer?.getData(NOTE_DRAG_TYPE) || event.dataTransfer?.getData("text/plain");
+      const folderId = draggingFolderId || event.dataTransfer?.getData(FOLDER_DRAG_TYPE);
+      const kind = target.dataset.dropKind as "folder" | "archive" | "trash" | "pin";
       clearDragVisuals();
-      if (noteId && kind) void moveDroppedNote(noteId, kind, folderId);
+      if (kind === "pin") {
+        if (noteId) pinItem(noteId, "note");
+        else if (folderId) pinItem(folderId, "folder");
+      } else if (noteId && kind) void moveDroppedNote(noteId, kind, target.dataset.dropId);
     });
   });
 }
@@ -995,9 +1121,112 @@ function bindNoteRows() {
   });
   document.querySelectorAll<HTMLElement>("[data-note-menu]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); const note = state.notes.find((item) => item.id === button.dataset.noteMenu); if (note) openMenu(noteMenuItems(note), button); }));
 }
+function folderDropLabel(id: string) {
+  return state.folders.find((folder) => folder.id === id)?.name ?? "Inbox";
+}
+async function moveDroppedFolder(sourceId: string, targetId: string, insertion: "before" | "after" | "inside") {
+  const source = state.folders.find((folder) => folder.id === sourceId);
+  if (!source) { announceDrag("That folder is no longer available."); return; }
+  if (sourceId === targetId) { announceDrag("A folder cannot be moved into itself."); return; }
+  if (insertion === "inside") {
+    const target = state.folders.find((folder) => folder.id === targetId);
+    if (!target) { announceDrag("That folder is no longer available."); return; }
+    if (descendants(sourceId).includes(targetId)) { announceDrag("A folder cannot be moved into one of its own subfolders."); return; }
+    source.parentId = targetId;
+    target.open = true;
+    announceDrag(`Moved “${source.name}” into “${target.name}”.`);
+  } else {
+    const sibling = state.folders.find((folder) => folder.id === targetId);
+    if (!sibling) { announceDrag("That folder is no longer available."); return; }
+    if (descendants(sourceId).includes(sibling.id)) { announceDrag("A folder cannot be moved into one of its own subfolders."); return; }
+    source.parentId = sibling.parentId;
+    const sourceIndex = state.folders.indexOf(source);
+    if (sourceIndex >= 0) state.folders.splice(sourceIndex, 1);
+    let insertIndex = state.folders.indexOf(sibling);
+    if (insertion === "after") insertIndex += 1;
+    state.folders.splice(Math.max(0, insertIndex), 0, source);
+    announceDrag(`Reordered “${source.name}” ${insertion} “${sibling.name}”.`);
+  }
+  await saveState(false);
+  renderApp();
+}
+function clearFolderDropVisuals() {
+  if (folderDropTargetId) {
+    const row = document.querySelector<HTMLElement>(`[data-folder-id="${CSS.escape(folderDropTargetId)}"]`);
+    row?.classList.remove("is-drop-target", "is-sort-target");
+    delete row?.dataset.sortInsertion;
+  }
+  folderDropTargetId = "";
+  folderDropInsertion = "inside";
+}
+function updateFolderDropVisuals(row: HTMLElement, insertion: "before" | "after" | "inside") {
+  if (folderDropTargetId === row.dataset.folderId && folderDropInsertion === insertion) return;
+  clearFolderDropVisuals();
+  folderDropTargetId = row.dataset.folderId!;
+  folderDropInsertion = insertion;
+  if (insertion === "inside") {
+    row.classList.add("is-drop-target");
+    announceDrag(`Move into ${folderDropLabel(folderDropTargetId)}.`);
+  } else {
+    row.classList.add("is-sort-target");
+    row.dataset.sortInsertion = insertion;
+    announceDrag(`Place ${insertion} ${folderDropLabel(folderDropTargetId)}.`);
+  }
+}
+function createFolderDragPreview(folder: Folder) {
+  const card = document.createElement("div"); card.className = "note-drag-image is-folder-drag-image"; card.setAttribute("aria-hidden", "true");
+  const icon = document.createElement("i"); icon.className = `ph ${safeFolderIcon(folder.icon, folder.id === "inbox")} folder-icon`;
+  const title = document.createElement("strong"); title.textContent = folder.name;
+  card.append(icon, title); document.body.append(card); dragImage = card;
+  requestAnimationFrame(() => card.classList.add("is-pointer-drag-image"));
+  return card;
+}
+function bindFolderRows() {
+  document.querySelectorAll<HTMLElement>("[data-folder-id]").forEach((row) => {
+    const id = row.dataset.folderId!;
+    if (id === "inbox") return;
+    row.addEventListener("dragstart", (event) => {
+      if ((event.target as HTMLElement).closest("button,a[href],[data-toggle-folder]")) { event.preventDefault(); return; }
+      draggingFolderId = id;
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData(FOLDER_DRAG_TYPE, id);
+        try { event.dataTransfer.setData("text/plain", id); } catch {}
+      }
+      row.classList.add("is-dragging");
+      const folder = state.folders.find((item) => item.id === id);
+      if (folder) {
+        const preview = createFolderDragPreview(folder);
+        if (event.dataTransfer) { try { event.dataTransfer.setDragImage(preview, 22, 18); } catch {} }
+      }
+      announceDrag(`Moving folder “${state.folders.find((item) => item.id === id)?.name || "Folder"}”.`);
+    });
+    row.addEventListener("dragover", (event) => {
+      if (!draggingFolderId) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      const rect = row.getBoundingClientRect();
+      const third = rect.height / 3;
+      const insertion: "before" | "after" | "inside" = event.clientY < rect.top + third ? "before" : event.clientY > rect.top + rect.height - third ? "after" : "inside";
+      updateFolderDropVisuals(row, insertion);
+    });
+    row.addEventListener("dragleave", (event) => { if (!row.contains(event.relatedTarget as Node | null)) clearFolderDropVisuals(); });
+    row.addEventListener("drop", (event) => {
+      if (!draggingFolderId) return;
+      event.preventDefault();
+      const sourceId = draggingFolderId;
+      const targetId = row.dataset.folderId!;
+      const insertion = folderDropInsertion;
+      clearDragVisuals();
+      void moveDroppedFolder(sourceId, targetId, insertion);
+    });
+    row.addEventListener("dragend", () => { suppressRowActivationUntil = Date.now() + 260; clearDragVisuals(); announceDrag(""); });
+  });
+}
 function bindEvents() {
   bindNoteRows();
   bindDropTargets();
+  bindFolderRows();
   document.querySelectorAll<HTMLElement>("[data-folder-id]").forEach((row) => {
     const activate = () => { currentView = "notes"; state.selectedFolderId = row.dataset.folderId!; repairState(); void saveState(false); renderApp(); };
     row.addEventListener("click", (event) => { if (!(event.target as HTMLElement).closest("[data-toggle-folder],[data-folder-menu]")) activate(); });
@@ -1040,7 +1269,15 @@ function bindEvents() {
   const toggleFocus = () => { focusMode = !focusMode; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-rich-editor]")?.focus()); };
   document.querySelector("#focus-mode")?.addEventListener("click", toggleFocus); document.querySelector("#expand-editor")?.addEventListener("click", toggleFocus);
   document.querySelector("#toolbar-more")?.addEventListener("click", () => { slashOpen = !slashOpen; slashIndex = 0; updateSlashMenu(); });
+  document.querySelector("#pin-add")?.addEventListener("click", () => { pinPickerOpen = !pinPickerOpen; pinPickerQuery = ""; renderApp(); });
+  document.querySelector<HTMLInputElement>("#pin-search")?.addEventListener("input", (event) => { pinPickerQuery = (event.target as HTMLInputElement).value; renderApp(); });
+  document.querySelectorAll<HTMLElement>("[data-pin-suggestion]").forEach((button) => button.addEventListener("click", () => { const id = button.dataset.pinSuggestion!; const type = button.dataset.pinType as PinType; pinItem(id, type); pinPickerOpen = false; }));
+  document.querySelectorAll<HTMLElement>("[data-pin-id]").forEach((button) => {
+    button.addEventListener("click", () => { const pin = { id: button.dataset.pinId!, type: button.dataset.pinType as PinType }; openPin(pin); });
+    button.addEventListener("contextmenu", (event) => { event.preventDefault(); unpinItem(button.dataset.pinId!, button.dataset.pinType as PinType); });
+  });
   bindTaskEvents(); bindJournalEvents(); bindSettingsEvents();
+  document.querySelectorAll<HTMLElement>(".tasks-mini .planner-task-card").forEach((row) => { row.addEventListener("click", (event) => { if ((event.target as HTMLElement).closest("button")) return; setView("tasks"); }); });
   document.querySelector("#close-help")?.addEventListener("click", () => { helpOpen = false; renderApp(); });
   document.querySelector("#help-overlay")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) { helpOpen = false; renderApp(); } });
 }
@@ -1054,7 +1291,7 @@ function bindJournalEvents() {
   document.querySelectorAll<HTMLElement>("[data-journal-card]").forEach((card) => { const open = () => selectDay(card.dataset.journalCard!, false); card.addEventListener("click", (event) => { if ((event.target as HTMLElement).closest("[data-journal-editor],input,button")) return; if (card.dataset.journalCard !== selectedJournalDate) open(); }); card.addEventListener("keydown", (event) => { if (event.target !== card || (event.key !== "Enter" && event.key !== " ")) return; event.preventDefault(); open(); }); });
   document.querySelectorAll<HTMLElement>("[data-open-journal]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); selectDay(button.dataset.openJournal!, true); }));
   const editor = document.querySelector<HTMLElement>("[data-journal-editor]");
-  if (editor) bindRichEditor(editor, (rich) => { const entry = entryForDate(selectedJournalDate); if (!entry) return; entry.content = richToMarkdown(rich); entry.updated = now(); clearTimeout(journalSaveTimer); journalSaveTimer = window.setTimeout(() => void saveState(false), 350); const status = document.querySelector<HTMLElement>(".journal-status"); if (status) status.textContent = `Saved ${journalTime(entry.updated)}`; });
+  if (editor) bindRichEditor(editor, (rich) => { const entry = entryForDate(selectedJournalDate); if (!entry) return; entry.content = cleanEmptyJournalSessions(richToMarkdown(rich)); entry.updated = now(); clearTimeout(journalSaveTimer); journalSaveTimer = window.setTimeout(() => void saveState(false), 350); const status = document.querySelector<HTMLElement>(".journal-status"); if (status) status.textContent = `Saved ${journalTime(entry.updated)}`; });
 }
 function bindTaskEvents() {
   document.querySelector("#quick-task-form")?.addEventListener("submit", (event) => { event.preventDefault(); const input = document.querySelector<HTMLInputElement>("#quick-task-input")!; const text = input.value.trim(); if (!text) return; addPlannerTodo(text); });
@@ -1066,12 +1303,36 @@ function bindTaskEvents() {
   document.querySelectorAll<HTMLElement>("[data-toggle-todo]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); toggleTodo(button.dataset.toggleTodo!); }));
   document.querySelectorAll<HTMLElement>(".planner-task-card[data-todo-id]").forEach((row) => { row.removeAttribute("draggable"); row.addEventListener("click", (event)=> { if(plannerPointerDragging || (event.target as HTMLElement).closest("button")) return; openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("contextmenu", (event) => { event.preventDefault(); openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("keydown", handleTaskKeydown); row.addEventListener("pointerdown", (event)=> { if(!(event.target as HTMLElement).closest("button")) startPlannerPointerDrag(event, row); }); });
   document.querySelectorAll<HTMLElement>("[data-todo-menu]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); openPlannerProperties(button.dataset.todoMenu!, button); }));
-  document.querySelectorAll<HTMLElement>("[data-calendar-task]").forEach(block=> { block.addEventListener("pointerdown",event=>{ if(!(event.target as HTMLElement).closest("button,[data-resize-todo]")) startPlannerPointerDrag(event,block); }); block.addEventListener("click",event=>{if(!plannerPointerDragging && !(event.target as HTMLElement).closest("button,[data-resize-todo]"))openPlannerProperties(block.dataset.todoId!,block);}); block.addEventListener("contextmenu",event=>{event.preventDefault();openPlannerProperties(block.dataset.todoId!,block);}); block.addEventListener("keydown",handleTaskKeydown); });
+  document.querySelectorAll<HTMLElement>("[data-calendar-task]").forEach((block) => {
+    block.addEventListener("pointerdown", (event) => {
+      if ((event.target as HTMLElement).closest("button")) return;
+      const rect = block.getBoundingClientRect();
+      const offsetY = event.clientY - rect.top;
+      const edgeHeight = 6;
+      if (offsetY < edgeHeight) startResize(event, block, "top");
+      else if (offsetY > rect.height - edgeHeight) startResize(event, block, "bottom");
+      else if (!(event.target as HTMLElement).closest("[data-resize-todo]")) startPlannerPointerDrag(event, block);
+    });
+    block.addEventListener("click", (event) => { if (!plannerPointerDragging && !(event.target as HTMLElement).closest("button,[data-resize-todo]")) openPlannerProperties(block.dataset.todoId!, block); });
+    block.addEventListener("contextmenu", (event) => { event.preventDefault(); openPlannerProperties(block.dataset.todoId!, block); });
+    block.addEventListener("keydown", handleTaskKeydown);
+  });
   document.querySelectorAll<HTMLElement>("[data-resize-todo]").forEach(handle=>handle.addEventListener("pointerdown", startResize));
-  document.querySelectorAll<HTMLElement>("[data-close-properties]").forEach(node=>node.addEventListener("click",(event)=>{if(event.target===node || (event.target as HTMLElement).closest("[data-close-properties]")) closePlannerProperties();}));
+  document.querySelector<HTMLElement>(".planner-properties-backdrop")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closePlannerProperties(); });
+  document.querySelectorAll<HTMLElement>("[data-close-properties]").forEach((button) => button.addEventListener("click", () => closePlannerProperties()));
   document.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-prop]").forEach(input=>input.addEventListener("change",()=>{const todo=state.todos.find(t=>t.id===taskMenuTodoId); if(!todo) return; const field=input.dataset.prop as keyof Todo; let value:string|number|null=input.value; if(field==="effort"||field==="durationMinutes") value=Number(value); if(field==="scheduledStart") value=input.value ? new Date(input.value).toISOString() : null; (todo as unknown as Record<string,string|number|null>)[field]=value; todo.updated=now(); void saveState(false); renderApp();}));
   document.querySelector("[data-unschedule]")?.addEventListener("click",()=>{const todo=state.todos.find(t=>t.id===taskMenuTodoId);if(todo){todo.scheduledStart=null;todo.updated=now();taskMenuTodoId="";void saveState(false);renderApp();}});
   document.querySelectorAll<HTMLElement>("[data-delete-todo]").forEach(button=>button.addEventListener("click",()=>void deletePlannerTodo(button.dataset.deleteTodo!)));
+  document.querySelector<HTMLElement>("#calendar-scroll")?.addEventListener("wheel", (event) => {
+    if (!event.shiftKey) return;
+    event.preventDefault();
+    const direction = Math.sign(event.deltaY || event.deltaX);
+    if (!direction) return;
+    plannerDate.setDate(plannerDate.getDate() + direction);
+    plannerDate.setHours(0, 0, 0, 0);
+    renderApp();
+  }, { passive: false });
+  document.querySelectorAll<HTMLElement>("[data-task-tab]").forEach((tab) => tab.addEventListener("click", () => { plannerInboxTab = tab.dataset.taskTab as "inbox" | "scheduled"; renderApp(); }));
   if (taskMenuTodoId) requestAnimationFrame(() => document.querySelector<HTMLElement>(".planner-properties")?.focus());
   document.querySelectorAll<HTMLInputElement>("[data-edit-todo]").forEach((input) => { input.addEventListener("keydown", (event) => { if (event.key === "Enter") commitTodoEdit(input); if (event.key === "Escape") { editingTodoId = ""; renderApp(); } }); input.addEventListener("blur", () => { if (editingTodoId) commitTodoEdit(input); }); });
   document.querySelector("#toggle-completed")?.addEventListener("click", () => { completedCollapsed = !completedCollapsed; renderApp(); });
@@ -1080,8 +1341,30 @@ function bindTaskEvents() {
 function addPlannerTodo(text:string) { const timestamp=now(); state.todos.unshift({id:uid("todo"),text,completed:false,created:timestamp,updated:timestamp,categoryId:"inbox",priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:30}); void saveState(false); renderApp(); requestAnimationFrame(()=>document.querySelector<HTMLInputElement>("#quick-task-input")?.focus()); }
 function openPlannerProperties(id:string, trigger:HTMLElement) { const rect=trigger.getBoundingClientRect(); const width=285; const height=420; const x=Math.max(8,Math.min(rect.right+10,window.innerWidth-width-8)); const y=Math.max(8,Math.min(rect.top,window.innerHeight-height-8)); taskMenuTodoId=id; plannerPopover={x,y,returnId:id}; renderApp(); }
 function closePlannerProperties() { const returnId=plannerPopover?.returnId; taskMenuTodoId=""; plannerPopover=null; renderApp(); if(returnId) requestAnimationFrame(()=>document.querySelector<HTMLElement>(`[data-todo-id="${CSS.escape(returnId)}"]`)?.focus()); }
-function plannerDropAt(todoId:string, clientX:number, clientY:number) { const hit=document.elementFromPoint(clientX,clientY); const slot=hit?.closest<HTMLElement>("[data-slot-minute]"); const target=slot?.closest<HTMLElement>(".calendar-column") ?? hit?.closest<HTMLElement>(".calendar-column"); const todo=state.todos.find(item=>item.id===todoId); const exact=plannerPointerDrop; if((!target && !exact)||!todo) return false; // The captured slot is invariant even if a WebView retargets pointerup.
-  const rect=target?.getBoundingClientRect(); const minute=exact?.minute ?? (slot ? Number(slot.dataset.slotMinute) : Math.max(0,Math.min(23*60+30,Math.round((clientY-(rect?.top ?? 0))/slotHeight)*30))); const date=exact?.date ?? target!.dataset.calendarDate!; todo.scheduledStart=localStart(new Date(`${date}T00:00:00`),minute); todo.durationMinutes=Math.max(30,todo.durationMinutes||30); todo.updated=now(); announcePlanner(`${todo.text} scheduled for ${new Date(todo.scheduledStart).toLocaleString()}.`); void saveState(false); renderApp(); return true; }
+function plannerDropAt(todoId: string, clientX: number, clientY: number, fromCalendar = false) {
+  const hit = document.elementFromPoint(clientX, clientY);
+  const todo = state.todos.find((item) => item.id === todoId);
+  if (!todo) return false;
+  const inbox = hit?.closest<HTMLElement>(".planner-inbox") ?? hit?.closest<HTMLElement>(".planner-categories") ?? hit?.closest<HTMLElement>(".planner-task-card");
+  if (fromCalendar && inbox) {
+    todo.scheduledStart = null;
+    todo.updated = now();
+    announcePlanner(`${todo.text} unscheduled.`);
+    void saveState(false); renderApp(); return true;
+  }
+  const slot = hit?.closest<HTMLElement>("[data-slot-minute]");
+  const target = slot?.closest<HTMLElement>(".calendar-column") ?? hit?.closest<HTMLElement>(".calendar-column");
+  const exact = plannerPointerDrop;
+  if (!target && !exact) return false;
+  const date = exact?.date ?? target!.dataset.calendarDate!;
+  const rect = target?.getBoundingClientRect();
+  const minute = exact?.minute ?? Math.max(0, Math.min(23 * 60 + 30, Math.round((clientY - (rect?.top ?? 0)) / slotHeight * 2) * 15));
+  todo.scheduledStart = localStart(new Date(`${date}T00:00:00`), minute);
+  todo.durationMinutes = Math.max(30, todo.durationMinutes || 30);
+  todo.updated = now();
+  announcePlanner(`${todo.text} scheduled for ${new Date(todo.scheduledStart).toLocaleString()}.`);
+  void saveState(false); renderApp(); return true;
+}
 function startPlannerPointerDrag(event:PointerEvent, source:HTMLElement) {
   if(event.button!==0) return; const todoId=source.dataset.todoId; if(!todoId) return;
   event.preventDefault();
@@ -1100,18 +1383,53 @@ function startPlannerPointerDrag(event:PointerEvent, source:HTMLElement) {
     window.getSelection()?.removeAllRanges();
     if(preview) preview.style.transform=`translate3d(${moveEvent.clientX-grabX}px,${moveEvent.clientY-grabY}px,0)`;
     const hit=document.elementFromPoint(moveEvent.clientX,moveEvent.clientY); const slot=hit?.closest<HTMLElement>("[data-slot-minute]"); const column=slot?.closest<HTMLElement>(".calendar-column") ?? hit?.closest<HTMLElement>(".calendar-column");
-    plannerPointerDrop=slot&&column ? { date:column.dataset.calendarDate!, minute:Number(slot.dataset.slotMinute) } : null;
+    let minute=0;
+    if (column) { const rect=column.getBoundingClientRect(); minute=Math.max(0,Math.min(23*60+30,Math.round((moveEvent.clientY-rect.top)/slotHeight*2)*15)); }
+    plannerPointerDrop=column ? { date:column.dataset.calendarDate!, minute } : null;
   };
   const finish=(finishEvent:PointerEvent,cancelled=false)=>{
     window.removeEventListener("pointermove",move); window.removeEventListener("pointerup",up); window.removeEventListener("pointercancel",cancel); clear();
-    if(started&&!cancelled) plannerDropAt(todoId,finishEvent.clientX,finishEvent.clientY);
+    if(started&&!cancelled) plannerDropAt(todoId,finishEvent.clientX,finishEvent.clientY, !!source.dataset.calendarTask);
     if(started) window.setTimeout(()=>{plannerPointerDragging=false;plannerPointerDrop=null;},0); else plannerPointerDrop=null;
   };
   const up=(upEvent:PointerEvent)=>finish(upEvent); const cancel=(cancelEvent:PointerEvent)=>finish(cancelEvent,true);
   window.addEventListener("pointermove",move,{passive:false}); window.addEventListener("pointerup",up,{once:true}); window.addEventListener("pointercancel",cancel,{once:true});
 }
 function announcePlanner(message:string) { const live=document.querySelector<HTMLElement>(".planner-live"); if(live) live.textContent=message; }
-function startResize(event:PointerEvent) { event.preventDefault(); event.stopPropagation(); const id=(event.currentTarget as HTMLElement).dataset.resizeTodo!; const todo=state.todos.find(t=>t.id===id); const block=(event.currentTarget as HTMLElement).closest<HTMLElement>("[data-calendar-task]"); if(!todo||!block) return; const startY=event.clientY; const origin=todo.durationMinutes; const move=(moveEvent:PointerEvent)=>{const next=Math.max(30,Math.min(24*60-(taskTime(todo)!.getHours()*60+taskTime(todo)!.getMinutes()),Math.round((origin+(moveEvent.clientY-startY)/slotHeight*30)/30)*30)); todo.durationMinutes=next; block.style.height=`${next/30*slotHeight}px`;}; const up=()=>{window.removeEventListener("pointermove",move);window.removeEventListener("pointerup",up);todo.updated=now();void saveState(false);renderApp();};window.addEventListener("pointermove",move);window.addEventListener("pointerup",up); }
+function startResize(event: PointerEvent, source?: HTMLElement, edge?: "top" | "bottom") {
+  event.preventDefault(); event.stopPropagation();
+  const current = source ?? (event.currentTarget as HTMLElement);
+  const id = current.dataset.resizeTodo ?? current.dataset.todoId!;
+  const todo = state.todos.find((t) => t.id === id);
+  const block = current.closest<HTMLElement>("[data-calendar-task]");
+  if (!todo || !block) return;
+  const startY = event.clientY;
+  const origin = todo.durationMinutes;
+  const start = taskTime(todo);
+  const startMin = start ? start.getHours() * 60 + start.getMinutes() : 0;
+  const endMin = startMin + origin;
+  const anchor = edge ?? "bottom";
+  plannerPointerDragging = true;
+  const move = (moveEvent: PointerEvent) => {
+    const deltaRaw = Math.round(((moveEvent.clientY - startY) / slotHeight * 30) / 15) * 15;
+    if (anchor === "top" && start) {
+      const newStart = Math.max(0, Math.min(endMin - 30, startMin + deltaRaw));
+      const newDuration = endMin - newStart;
+      const base = new Date(start); base.setHours(0, 0, 0, 0);
+      todo.scheduledStart = localStart(base, newStart);
+      todo.durationMinutes = newDuration;
+      block.style.top = `${newStart / 30 * slotHeight}px`;
+      block.style.height = `${newDuration / 30 * slotHeight}px`;
+    } else {
+      const maxMinutes = 24 * 60 - startMin;
+      const next = Math.max(30, Math.min(maxMinutes, origin + deltaRaw));
+      todo.durationMinutes = next;
+      block.style.height = `${next / 30 * slotHeight}px`;
+    }
+  };
+  const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); todo.updated = now(); window.setTimeout(() => plannerPointerDragging = false, 0); void saveState(false); renderApp(); };
+  window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
+}
 async function deletePlannerTodo(id:string) { const todo=state.todos.find(t=>t.id===id); if(!todo || !await confirmOdo("Delete task?",`“${todo.text}” will be removed from your planner.`,"Delete task",true)) return; state.todos=state.todos.filter(t=>t.id!==id);taskMenuTodoId="";void saveState(false);renderApp(); }
 function scrollPlannerToNow(){ const scroll=document.querySelector<HTMLElement>("#calendar-scroll"); if(scroll && dateKey(plannerDate)===dateKey(new Date())) scroll.scrollTop=Math.max(0,(new Date().getHours()*2-3)*slotHeight); }
 function handleTaskKeydown(event: KeyboardEvent) {
