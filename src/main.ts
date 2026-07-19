@@ -33,7 +33,6 @@ const STORAGE_KEY = "odo-notes-workspace-v2";
 const MOTION_KEY = "odo-motion-enabled";
 const NOTE_DRAG_TYPE = "application/x-odo-note";
 const FOLDER_DRAG_TYPE = "application/x-odo-folder";
-const PROJECT_DRAG_TYPE = "application/x-odo-project";
 const isDesktopApp = "__TAURI_INTERNALS__" in window;
 const detachedNoteId = new URLSearchParams(location.search).get("note");
 const isMac = navigator.platform.toLowerCase().includes("mac");
@@ -117,7 +116,6 @@ let reloadingWorkspace = false;
 let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
 let draggingNoteId = "";
 let draggingFolderId = "";
-let draggingProjectId = "";
 let projectDragPreview: HTMLElement | null = null;
 let suppressProjectActivationUntil = 0;
 let suppressRowActivationUntil = 0;
@@ -515,7 +513,7 @@ function formatProjectDate(value: string | null) {
 }
 function renderProjectCard(project: Project) {
   const tasks = projectTasks(project.id); const open = tasks.filter((todo) => !todo.completed).length;
-  return `<button class="project-card" draggable="true" data-project-id="${attr(project.id)}" aria-label="Open ${attr(project.name)}. Drag to another stage to update its status."><span class="project-card-top"><span class="project-mark ${projectStatusMeta[project.status].tone}"><i class="ph ph-cube"></i></span><span class="project-card-actions"><i class="ph ${projectStatusMeta[project.status].icon}"></i><i class="ph ph-dots-three"></i></span></span><strong>${escapeHtml(project.name)}</strong><span class="project-summary">${escapeHtml(project.summary || "Add a short summary to make this project easier to scan.")}</span><span class="project-card-meta"><span>${open} open ${open === 1 ? "task" : "tasks"}</span><span>${formatProjectDate(project.targetDate)}</span></span></button>`;
+  return `<button class="project-card" data-project-id="${attr(project.id)}" aria-label="Open ${attr(project.name)}. Drag to another stage to update its status."><span class="project-card-top"><span class="project-mark ${projectStatusMeta[project.status].tone}"><i class="ph ph-cube"></i></span><span class="project-card-actions"><i class="ph ${projectStatusMeta[project.status].icon}"></i><i class="ph ph-dots-three"></i></span></span><strong>${escapeHtml(project.name)}</strong><span class="project-summary">${escapeHtml(project.summary || "Add a short summary to make this project easier to scan.")}</span><span class="project-card-meta"><span>${open} open ${open === 1 ? "task" : "tasks"}</span><span>${formatProjectDate(project.targetDate)}</span></span></button>`;
 }
 function renderProjectsBoard() {
   return `<main class="projects-view" aria-label="Projects"><header class="projects-toolbar"><div><span class="eyebrow">Workspace</span><h1>Projects</h1><p>See what is waiting, planned, and moving forward.</p></div><button class="primary-button" id="new-project"><i class="ph ph-plus"></i>New project</button></header><div class="project-filter-row"><button class="project-filter is-active">All projects <span>${state.projects.length}</span></button><span>${state.projects.filter((project) => project.status === "in_progress").length} in progress</span></div><div class="project-board">${projectStatuses.map((status) => { const meta = projectStatusMeta[status]; const projects = state.projects.filter((project) => project.status === status); return `<section class="project-column ${meta.tone}" data-project-status="${status}" aria-label="${meta.label} stage"><header><span><i class="ph ${meta.icon}"></i><strong>${meta.label}</strong><small>${projects.length}</small></span><button data-new-project-status="${status}" aria-label="Add a project to ${meta.label}"><i class="ph ph-plus"></i></button></header><div class="project-column-list">${projects.map(renderProjectCard).join("") || `<div class="project-column-empty"><i class="ph ${meta.icon}"></i><span>No projects here</span></div>`}</div></section>`; }).join("")}</div></main>`;
@@ -1375,7 +1373,6 @@ function clearProjectDragVisuals() {
   document.documentElement.classList.remove("is-project-dragging");
   projectDragPreview?.remove();
   projectDragPreview = null;
-  draggingProjectId = "";
 }
 async function moveProjectToStatus(projectId: string, status: ProjectStatus) {
   const project = state.projects.find((item) => item.id === projectId);
@@ -1400,7 +1397,7 @@ function highlightProjectStatus(status: ProjectStatus | null) {
 }
 function bindProjectPointerDrag(card: HTMLElement) {
   card.addEventListener("pointerdown", (event) => {
-    if (event.pointerType === "mouse" || event.button !== 0) return;
+    if (event.button !== 0) return;
     const projectId = card.dataset.projectId;
     const project = state.projects.find((item) => item.id === projectId);
     if (!projectId || !project) return;
@@ -1419,8 +1416,6 @@ function bindProjectPointerDrag(card: HTMLElement) {
       if (!started && Math.hypot(moveEvent.clientX - origin.x, moveEvent.clientY - origin.y) < 8) return;
       if (!started) {
         started = true;
-        draggingProjectId = projectId;
-        card.draggable = false;
         card.classList.add("is-dragging");
         document.documentElement.classList.add("is-project-dragging");
         projectDragPreview = card.cloneNode(true) as HTMLElement;
@@ -1445,7 +1440,6 @@ function bindProjectPointerDrag(card: HTMLElement) {
       const status = started ? projectStatusAt(upEvent.clientX, upEvent.clientY) : null;
       if (started) suppressProjectActivationUntil = Date.now() + 260;
       clearProjectDragVisuals();
-      card.draggable = true;
       if (status) void moveProjectToStatus(projectId, status);
       else if (started) announceDrag("Move cancelled. The project was not changed.");
     };
@@ -1454,7 +1448,6 @@ function bindProjectPointerDrag(card: HTMLElement) {
       cleanup();
       if (started) suppressProjectActivationUntil = Date.now() + 260;
       clearProjectDragVisuals();
-      card.draggable = true;
       if (started) announceDrag("Move cancelled. The project was not changed.");
     };
     window.addEventListener("pointermove", move, { passive: false });
@@ -1468,40 +1461,6 @@ function bindProjectsEvents() {
   document.querySelectorAll<HTMLElement>(".project-card[data-project-id]").forEach((card) => {
     bindProjectPointerDrag(card);
     card.addEventListener("click", () => { if (Date.now() < suppressProjectActivationUntil) return; selectedProjectId = card.dataset.projectId!; projectTab = "overview"; renderApp(); });
-    card.addEventListener("dragstart", (event) => {
-      const projectId = card.dataset.projectId!;
-      const project = state.projects.find((item) => item.id === projectId);
-      draggingProjectId = projectId;
-      if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(PROJECT_DRAG_TYPE, projectId); }
-      card.classList.add("is-dragging");
-      document.documentElement.classList.add("is-project-dragging");
-      announceDrag(`Moving “${project?.name || "Untitled project"}”. Choose another stage.`);
-    });
-    card.addEventListener("dragend", () => { suppressProjectActivationUntil = Date.now() + 260; clearProjectDragVisuals(); announceDrag(""); });
-  });
-  document.querySelectorAll<HTMLElement>("[data-project-status]").forEach((column) => {
-    const acceptsProject = (event: DragEvent) => draggingProjectId || Array.from(event.dataTransfer?.types ?? []).includes(PROJECT_DRAG_TYPE);
-    column.addEventListener("dragenter", (event) => {
-      if (!acceptsProject(event)) return;
-      event.preventDefault();
-      highlightProjectStatus(column.dataset.projectStatus as ProjectStatus);
-    });
-    column.addEventListener("dragover", (event) => {
-      if (!acceptsProject(event)) return;
-      event.preventDefault();
-      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-      column.classList.add("is-drop-target");
-    });
-    column.addEventListener("dragleave", (event) => { if (!column.contains(event.relatedTarget as Node | null)) column.classList.remove("is-drop-target"); });
-    column.addEventListener("drop", (event) => {
-      if (!acceptsProject(event)) return;
-      event.preventDefault();
-      const projectId = draggingProjectId || event.dataTransfer?.getData(PROJECT_DRAG_TYPE);
-      const status = column.dataset.projectStatus as ProjectStatus;
-      suppressProjectActivationUntil = Date.now() + 260;
-      clearProjectDragVisuals();
-      if (projectId) void moveProjectToStatus(projectId, status);
-    });
   });
   document.querySelector("#back-to-projects")?.addEventListener("click", () => { selectedProjectId = ""; projectTab = "overview"; renderApp(); });
   document.querySelectorAll<HTMLElement>("[data-project-tab]").forEach((tab) => tab.addEventListener("click", () => { projectTab = tab.dataset.projectTab as "overview" | "tasks"; renderApp(); }));

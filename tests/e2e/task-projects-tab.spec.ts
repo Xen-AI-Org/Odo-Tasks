@@ -39,12 +39,19 @@ test("opens the Projects board between Tasks and Journal", async ({ page }) => {
   await expect(page.getByRole("textbox", { name: "Project name" })).toContainText("Summer launch");
 });
 
-test("drags a project to another stage and persists the status", async ({ page }) => {
+test("drags a project to another stage with mouse input and persists the status", async ({ page }) => {
   await openProjects(page);
 
   const project = page.locator('[data-project-id="summer-launch"]');
   const completed = page.locator('[data-project-status="completed"]');
-  await project.dragTo(completed.locator(".project-column-list"));
+  const sourceBox = await project.boundingBox();
+  const targetBox = await completed.locator(".project-column-list").boundingBox();
+  if (!sourceBox || !targetBox) throw new Error("Expected project and destination stage to be visible");
+  await page.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + Math.min(targetBox.height / 2, 90), { steps: 12 });
+  await expect(completed).toHaveClass(/is-drop-target/);
+  await page.mouse.up();
 
   await expect(page.locator('main.projects-view[aria-label="Projects"]')).toBeVisible();
   await expect(completed.locator('[data-project-id="summer-launch"]')).toBeVisible();
