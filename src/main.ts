@@ -5,18 +5,20 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "./styles.css";
 
 type NoteStatus = "active" | "archived" | "trash";
-type View = "notes" | "tasks" | "journal" | "settings" | "archived" | "trash";
+type View = "notes" | "tasks" | "projects" | "journal" | "settings" | "archived" | "trash";
 type SortMode = "newest" | "oldest" | "manual";
 type Folder = { id: string; name: string; parentId: string | null; open: boolean; icon?: string };
 type Note = { id: string; folderId: string; title: string; content: string; updated: string; status: NoteStatus; pinned?: boolean; revision: number };
 type Priority = "low" | "medium" | "high" | "urgent";
-type Todo = { id: string; text: string; completed: boolean; created: string; updated: string; categoryId: string; priority: Priority; effort: number; color: string; scheduledStart: string | null; durationMinutes: number; status: string; content: string };
+type Todo = { id: string; text: string; completed: boolean; created: string; updated: string; categoryId: string; priority: Priority; effort: number; color: string; scheduledStart: string | null; durationMinutes: number; status: string; content: string; projectId?: string | null };
 type TodoCategory = { id: string; name: string; color: string; icon?: string };
+type ProjectStatus = "backlog" | "planned" | "in_progress" | "completed";
+type Project = { id: string; name: string; summary: string; description: string; status: ProjectStatus; targetDate: string | null; created: string; updated: string };
 type JournalEntry = { id: string; dateKey: string; content: string; created: string; updated: string };
 type PlannerView = "1" | "3" | "4" | "7";
 type PinType = "note" | "task" | "folder";
 type Pin = { id: string; type: PinType };
-type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; todoCategories: TodoCategory[]; journalEntries: JournalEntry[]; pins: Pin[]; selectedFolderId: string; selectedNoteId: string; sortMode: SortMode; plannerView: PlannerView };
+type Workspace = { folders: Folder[]; notes: Note[]; todos: Todo[]; todoCategories: TodoCategory[]; projects: Project[]; journalEntries: JournalEntry[]; pins: Pin[]; selectedFolderId: string; selectedNoteId: string; sortMode: SortMode; plannerView: PlannerView };
 type StorageInfo = { databasePath: string; backupDirectory: string };
 type McpConfig = { enabled: boolean; host: string; port: number; authEnabled: boolean; token: string; permanentDeleteEnabled: boolean; startAtLogin: boolean };
 type McpStatus = { running: boolean; endpoint: string | null; error: string | null };
@@ -57,7 +59,12 @@ const starterFolders: Folder[] = [
 const starterNotes: Note[] = [
   { id: "welcome", folderId: "inbox", title: "Welcome to Odo", updated: now(), status: "active", pinned: true, revision: 0, content: "## A calm place for your work\n\nCapture ideas, organize projects, and keep your day moving.\n\n- Press Ctrl+N for a new note\n- Press Ctrl+2 for Tasks\n- Type / on a new line for blocks" },
 ];
-const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], todoCategories: [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }], journalEntries: [], pins: [], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest", plannerView: "3" });
+const starterProjects: Project[] = [
+  { id: "summer-launch", name: "Summer launch", summary: "Bring the next Odo release from rough plan to a polished launch.", description: "Keep launch decisions, open work, and the final release checklist together in one calm place.", status: "in_progress", targetDate: "2026-08-28", created: now(), updated: now() },
+  { id: "weekly-review", name: "Weekly review refresh", summary: "Make the weekly reset faster and easier to scan.", description: "Refine the review flow so priorities, unfinished tasks, and notes are easy to carry into the next week.", status: "planned", targetDate: null, created: now(), updated: now() },
+  { id: "mobile-capture", name: "Mobile capture", summary: "Explore a lightweight way to capture tasks away from the desk.", description: "Collect the smallest useful mobile capture flow before committing to a full companion app.", status: "backlog", targetDate: null, created: now(), updated: now() },
+];
+const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], todoCategories: [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }], projects: structuredClone(starterProjects), journalEntries: [], pins: [], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest", plannerView: "3" });
 
 const escapeHtml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#039;");
 const attr = escapeHtml;
@@ -68,11 +75,13 @@ function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Works
   const notes = (Array.isArray(input?.notes) ? input.notes : fallback.notes).map((note) => ({ ...note, revision: note.revision ?? 0 }));
   const sortMode: SortMode = input?.sortMode === "manual" || input?.sortMode === "oldest" ? input.sortMode : "newest";
   const categories = Array.isArray(input?.todoCategories) && input.todoCategories.length ? input.todoCategories : [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }];
-  const todos = (Array.isArray(input?.todos) ? input.todos : []).map((todo) => ({ ...todo, categoryId: todo.categoryId || "inbox", priority: (todo.priority || "medium") as Priority, effort: todo.effort || 2, color: todo.color || "", scheduledStart: todo.scheduledStart || null, durationMinutes: todo.durationMinutes || 30, status: todo.status || "todo", content: todo.content || "" }));
+  const projects = (Array.isArray(input?.projects) ? input.projects : fallback.projects).filter((project): project is Project => !!project && typeof project.id === "string" && typeof project.name === "string").map((project) => ({ ...project, summary: project.summary || "", description: project.description || "", status: (["backlog", "planned", "in_progress", "completed"].includes(project.status) ? project.status : "backlog") as ProjectStatus, targetDate: project.targetDate || null, created: project.created || now(), updated: project.updated || project.created || now() }));
+  const projectIds = new Set(projects.map((project) => project.id));
+  const todos = (Array.isArray(input?.todos) ? input.todos : []).map((todo) => ({ ...todo, categoryId: todo.categoryId || "inbox", priority: (todo.priority || "medium") as Priority, effort: todo.effort || 2, color: todo.color || "", scheduledStart: todo.scheduledStart || null, durationMinutes: todo.durationMinutes || 30, status: todo.status || "todo", content: todo.content || "", projectId: todo.projectId && projectIds.has(todo.projectId) ? todo.projectId : null }));
   const plannerView: PlannerView = ["1", "3", "4", "7"].includes(input?.plannerView || "") ? input!.plannerView as PlannerView : "3";
   const journalEntries = (Array.isArray(input?.journalEntries) ? input.journalEntries : []).filter((entry): entry is JournalEntry => !!entry && typeof entry.dateKey === "string").map((entry) => ({ id: entry.id || uid("journal"), dateKey: entry.dateKey, content: entry.content || "", created: entry.created || now(), updated: entry.updated || entry.created || now() }));
   const pins = (Array.isArray(input?.pins) ? input.pins : fallback.pins).filter((pin): pin is Pin => !!pin && typeof pin.id === "string" && ["note", "task", "folder"].includes(pin.type));
-  return { folders, notes, todos, todoCategories: categories, journalEntries, pins, selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "", sortMode, plannerView };
+  return { folders, notes, todos, todoCategories: categories, projects, journalEntries, pins, selectedFolderId: input?.selectedFolderId || "inbox", selectedNoteId: input?.selectedNoteId || "", sortMode, plannerView };
 }
 function initialState(): Workspace {
   if (!isDesktopApp) try { const saved = localStorage.getItem(STORAGE_KEY); if (saved) return normalizeWorkspace(JSON.parse(saved) as Workspace); } catch { localStorage.removeItem(STORAGE_KEY); }
@@ -116,6 +125,8 @@ let dragImage: HTMLElement | null = null;
 let plannerDate = new Date(); plannerDate.setHours(0, 0, 0, 0);
 let taskMenuTodoId = "";
 let taskDetailId = "";
+let selectedProjectId = "";
+let projectTab: "overview" | "tasks" = "overview";
 let plannerPopover: { x: number; y: number; returnId: string } | null = null;
 let plannerPointerDragging = false;
 let plannerPointerDrop: { date: string; minute: number } | null = null;
@@ -255,7 +266,7 @@ function renderPinPicker() {
 function renderSidebar() {
   const remaining = state.todos.filter((todo) => !todo.completed).length;
   return `<aside class="folders-panel" aria-label="Workspace navigation"><header class="brand-row"><button class="wordmark" id="wordmark" title="Go to Inbox">Odo</button><button class="icon-button sidebar-toggle" title="${sidebarCollapsed ? "Show" : "Hide"} sidebar" aria-label="${sidebarCollapsed ? "Show" : "Hide"} sidebar"><i class="ph ph-sidebar-simple"></i></button></header>
-    <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button><button class="primary-link ${currentView === "journal" ? "is-selected" : ""}" data-view="journal" aria-label="Journal"><i class="ph ph-book-open-text"></i><span>Journal</span></button></nav>
+    <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button><button class="primary-link ${currentView === "projects" ? "is-selected" : ""}" data-view="projects"><i class="ph ph-cube"></i><span>Projects</span><span class="nav-count">${state.projects.filter((project) => project.status !== "completed").length}</span></button><button class="primary-link ${currentView === "journal" ? "is-selected" : ""}" data-view="journal" aria-label="Journal"><i class="ph ph-book-open-text"></i><span>Journal</span></button></nav>
     <div class="pinned-section" data-drop-kind="pin"><div class="panel-label-row"><span>Pinned</span><button class="icon-button" id="pin-add" title="Pin a note, task, or project" aria-label="Pin a note, task, or project"><i class="ph ph-push-pin"></i></button></div><nav class="pin-list">${state.pins.map(renderPin).join("") || '<p class="pin-empty">Drag notes, tasks, or projects here</p>'}</nav>${pinPickerOpen ? renderPinPicker() : ""}</div>
     <div class="panel-label-row"><span>Folders</span><button class="icon-button" id="new-folder" title="New folder (${modLabel}+Shift+N)"><i class="ph ph-plus"></i></button></div><nav class="folder-tree" id="folder-tree">${state.folders.filter((folder) => folder.parentId === null && folder.id !== "inbox").map((folder) => renderFolder(folder)).join("")}</nav>
     <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
@@ -276,7 +287,8 @@ function renderTaskDetail() {
   const durationOptions = [15, 30, 45, 60, 90, 120, 150, 180, 240];
   const select = (prop: string, options: (string | number)[], selected: string | number) => `<select data-task-prop="${attr(prop)}">${options.map((o) => `<option value="${attr(String(o))}" ${o === selected ? "selected" : ""}>${escapeHtml(String(o))}</option>`).join("")}</select>`;
   const categories = state.todoCategories.map((c) => `<option value="${attr(c.id)}" ${c.id === todo.categoryId ? "selected" : ""}>${escapeHtml(c.name)}</option>`).join("");
-  return `<div id="task-detail-overlay" class="is-open" aria-modal="true" role="dialog" aria-label="Task details"><div class="task-detail"><header class="task-detail-header"><div class="task-detail-title" id="task-detail-title" data-title-editor contenteditable="true" role="textbox" aria-multiline="false" aria-label="Task title" spellcheck="true">${linkedPlainText(todo.text) || "<br>"}</div><button class="icon-button" id="close-task-detail" aria-label="Close task detail"><i class="ph ph-x"></i></button></header><div class="task-detail-body"><div class="task-detail-properties"><label class="task-property"><span>Status</span>${select("status", statusOptions, todo.status)}</label><label class="task-property"><span>Priority</span>${select("priority", priorityOptions, todo.priority)}</label><label class="task-property"><span>Effort</span>${select("effort", effortOptions, todo.effort)}</label><label class="task-property"><span>Category</span><select data-task-prop="categoryId">${categories}</select></label><label class="task-property"><span>Color</span><input type="color" data-task-prop="color" value="${attr(todo.color || category.color)}"></label><label class="task-property"><span>Schedule</span><input type="datetime-local" data-task-prop="scheduledStart" value="${todo.scheduledStart ? todo.scheduledStart.slice(0, 16) : ""}"></label><label class="task-property"><span>Duration</span>${select("durationMinutes", durationOptions, todo.durationMinutes)}</label></div><div class="task-detail-toolbar"><button class="icon-button" data-block="H1" title="Heading 1">H₁</button><button class="icon-button" data-block="H2" title="Heading 2">H₂</button><button class="icon-button" data-block="H3" title="Heading 3">H₃</button><span></span><button class="icon-button" data-rich-command="bold" title="Bold">B</button><button class="icon-button" data-rich-command="italic" title="Italic">I</button><button class="icon-button" data-rich-command="strikeThrough" title="Strike">S</button><span></span><button class="icon-button" data-block="UL" title="Bulleted list"><i class="ph ph-list-bullets"></i></button><button class="icon-button" data-rich-command="link" title="Add link"><i class="ph ph-link"></i></button><button class="icon-button" data-block="PRE" title="Code block"><i class="ph ph-code"></i></button></div><div id="task-detail-editor" class="rich-editor task-detail-editor" data-rich-editor contenteditable="true" role="textbox" aria-multiline="true" aria-label="Task description" spellcheck="true">${markdownToRich(todo.content)}</div></div></div></div>`;
+  const projects = `<option value="">No project</option>${state.projects.map((project) => `<option value="${attr(project.id)}" ${project.id === todo.projectId ? "selected" : ""}>${escapeHtml(project.name)}</option>`).join("")}`;
+  return `<div id="task-detail-overlay" class="is-open" aria-modal="true" role="dialog" aria-label="Task details"><div class="task-detail"><header class="task-detail-header"><div class="task-detail-title" id="task-detail-title" data-title-editor contenteditable="true" role="textbox" aria-multiline="false" aria-label="Task title" spellcheck="true">${linkedPlainText(todo.text) || "<br>"}</div><button class="icon-button" id="close-task-detail" aria-label="Close task detail"><i class="ph ph-x"></i></button></header><div class="task-detail-body"><div class="task-detail-properties"><label class="task-property"><span>Status</span>${select("status", statusOptions, todo.status)}</label><label class="task-property"><span>Priority</span>${select("priority", priorityOptions, todo.priority)}</label><label class="task-property"><span>Effort</span>${select("effort", effortOptions, todo.effort)}</label><label class="task-property"><span>Category</span><select data-task-prop="categoryId">${categories}</select></label><label class="task-property"><span>Project</span><select data-task-prop="projectId">${projects}</select></label><label class="task-property"><span>Color</span><input type="color" data-task-prop="color" value="${attr(todo.color || category.color)}"></label><label class="task-property"><span>Schedule</span><input type="datetime-local" data-task-prop="scheduledStart" value="${todo.scheduledStart ? todo.scheduledStart.slice(0, 16) : ""}"></label><label class="task-property"><span>Duration</span>${select("durationMinutes", durationOptions, todo.durationMinutes)}</label></div><div class="task-detail-toolbar"><button class="icon-button" data-block="H1" title="Heading 1">H₁</button><button class="icon-button" data-block="H2" title="Heading 2">H₂</button><button class="icon-button" data-block="H3" title="Heading 3">H₃</button><span></span><button class="icon-button" data-rich-command="bold" title="Bold">B</button><button class="icon-button" data-rich-command="italic" title="Italic">I</button><button class="icon-button" data-rich-command="strikeThrough" title="Strike">S</button><span></span><button class="icon-button" data-block="UL" title="Bulleted list"><i class="ph ph-list-bullets"></i></button><button class="icon-button" data-rich-command="link" title="Add link"><i class="ph ph-link"></i></button><button class="icon-button" data-block="PRE" title="Code block"><i class="ph ph-code"></i></button></div><div id="task-detail-editor" class="rich-editor task-detail-editor" data-rich-editor contenteditable="true" role="textbox" aria-multiline="true" aria-label="Task description" spellcheck="true">${markdownToRich(todo.content)}</div></div></div></div>`;
 }
 function openTaskDetail(id: string) { taskMenuTodoId = ""; plannerPopover = null; taskDetailId = id; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>("#task-detail-title")?.focus()); }
 function closeTaskDetail() { taskDetailId = ""; renderApp(); }
@@ -483,6 +495,41 @@ function renderEditor() {
     ${canEdit ? `<div class="format-bar" role="toolbar" aria-label="Formatting"><button data-block="H1" title="Heading 1">H₁</button><button data-block="H2" title="Heading 2">H₂</button><button data-block="H3" title="Heading 3">H₃</button><span></span><button data-rich-command="bold" title="Bold (${modLabel}+B)">B</button><button data-rich-command="italic" class="italic" title="Italic (${modLabel}+I)">I</button><button data-rich-command="strikeThrough" class="strike" title="Strike through">S</button><span></span><button class="icon-button" data-block="UL" title="Bulleted list"><i class="ph ph-list-bullets"></i></button><button class="icon-button" data-rich-task title="To-do list"><i class="ph ph-check-square"></i></button><span></span><button class="icon-button" data-rich-command="link" title="Add link"><i class="ph ph-link"></i></button><button class="icon-button" data-block="PRE" title="Code block"><i class="ph ph-code"></i></button><span></span><button class="icon-button" id="toolbar-more" title="Block menu"><i class="ph ph-dots-three"></i></button><button class="icon-button expand-editor" id="expand-editor" title="Focus mode"><i class="ph ph-arrows-out"></i></button></div>` : '<div class="readonly-bar"><i class="ph ph-info"></i>This note is read-only here. Restore it to edit.</div>'}
     <article class="editor-page"><div class="title-input" id="title-input" data-title-editor contenteditable="${canEdit}" role="textbox" aria-multiline="false" aria-label="Note title" spellcheck="true">${linkedPlainText(note.title) || "<br>"}</div><div class="note-meta"><span>${formatEditorDate(note.updated)}</span><span>·</span><span id="word-count">${wordCount(note.content)} words</span></div><div class="editor-wrap"><div id="markdown-editor" class="rich-editor" data-rich-editor contenteditable="${canEdit}" role="textbox" aria-multiline="true" aria-label="Note content" spellcheck="true">${markdownToRich(note.content)}</div>${canEdit ? slashMenuHtml() : ""}</div></article></main>`;
 }
+
+const projectStatusMeta: Record<ProjectStatus, { label: string; icon: string; tone: string }> = {
+  backlog: { label: "Backlog", icon: "ph-circle-dashed", tone: "clay" },
+  planned: { label: "Planned", icon: "ph-circle", tone: "slate" },
+  in_progress: { label: "In progress", icon: "ph-circle-half-tilt", tone: "sun" },
+  completed: { label: "Completed", icon: "ph-check-circle", tone: "green" },
+};
+const projectStatuses = Object.keys(projectStatusMeta) as ProjectStatus[];
+const projectTasks = (projectId: string) => state.todos.filter((todo) => todo.projectId === projectId);
+function formatProjectDate(value: string | null) {
+  if (!value) return "No target date";
+  const date = new Date(`${value}T12:00:00`);
+  return Number.isNaN(date.getTime()) ? "No target date" : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+function renderProjectCard(project: Project) {
+  const tasks = projectTasks(project.id); const open = tasks.filter((todo) => !todo.completed).length;
+  return `<button class="project-card" data-project-id="${attr(project.id)}" aria-label="Open ${attr(project.name)}"><span class="project-card-top"><span class="project-mark ${projectStatusMeta[project.status].tone}"><i class="ph ph-cube"></i></span><span class="project-card-actions"><i class="ph ${projectStatusMeta[project.status].icon}"></i><i class="ph ph-dots-three"></i></span></span><strong>${escapeHtml(project.name)}</strong><span class="project-summary">${escapeHtml(project.summary || "Add a short summary to make this project easier to scan.")}</span><span class="project-card-meta"><span>${open} open ${open === 1 ? "task" : "tasks"}</span><span>${formatProjectDate(project.targetDate)}</span></span></button>`;
+}
+function renderProjectsBoard() {
+  return `<main class="projects-view" aria-label="Projects"><header class="projects-toolbar"><div><span class="eyebrow">Workspace</span><h1>Projects</h1><p>See what is waiting, planned, and moving forward.</p></div><button class="primary-button" id="new-project"><i class="ph ph-plus"></i>New project</button></header><div class="project-filter-row"><button class="project-filter is-active">All projects <span>${state.projects.length}</span></button><span>${state.projects.filter((project) => project.status === "in_progress").length} in progress</span></div><div class="project-board">${projectStatuses.map((status) => { const meta = projectStatusMeta[status]; const projects = state.projects.filter((project) => project.status === status); return `<section class="project-column ${meta.tone}"><header><span><i class="ph ${meta.icon}"></i><strong>${meta.label}</strong><small>${projects.length}</small></span><button data-new-project-status="${status}" aria-label="Add a project to ${meta.label}"><i class="ph ph-plus"></i></button></header><div class="project-column-list">${projects.map(renderProjectCard).join("") || `<div class="project-column-empty"><i class="ph ${meta.icon}"></i><span>No projects here</span></div>`}</div></section>`; }).join("")}</div></main>`;
+}
+function renderProjectTask(todo: Todo) {
+  const category = categoryFor(todo);
+  return `<button class="project-task-row ${todo.completed ? "is-complete" : ""}" data-project-task="${attr(todo.id)}"><span class="project-task-check"><i class="ph ph-${todo.completed ? "check" : "circle"}"></i></span><span><strong>${escapeHtml(todo.text || "Untitled task")}</strong><small>${escapeHtml(category.name)} · ${todo.priority} priority</small></span><i class="ph ph-caret-right"></i></button>`;
+}
+function renderProjectDetail(project: Project) {
+  const meta = projectStatusMeta[project.status]; const tasks = projectTasks(project.id); const openTasks = tasks.filter((todo) => !todo.completed);
+  const tasksContent = `<section class="project-related"><header><div><span class="eyebrow">Related work</span><h2>Tasks</h2></div><button class="secondary-button" id="add-project-task"><i class="ph ph-plus"></i>Add task</button></header><div class="project-task-list">${tasks.map(renderProjectTask).join("") || '<div class="project-detail-empty"><i class="ph ph-check-square"></i><strong>No tasks yet</strong><span>Add the first task for this project.</span></div>'}</div></section>`;
+  const overview = `<div class="project-overview-grid"><section class="project-description-card"><label for="project-description">Description</label><textarea id="project-description" placeholder="Add a description…">${escapeHtml(project.description)}</textarea></section><aside class="project-progress-card"><span class="eyebrow">Progress</span><strong>${tasks.length ? Math.round((tasks.length - openTasks.length) / tasks.length * 100) : 0}%</strong><div><span style="width:${tasks.length ? Math.round((tasks.length - openTasks.length) / tasks.length * 100) : 0}%"></span></div><p>${openTasks.length} open · ${tasks.length - openTasks.length} completed</p></aside></div>${tasksContent}`;
+  return `<main class="project-detail-view" aria-label="${attr(project.name)} project"><header class="project-detail-topbar"><button id="back-to-projects"><i class="ph ph-arrow-left"></i>Projects</button><span><i class="ph ph-cube"></i>${escapeHtml(project.name)}</span><button class="icon-button" id="project-more" aria-label="Project actions"><i class="ph ph-dots-three"></i></button></header><nav class="project-detail-tabs" aria-label="Project sections"><button class="${projectTab === "overview" ? "is-active" : ""}" data-project-tab="overview">Overview</button><button class="${projectTab === "tasks" ? "is-active" : ""}" data-project-tab="tasks">Tasks <span>${tasks.length}</span></button></nav><div class="project-detail-scroll"><article class="project-hero"><span class="project-hero-mark ${meta.tone}"><i class="ph ph-cube"></i></span><div class="project-name-editor" id="project-name" contenteditable="true" role="textbox" aria-multiline="false" aria-label="Project name">${linkedPlainText(project.name)}</div><p>${escapeHtml(project.summary || "Add a short summary so everyone knows what success looks like.")}</p><div class="project-properties"><label><span>Status</span><i class="ph ${meta.icon}"></i><select id="project-status">${projectStatuses.map((status) => `<option value="${status}" ${status === project.status ? "selected" : ""}>${projectStatusMeta[status].label}</option>`).join("")}</select></label><label><span>Target date</span><i class="ph ph-calendar-blank"></i><input id="project-target-date" type="date" value="${attr(project.targetDate || "")}"></label><span class="project-task-stat"><i class="ph ph-check-square"></i>${openTasks.length} open tasks</span></div></article>${projectTab === "overview" ? overview : tasksContent}</div></main>`;
+}
+function renderProjects() {
+  const project = state.projects.find((item) => item.id === selectedProjectId);
+  return project ? renderProjectDetail(project) : renderProjectsBoard();
+}
 const slotHeight = 32;
 const categoryFor = (todo: Todo) => state.todoCategories.find((category) => category.id === todo.categoryId) ?? state.todoCategories[0];
 const dateKey = (date: Date) => `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;
@@ -610,7 +657,7 @@ function renderApp() {
   const plannerScrollPosition = previousPlannerScroll ? { top: previousPlannerScroll.scrollTop, left: previousPlannerScroll.scrollLeft } : null;
   const isInbox = currentView === "notes" && state.selectedFolderId === "inbox";
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}${isInbox ? " view-inbox" : ""}`;
-  const content = currentView === "tasks" ? renderTasks() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
+  const content = currentView === "tasks" ? renderTasks() : currentView === "projects" ? renderProjects() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
   app.innerHTML = `${renderSidebar()}${content}${renderTaskDetail()}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
   updateSaveStatus(); bindEvents(); bindOdoDialog();
   if (currentView === "tasks") {
@@ -657,7 +704,7 @@ function createFolder(name: string) {
   if (parent) parent.open = true; state.folders.push(folder); state.selectedFolderId = folder.id; currentView = "notes"; state.selectedNoteId = ""; void saveState(false); renderApp();
 }
 function setView(view: View) {
-  currentView = view; focusMode = false; searchQuery = ""; if (view === "journal") { openJournalToday(true); return; } repairState(); renderApp();
+  currentView = view; focusMode = false; searchQuery = ""; if (view === "projects") { selectedProjectId = ""; projectTab = "overview"; } if (view === "journal") { openJournalToday(true); return; } repairState(); renderApp();
   if (view === "settings" && isDesktopApp) {
     if (!storageInfo) void loadStorageInfo();
     void loadMcpSettings();
@@ -1299,10 +1346,38 @@ function bindEvents() {
     button.addEventListener("click", () => { const pin = { id: button.dataset.pinId!, type: button.dataset.pinType as PinType }; openPin(pin); });
     button.addEventListener("contextmenu", (event) => { event.preventDefault(); unpinItem(button.dataset.pinId!, button.dataset.pinType as PinType); });
   });
-  bindTaskEvents(); bindTaskDetailEvents(); bindJournalEvents(); bindSettingsEvents();
+  bindProjectsEvents(); bindTaskEvents(); bindTaskDetailEvents(); bindJournalEvents(); bindSettingsEvents();
   document.querySelectorAll<HTMLElement>(".mini-task[data-todo-id]").forEach((row) => { row.addEventListener("click", (event) => { if (plannerPointerDragging || (event.target as HTMLElement).closest("button")) return; openTaskDetail(row.dataset.todoId!); }); row.addEventListener("contextmenu", (event) => { event.preventDefault(); openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("keydown", handleTaskKeydown); });
   document.querySelector("#close-help")?.addEventListener("click", () => { helpOpen = false; renderApp(); });
   document.querySelector("#help-overlay")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) { helpOpen = false; renderApp(); } });
+}
+async function createProject(status: ProjectStatus = "backlog") {
+  const name = await promptOdo("New project", "What should this project be called?", "Untitled project");
+  if (!name) return;
+  const timestamp = now(); const project: Project = { id: uid("project"), name, summary: "", description: "", status, targetDate: null, created: timestamp, updated: timestamp };
+  state.projects.unshift(project); selectedProjectId = project.id; projectTab = "overview"; await saveState(false); renderApp();
+  requestAnimationFrame(() => document.querySelector<HTMLElement>("#project-name")?.focus());
+}
+async function createProjectTask(project: Project) {
+  const text = await promptOdo("Add a task", `Add a task to “${project.name}”.`, "Untitled task");
+  if (!text) return;
+  const timestamp = now(); const todo: Todo = { id: uid("todo"), text, completed: false, created: timestamp, updated: timestamp, categoryId: "inbox", priority: "medium", effort: 2, color: "", scheduledStart: null, durationMinutes: 30, status: "todo", content: "", projectId: project.id };
+  state.todos.unshift(todo); await saveState(false); renderApp(); openTaskDetail(todo.id);
+}
+function bindProjectsEvents() {
+  document.querySelector("#new-project")?.addEventListener("click", () => void createProject());
+  document.querySelectorAll<HTMLElement>("[data-new-project-status]").forEach((button) => button.addEventListener("click", () => void createProject(button.dataset.newProjectStatus as ProjectStatus)));
+  document.querySelectorAll<HTMLElement>("[data-project-id]").forEach((card) => card.addEventListener("click", () => { selectedProjectId = card.dataset.projectId!; projectTab = "overview"; renderApp(); }));
+  document.querySelector("#back-to-projects")?.addEventListener("click", () => { selectedProjectId = ""; projectTab = "overview"; renderApp(); });
+  document.querySelectorAll<HTMLElement>("[data-project-tab]").forEach((tab) => tab.addEventListener("click", () => { projectTab = tab.dataset.projectTab as "overview" | "tasks"; renderApp(); }));
+  const project = state.projects.find((item) => item.id === selectedProjectId); if (!project) return;
+  const name = document.querySelector<HTMLElement>("#project-name");
+  if (name) bindTitleEditor(name, (value) => { project.name = value || "Untitled project"; project.updated = now(); scheduleSave(); }, () => document.querySelector<HTMLTextAreaElement>("#project-description")?.focus(), () => document.querySelector<HTMLButtonElement>("#back-to-projects")?.focus());
+  document.querySelector<HTMLTextAreaElement>("#project-description")?.addEventListener("input", (event) => { project.description = (event.target as HTMLTextAreaElement).value; project.updated = now(); scheduleSave(); });
+  document.querySelector<HTMLSelectElement>("#project-status")?.addEventListener("change", (event) => { project.status = (event.target as HTMLSelectElement).value as ProjectStatus; project.updated = now(); void saveState(false); renderApp(); });
+  document.querySelector<HTMLInputElement>("#project-target-date")?.addEventListener("change", (event) => { project.targetDate = (event.target as HTMLInputElement).value || null; project.updated = now(); void saveState(false); renderApp(); });
+  document.querySelector("#add-project-task")?.addEventListener("click", () => void createProjectTask(project));
+  document.querySelectorAll<HTMLElement>("[data-project-task]").forEach((task) => task.addEventListener("click", () => openTaskDetail(task.dataset.projectTask!)));
 }
 function bindTaskDetailEvents() {
   document.querySelector("#close-task-detail")?.addEventListener("click", closeTaskDetail);
@@ -1319,6 +1394,7 @@ function bindTaskDetailEvents() {
     if (prop === "effort" || prop === "durationMinutes") (todo as any)[prop] = Number(value);
     else if (prop === "scheduledStart") todo.scheduledStart = value ? new Date(value).toISOString() : null;
     else if (prop === "status") { todo.status = value; todo.completed = value === "done"; }
+    else if (prop === "projectId") todo.projectId = value || null;
     else (todo as any)[prop] = value;
     todo.updated = now(); clearTimeout(taskDetailSaveTimer); taskDetailSaveTimer = window.setTimeout(() => void saveState(false), 350);
   }));

@@ -63,6 +63,8 @@ struct Todo {
     scheduled_start: Option<String>,
     #[serde(default = "default_duration")]
     duration_minutes: i64,
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,6 +75,23 @@ struct TodoCategory {
     color: String,
     #[serde(default)]
     icon: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Project {
+    id: String,
+    name: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "default_project_status")]
+    status: String,
+    #[serde(default)]
+    target_date: Option<String>,
+    created: String,
+    updated: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,6 +113,8 @@ struct Workspace {
     todos: Vec<Todo>,
     #[serde(default)]
     todo_categories: Vec<TodoCategory>,
+    #[serde(default)]
+    projects: Vec<Project>,
     #[serde(default)]
     journal_entries: Vec<JournalEntry>,
     selected_folder_id: String,
@@ -121,6 +142,9 @@ fn default_duration() -> i64 {
 }
 fn default_planner_view() -> String {
     "3".into()
+}
+fn default_project_status() -> String {
+    "backlog".into()
 }
 
 #[derive(Serialize)]
@@ -200,6 +224,9 @@ pub fn initialize_database(connection: &Connection) -> Result<(), String> {
              CREATE TABLE IF NOT EXISTS todo_categories (
                id TEXT PRIMARY KEY, name TEXT NOT NULL, color TEXT NOT NULL, icon TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0
              );
+             CREATE TABLE IF NOT EXISTS projects (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'backlog', target_date TEXT, created TEXT NOT NULL, updated TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0
+             );
              CREATE TABLE IF NOT EXISTS journal_entries (
                id TEXT PRIMARY KEY, date_key TEXT NOT NULL UNIQUE, content TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, updated TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0
              );",
@@ -256,6 +283,10 @@ pub fn initialize_database(connection: &Connection) -> Result<(), String> {
             "duration_minutes",
             "ALTER TABLE todos ADD COLUMN duration_minutes INTEGER NOT NULL DEFAULT 30",
         ),
+        (
+            "project_id",
+            "ALTER TABLE todos ADD COLUMN project_id TEXT",
+        ),
     ] {
         if !todo_columns.iter().any(|item| item == column) {
             connection
@@ -290,6 +321,7 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
         .execute_batch(
             "DELETE FROM folders;
              DELETE FROM todos;
+             DELETE FROM projects;
              DELETE FROM todo_categories;
              DELETE FROM journal_entries;
              CREATE TEMP TABLE IF NOT EXISTS incoming_note_ids (id TEXT PRIMARY KEY);
@@ -379,18 +411,27 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
     if workspace.todo_categories.is_empty() {
         transaction.execute("INSERT OR IGNORE INTO todo_categories (id,name,color,icon,position) VALUES ('inbox','Inbox','#7b8e7c','ph-tray',0)", []).map_err(|error| format!("Could not seed category: {error}"))?;
     }
+    for (position, project) in workspace.projects.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO projects (id, name, summary, description, status, target_date, created, updated, position)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![project.id, project.name, project.summary, project.description, project.status, project.target_date, project.created, project.updated, position as i64],
+            )
+            .map_err(|error| format!("Could not save a project: {error}"))?;
+    }
     for (position, todo) in workspace.todos.iter().enumerate() {
         transaction
             .execute(
-                "INSERT INTO todos (id, text, completed, created, updated, position, category_id, priority, effort, color, scheduled_start, duration_minutes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO todos (id, text, completed, created, updated, position, category_id, priority, effort, color, scheduled_start, duration_minutes, project_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     todo.id,
                     todo.text,
                     todo.completed,
                     todo.created,
                     todo.updated,
-                    position as i64, todo.category_id, todo.priority, todo.effort, todo.color, todo.scheduled_start, todo.duration_minutes
+                    position as i64, todo.category_id, todo.priority, todo.effort, todo.color, todo.scheduled_start, todo.duration_minutes, todo.project_id
                 ],
             )
             .map_err(|error| format!("Could not save a task: {error}"))?;
@@ -486,7 +527,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .map_err(|error| format!("Could not decode notes: {error}"))?;
 
     let mut todo_statement = connection
-        .prepare("SELECT id, text, completed, created, updated, category_id, priority, effort, color, scheduled_start, duration_minutes FROM todos ORDER BY position")
+        .prepare("SELECT id, text, completed, created, updated, category_id, priority, effort, color, scheduled_start, duration_minutes, project_id FROM todos ORDER BY position")
         .map_err(|error| format!("Could not read tasks: {error}"))?;
     let todos = todo_statement
         .query_map([], |row| {
@@ -502,6 +543,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
                 color: row.get(8)?,
                 scheduled_start: row.get(9)?,
                 duration_minutes: row.get(10)?,
+                project_id: row.get(11)?,
             })
         })
         .map_err(|error| format!("Could not query tasks: {error}"))?
@@ -522,6 +564,25 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .map_err(|error| format!("Could not query task categories: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Could not decode categories: {error}"))?;
+    let mut project_statement = connection
+        .prepare("SELECT id,name,summary,description,status,target_date,created,updated FROM projects ORDER BY position")
+        .map_err(|error| format!("Could not read projects: {error}"))?;
+    let projects = project_statement
+        .query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                summary: row.get(2)?,
+                description: row.get(3)?,
+                status: row.get(4)?,
+                target_date: row.get(5)?,
+                created: row.get(6)?,
+                updated: row.get(7)?,
+            })
+        })
+        .map_err(|error| format!("Could not query projects: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Could not decode projects: {error}"))?;
     let mut journal_statement = connection.prepare("SELECT id,date_key,content,created,updated FROM journal_entries ORDER BY date_key DESC, position").map_err(|error| format!("Could not read journal entries: {error}"))?;
     let journal_entries = journal_statement
         .query_map([], |row| {
@@ -584,6 +645,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         notes,
         todos,
         todo_categories,
+        projects,
         journal_entries,
         selected_folder_id,
         selected_note_id,
