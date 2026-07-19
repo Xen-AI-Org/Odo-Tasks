@@ -1,12 +1,13 @@
 import { expect, test } from "@playwright/test";
 
-test("opens an empty Projects page from below Tasks", async ({ page }) => {
+test("opens an empty top-level Projects page from below Journal", async ({ page }) => {
   await page.goto("/");
 
-  const tasksTab = page.locator('[data-view="tasks"]');
+  const journalTab = page.locator('[data-view="journal"]');
   const projectsTab = page.locator('[data-view="projects"]');
-  await expect(tasksTab).toBeVisible();
+  await expect(journalTab).toBeVisible();
   await expect(projectsTab).toBeVisible();
+  await expect(journalTab.locator("xpath=following-sibling::*[1]")).toHaveAttribute("data-view", "projects");
   await projectsTab.click();
 
   await expect(projectsTab).toHaveClass(/is-selected/);
