@@ -123,6 +123,8 @@ let reloadingWorkspace = false;
 let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
 let draggingNoteId = "";
 let draggingFolderId = "";
+let projectDragPreview: HTMLElement | null = null;
+let suppressProjectActivationUntil = 0;
 let suppressRowActivationUntil = 0;
 let sortInsertionTargetId = "";
 let sortInsertionSide: "before" | "after" = "before";
@@ -521,10 +523,10 @@ function formatProjectDate(value: string | null) {
 }
 function renderProjectCard(project: Project) {
   const milestones = projectMilestones(project.id); const open = milestones.filter((milestone) => !milestone.completed).length;
-  return `<button class="project-card" data-project-id="${attr(project.id)}" aria-label="Open ${attr(project.name)}"><span class="project-card-top"><span class="project-mark ${projectStatusMeta[project.status].tone}"><i class="ph ph-cube"></i></span><span class="project-card-actions"><i class="ph ${projectStatusMeta[project.status].icon}"></i><i class="ph ph-dots-three"></i></span></span><strong>${escapeHtml(project.name)}</strong><span class="project-summary">${escapeHtml(project.summary || "Add a short summary to make this project easier to scan.")}</span><span class="project-card-meta"><span>${open} open ${open === 1 ? "milestone" : "milestones"}</span><span>${formatProjectDate(project.targetDate)}</span></span></button>`;
+  return `<button class="project-card" data-project-id="${attr(project.id)}" aria-label="Open ${attr(project.name)}. Drag to another stage to update its status."><span class="project-card-top"><span class="project-mark ${projectStatusMeta[project.status].tone}"><i class="ph ph-cube"></i></span><span class="project-card-actions"><i class="ph ${projectStatusMeta[project.status].icon}"></i><i class="ph ph-dots-three"></i></span></span><strong>${escapeHtml(project.name)}</strong><span class="project-summary">${escapeHtml(project.summary || "Add a short summary to make this project easier to scan.")}</span><span class="project-card-meta"><span>${open} open ${open === 1 ? "milestone" : "milestones"}</span><span>${formatProjectDate(project.targetDate)}</span></span></button>`;
 }
 function renderProjectsBoard() {
-  return `<main class="projects-view" aria-label="Projects"><header class="projects-toolbar"><div><span class="eyebrow">Workspace</span><h1>Projects</h1><p>See what is waiting, planned, and moving forward.</p></div><button class="primary-button" id="new-project"><i class="ph ph-plus"></i>New project</button></header><div class="project-filter-row"><button class="project-filter is-active">All projects <span>${state.projects.length}</span></button><span>${state.projects.filter((project) => project.status === "in_progress").length} in progress</span></div><div class="project-board">${projectStatuses.map((status) => { const meta = projectStatusMeta[status]; const projects = state.projects.filter((project) => project.status === status); return `<section class="project-column ${meta.tone}"><header><span><i class="ph ${meta.icon}"></i><strong>${meta.label}</strong><small>${projects.length}</small></span><button data-new-project-status="${status}" aria-label="Add a project to ${meta.label}"><i class="ph ph-plus"></i></button></header><div class="project-column-list">${projects.map(renderProjectCard).join("") || `<div class="project-column-empty"><i class="ph ${meta.icon}"></i><span>No projects here</span></div>`}</div></section>`; }).join("")}</div></main>`;
+  return `<main class="projects-view" aria-label="Projects"><header class="projects-toolbar"><div><span class="eyebrow">Workspace</span><h1>Projects</h1><p>See what is waiting, planned, and moving forward.</p></div><button class="primary-button" id="new-project"><i class="ph ph-plus"></i>New project</button></header><div class="project-filter-row"><button class="project-filter is-active">All projects <span>${state.projects.length}</span></button><span>${state.projects.filter((project) => project.status === "in_progress").length} in progress</span></div><div class="project-board">${projectStatuses.map((status) => { const meta = projectStatusMeta[status]; const projects = state.projects.filter((project) => project.status === status); return `<section class="project-column ${meta.tone}" data-project-status="${status}" aria-label="${meta.label} stage"><header><span><i class="ph ${meta.icon}"></i><strong>${meta.label}</strong><small>${projects.length}</small></span><button data-new-project-status="${status}" aria-label="Add a project to ${meta.label}"><i class="ph ph-plus"></i></button></header><div class="project-column-list">${projects.map(renderProjectCard).join("") || `<div class="project-column-empty"><i class="ph ${meta.icon}"></i><span>No projects here</span></div>`}</div></section>`; }).join("")}</div></main>`;
 }
 function renderProjectTask(todo: Todo) {
   const category = categoryFor(todo);
@@ -1394,10 +1396,108 @@ async function createProjectTask(project: Project, milestoneId: string | null = 
   const timestamp = now(); const todo: Todo = { id: uid("todo"), text, completed: false, created: timestamp, updated: timestamp, categoryId: "inbox", priority: "medium", effort: 2, color: "", scheduledStart: null, durationMinutes: 30, status: "todo", content: "", projectId: project.id, milestoneId };
   state.todos.unshift(todo); await saveState(false); renderApp(); openTaskDetail(todo.id);
 }
+function clearProjectDragVisuals() {
+  document.querySelectorAll<HTMLElement>(".project-card.is-dragging").forEach((card) => card.classList.remove("is-dragging"));
+  document.querySelectorAll<HTMLElement>(".project-column.is-drop-target").forEach((column) => column.classList.remove("is-drop-target"));
+  document.documentElement.classList.remove("is-project-dragging");
+  projectDragPreview?.remove();
+  projectDragPreview = null;
+}
+async function moveProjectToStatus(projectId: string, status: ProjectStatus) {
+  const project = state.projects.find((item) => item.id === projectId);
+  if (!project || !projectStatuses.includes(status)) { announceDrag("That project or stage is no longer available."); return; }
+  const destination = projectStatusMeta[status].label;
+  if (project.status === status) { announceDrag(`“${project.name}” is already in ${destination}.`); return; }
+  project.status = status;
+  project.updated = now();
+  await saveState(false);
+  renderApp();
+  announceDrag(`Moved “${project.name}” to ${destination}.`);
+}
+function projectStatusAt(x: number, y: number): ProjectStatus | null {
+  const value = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-project-status]")?.dataset.projectStatus as ProjectStatus | undefined;
+  return value && projectStatuses.includes(value) ? value : null;
+}
+function highlightProjectStatus(status: ProjectStatus | null) {
+  document.querySelectorAll<HTMLElement>(".project-column.is-drop-target").forEach((column) => column.classList.remove("is-drop-target"));
+  if (!status) return;
+  document.querySelector<HTMLElement>(`[data-project-status="${status}"]`)?.classList.add("is-drop-target");
+  announceDrag(`Move here: ${projectStatusMeta[status].label}.`);
+}
+function bindProjectPointerDrag(card: HTMLElement) {
+  card.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const projectId = card.dataset.projectId;
+    const project = state.projects.find((item) => item.id === projectId);
+    if (!projectId || !project) return;
+
+    const pointerId = event.pointerId;
+    const origin = { x: event.clientX, y: event.clientY };
+    const sourceRect = card.getBoundingClientRect();
+    const grabX = Math.max(0, Math.min(sourceRect.width, event.clientX - sourceRect.left));
+    const grabY = Math.max(0, Math.min(sourceRect.height, event.clientY - sourceRect.top));
+    let started = false;
+    let activeStatus: ProjectStatus | null = null;
+    const cleanup = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", cancel);
+    };
+    const move = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      if (!started && Math.hypot(moveEvent.clientX - origin.x, moveEvent.clientY - origin.y) < 8) return;
+      if (!started) {
+        started = true;
+        card.classList.add("is-dragging");
+        document.documentElement.classList.add("is-project-dragging");
+        projectDragPreview = card.cloneNode(true) as HTMLElement;
+        projectDragPreview.classList.remove("is-dragging");
+        projectDragPreview.classList.add("project-drag-preview");
+        projectDragPreview.setAttribute("aria-hidden", "true");
+        projectDragPreview.setAttribute("tabindex", "-1");
+        projectDragPreview.removeAttribute("draggable");
+        projectDragPreview.querySelectorAll<HTMLElement>("button,[tabindex]").forEach((element) => element.setAttribute("tabindex", "-1"));
+        projectDragPreview.style.width = `${sourceRect.width}px`;
+        projectDragPreview.style.height = `${sourceRect.height}px`;
+        projectDragPreview.style.transform = `translate3d(${moveEvent.clientX - grabX}px, ${moveEvent.clientY - grabY}px, 0)`;
+        document.body.append(projectDragPreview);
+        window.getSelection()?.removeAllRanges();
+        announceDrag(`Moving “${project.name}”. Choose another stage.`);
+      }
+      moveEvent.preventDefault();
+      window.getSelection()?.removeAllRanges();
+      if (projectDragPreview) projectDragPreview.style.transform = `translate3d(${moveEvent.clientX - grabX}px, ${moveEvent.clientY - grabY}px, 0)`;
+      const nextStatus = projectStatusAt(moveEvent.clientX, moveEvent.clientY);
+      if (nextStatus !== activeStatus) { activeStatus = nextStatus; highlightProjectStatus(activeStatus); }
+    };
+    const finish = (upEvent: PointerEvent) => {
+      if (upEvent.pointerId !== pointerId) return;
+      cleanup();
+      const status = started ? projectStatusAt(upEvent.clientX, upEvent.clientY) : null;
+      if (started) suppressProjectActivationUntil = Date.now() + 260;
+      clearProjectDragVisuals();
+      if (status) void moveProjectToStatus(projectId, status);
+      else if (started) announceDrag("Move cancelled. The project was not changed.");
+    };
+    const cancel = (cancelEvent: PointerEvent) => {
+      if (cancelEvent.pointerId !== pointerId) return;
+      cleanup();
+      if (started) suppressProjectActivationUntil = Date.now() + 260;
+      clearProjectDragVisuals();
+      if (started) announceDrag("Move cancelled. The project was not changed.");
+    };
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", cancel);
+  });
+}
 function bindProjectsEvents() {
   document.querySelector("#new-project")?.addEventListener("click", () => void createProject());
   document.querySelectorAll<HTMLElement>("[data-new-project-status]").forEach((button) => button.addEventListener("click", () => void createProject(button.dataset.newProjectStatus as ProjectStatus)));
-  document.querySelectorAll<HTMLElement>("[data-project-id]").forEach((card) => card.addEventListener("click", () => { selectedProjectId = card.dataset.projectId!; projectTab = "overview"; renderApp(); }));
+  document.querySelectorAll<HTMLElement>(".project-card[data-project-id]").forEach((card) => {
+    bindProjectPointerDrag(card);
+    card.addEventListener("click", () => { if (Date.now() < suppressProjectActivationUntil) return; selectedProjectId = card.dataset.projectId!; projectTab = "overview"; renderApp(); });
+  });
   document.querySelector("#back-to-projects")?.addEventListener("click", () => { selectedProjectId = ""; projectTab = "overview"; renderApp(); });
   document.querySelectorAll<HTMLElement>("[data-project-tab]").forEach((tab) => tab.addEventListener("click", () => { projectTab = tab.dataset.projectTab as "overview" | "milestones"; renderApp(); }));
   const project = state.projects.find((item) => item.id === selectedProjectId); if (!project) return;
