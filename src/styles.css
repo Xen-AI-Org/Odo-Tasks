@@ -36,28 +36,41 @@ kbd { color: #716e67; font: 11px/1.2 ui-monospace, "Cascadia Code", monospace; w
 
 #app {
   display: grid;
-  grid-template: 100% / 246px minmax(300px, 1fr) minmax(0, 1fr);
+  grid-template: 100% / 275px minmax(300px, 1fr) minmax(0, 1fr);
   min-width: 1000px;
   background: #fff;
   transition: grid-template-columns 180ms ease;
 }
-#app.view-inbox { grid-template: 100% / minmax(180px, 20%) minmax(180px, 20%) minmax(200px, 20%) minmax(380px, 40%); }
+#app.view-inbox { grid-template: 100% / 275px minmax(180px, 20%) minmax(380px, 1fr) 300px; }
 .folders-panel, .notes-panel, .editor-panel, .tasks-mini, .wide-view { min-width: 0; min-height: 0; }
 .folders-panel { display: flex; flex-direction: column; overflow: hidden; background: var(--warm); border-right: 1px solid var(--line); transition: opacity 160ms ease, transform 180ms ease; }
 .notes-panel { display: flex; flex-direction: column; overflow: hidden; background: #fdfcf9; border-right: 1px solid var(--line); transition: opacity 160ms ease; }
-.tasks-mini { display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--line); background: #f8f6f1; }
-.tasks-mini-header { flex: 0 0 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border-bottom: 1px solid var(--line); }
-.tasks-mini-header h2 { margin: 0; font: 400 clamp(15px, 1.2vw, 18px) Georgia, serif; }
-.tasks-mini-header span { color: var(--muted); font-size: clamp(11px, 0.85vw, 13px); }
-.tasks-mini-list { flex: 1; overflow-y: auto; padding: 10px; }
-.tasks-mini-category { margin-bottom: 14px; }
-.tasks-mini-category h3 { margin: 0 0 6px; color: var(--muted); font-size: clamp(10px, 0.8vw, 11.5px); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
-.tasks-empty { margin: 0; color: var(--muted); font-size: clamp(10px, 0.8vw, 12px); font-style: italic; }
+.tasks-mini { display: flex; flex-direction: column; overflow: hidden; padding: 14px 0 0; border: 1px solid #edeae2; border-radius: 14px; background: #fff; box-shadow: 0 4px 18px rgba(40,35,25,.04); }
+.tasks-mini-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; padding: 0 16px 12px; border-bottom: 1px solid #f1efe9; }
+.tasks-mini-header h2 { margin: 0; font: 500 14px Georgia, serif; color: #2d2b27; }
+.tasks-mini-header span { color: var(--muted); font-size: 11px; }
+.tasks-mini-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; padding: 2px 0 10px; }
+.tasks-empty { margin: 0; padding: 18px 16px; color: var(--muted); font-size: 12px; font-style: italic; text-align: center; }
+.mini-task { position: relative; display: grid; grid-template-columns: 17px minmax(0,1fr) 6px 20px; align-items: center; gap: 8px; padding: 7px 16px; background: transparent; cursor: grab; transition: background 120ms ease; }
+.mini-task::after { content: ""; position: absolute; left: 15%; right: 15%; bottom: 0; height: 1px; background: #f0ede6; }
+.mini-task:last-child::after { display: none; }
+.mini-task:hover { background: #faf9f6; }
+.mini-task:active { cursor: grabbing; }
+.mini-task.is-complete { opacity: .5; }
+.mini-task-check { width: 15px; height: 15px; display: grid; place-items: center; border: 1.5px solid #c9c4bb; border-radius: 5px; color: transparent; font-size: 9px; transition: background 140ms ease, border-color 140ms ease; }
+.mini-task-check:hover { border-color: #b78308; }
+.mini-task.is-complete .mini-task-check { border-color: var(--green); background: var(--green); color: #fff; }
+.mini-task-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: #3a3833; }
+.mini-task.is-complete .mini-task-text { text-decoration: line-through; color: #9a958c; }
+.mini-task-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--category, #ccc); }
+.mini-task-more { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 5px; color: #aaa59c; font-size: 13px; opacity: 0; transition: opacity 120ms ease, background 120ms ease; }
+.mini-task:hover .mini-task-more, .mini-task:focus-within .mini-task-more { opacity: 1; }
+.mini-task-more:hover { background: rgba(0,0,0,.07); }
 .editor-panel { display: grid; grid-template-rows: 68px 50px minmax(0, 1fr); position: relative; overflow: hidden; background: var(--paper); }
 .wide-view { grid-column: 2 / 4; overflow-y: auto; background: #fbfaf7; animation: rise-in 180ms ease-out; }
-#app.view-inbox.sidebar-collapsed { grid-template-columns: 48px minmax(180px, 20%) minmax(200px, 20%) minmax(380px, 40%); }
-#app.sidebar-collapsed { grid-template-columns: 48px minmax(300px, 1fr) minmax(0, 1fr); }
-#app.sidebar-collapsed .folders-panel { width: 48px; }
+#app.view-inbox.sidebar-collapsed { grid-template-columns: 275px minmax(180px, 20%) minmax(380px, 1fr) 300px; }
+#app.sidebar-collapsed { grid-template-columns: 275px minmax(300px, 1fr) minmax(0, 1fr); }
+#app.sidebar-collapsed .folders-panel { width: 275px; }
 #app.sidebar-collapsed .folders-panel .wordmark,
 #app.sidebar-collapsed .folders-panel .primary-link span,
 #app.sidebar-collapsed .folders-panel .primary-link kbd,
@@ -77,7 +90,7 @@ kbd { color: #716e67; font: 11px/1.2 ui-monospace, "Cascadia Code", monospace; w
 #app.sidebar-collapsed .folders-panel .primary-nav { padding: 2px 4px 10px; }
 #app.sidebar-collapsed .folders-panel .library-links { padding: 0 4px; }
 #app.sidebar-collapsed .folders-panel .settings-link { justify-content: center; }
-#app.view-inbox.focus-mode { grid-template-columns: 0 0 0 minmax(0, 1fr); }
+#app.view-inbox.focus-mode { grid-template-columns: 0 0 minmax(0, 1fr) 0; }
 #app.focus-mode { grid-template-columns: 0 0 minmax(0, 1fr); }
 #app.focus-mode .folders-panel, #app.focus-mode .notes-panel, #app.focus-mode .tasks-mini { opacity: 0; pointer-events: none; }
 #app.view-inbox.focus-mode .tasks-mini { opacity: 0; pointer-events: none; }
@@ -513,6 +526,7 @@ html.no-motion *, html.no-motion *::before, html.no-motion *::after { scroll-beh
 .planner-tabs button { flex: 1; height: 30px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--muted); font-size: clamp(12px, 0.9vw, 14px); font-weight: 400; cursor: pointer; }
 .planner-tabs button.is-active { background: var(--sun-soft); color: var(--ink); border-color: #d9c47a; }
 .calendar-task .calendar-task-content strong { font-size: clamp(13px, 1vw, 16px); }
+.calendar-task .task-edit-input { width: 100%; height: 24px; padding: 0 5px; border: 1px solid #d5ab43; border-radius: 4px; outline: 0; background: #fffdf7; font-size: clamp(12px, 0.9vw, 14px); box-sizing: border-box; }
 .calendar-task .calendar-task-content small { font-size: clamp(11px, 0.85vw, 13px); }
 .time-axis span { font-size: clamp(10px, 0.8vw, 12px); }
 html.is-planner-dragging,html.is-planner-dragging *{cursor:grabbing!important;user-select:none!important;-webkit-user-select:none!important}
@@ -552,3 +566,21 @@ html.is-note-dragging,html.is-note-dragging *{cursor:grabbing!important;user-sel
 @media (max-width:980px) and (min-width:661px){.journal-view{padding:36px 24px 70px}.journal-header{align-items:flex-start;flex-direction:column;gap:16px}.journal-actions{width:100%;display:grid;grid-template-columns:auto auto auto minmax(135px,1fr);justify-content:stretch}.journal-actions input{width:100%;min-width:0}.journal-actions .primary-button{grid-column:1 / -1;width:100%;margin-left:0;justify-content:center}.journal-status{margin-top:-10px}}
 @media (max-width:930px) and (min-width:661px){#app.view-journal{min-width:0;grid-template-columns:205px minmax(0,1fr)}#app.view-journal .journal-view{grid-column:2}.view-journal .notes-panel{display:none}}
 @media(max-width:760px){.journal-view{grid-column:1;padding:25px 16px 60px}.journal-header{align-items:start;flex-direction:column;gap:16px}.journal-header h1{font-size:36px}.journal-actions{justify-content:flex-start}.journal-actions input{max-width:137px}.journal-card-header{padding:16px 16px 7px 19px}.journal-card h2{font-size:17px}.journal-card-meta time{display:none}.journal-card-preview{padding:3px 16px 16px 19px}.journal-card-preview span{display:none}.journal-expanded{grid-template-columns:17px minmax(0,1fr);padding:9px 16px 22px}.journal-editor-wrap{padding-left:7px}.journal-session-rail small{display:none}.journal-rich-editor{min-height:300px;font-size:14px}}
+
+#task-detail-overlay { display: none; position: fixed; inset: 0; z-index: 100; align-items: center; justify-content: center; background: rgba(35, 32, 25, .45); }
+#task-detail-overlay.is-open { display: flex; }
+.task-detail { width: min(820px, 94vw); max-height: 92vh; display: flex; flex-direction: column; overflow: hidden; border-radius: 16px; background: #fff; box-shadow: 0 24px 70px rgba(24, 21, 14, .35); }
+.task-detail-header { flex: 0 0 auto; display: flex; align-items: center; gap: 12px; padding: 20px 24px 16px; border-bottom: 1px solid var(--line); }
+#task-detail-title { flex: 1; min-width: 0; padding: 0; border: 0; outline: 0; background: transparent; color: #292824; font: 500 28px/1.15 Georgia, "Times New Roman", serif; letter-spacing: -0.8px; white-space: pre-wrap; overflow-x: auto; }
+.task-detail-header .icon-button { width: 34px; height: 34px; }
+.task-detail-body { flex: 1; overflow-y: auto; padding: 22px 24px 32px; }
+.task-detail-properties { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+.task-property { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
+.task-property span { text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+.task-property select, .task-property input[type="color"], .task-property input[type="datetime-local"] { min-width: 0; height: 34px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: #3a3833; font: 13px inherit; }
+.task-property input[type="color"] { padding: 2px; }
+.task-detail-toolbar { display: flex; align-items: center; gap: 1px; padding: 0 4px 10px; color: #504e48; }
+.task-detail-toolbar .icon-button { width: 32px; height: 32px; border-radius: 6px; font-size: 16px; }
+.task-detail-toolbar .icon-button:hover { background: #f1efeb; }
+.task-detail-editor { min-height: 260px; padding: 12px 0 28px; color: #373530; font-size: 15px; line-height: 1.72; outline: 0; }
+.task-detail-editor img { max-width: 100%; border-radius: 8px; box-shadow: 0 2px 8px rgba(40,35,25,.08); }

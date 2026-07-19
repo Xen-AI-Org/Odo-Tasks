@@ -10,7 +10,7 @@ type SortMode = "newest" | "oldest" | "manual";
 type Folder = { id: string; name: string; parentId: string | null; open: boolean; icon?: string };
 type Note = { id: string; folderId: string; title: string; content: string; updated: string; status: NoteStatus; pinned?: boolean; revision: number };
 type Priority = "low" | "medium" | "high" | "urgent";
-type Todo = { id: string; text: string; completed: boolean; created: string; updated: string; categoryId: string; priority: Priority; effort: number; color: string; scheduledStart: string | null; durationMinutes: number };
+type Todo = { id: string; text: string; completed: boolean; created: string; updated: string; categoryId: string; priority: Priority; effort: number; color: string; scheduledStart: string | null; durationMinutes: number; status: string; content: string };
 type TodoCategory = { id: string; name: string; color: string; icon?: string };
 type JournalEntry = { id: string; dateKey: string; content: string; created: string; updated: string };
 type PlannerView = "1" | "3" | "4" | "7";
@@ -68,7 +68,7 @@ function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Works
   const notes = (Array.isArray(input?.notes) ? input.notes : fallback.notes).map((note) => ({ ...note, revision: note.revision ?? 0 }));
   const sortMode: SortMode = input?.sortMode === "manual" || input?.sortMode === "oldest" ? input.sortMode : "newest";
   const categories = Array.isArray(input?.todoCategories) && input.todoCategories.length ? input.todoCategories : [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }];
-  const todos = (Array.isArray(input?.todos) ? input.todos : []).map((todo) => ({ ...todo, categoryId: todo.categoryId || "inbox", priority: (todo.priority || "medium") as Priority, effort: todo.effort || 2, color: todo.color || "", scheduledStart: todo.scheduledStart || null, durationMinutes: todo.durationMinutes || 30 }));
+  const todos = (Array.isArray(input?.todos) ? input.todos : []).map((todo) => ({ ...todo, categoryId: todo.categoryId || "inbox", priority: (todo.priority || "medium") as Priority, effort: todo.effort || 2, color: todo.color || "", scheduledStart: todo.scheduledStart || null, durationMinutes: todo.durationMinutes || 30, status: todo.status || "todo", content: todo.content || "" }));
   const plannerView: PlannerView = ["1", "3", "4", "7"].includes(input?.plannerView || "") ? input!.plannerView as PlannerView : "3";
   const journalEntries = (Array.isArray(input?.journalEntries) ? input.journalEntries : []).filter((entry): entry is JournalEntry => !!entry && typeof entry.dateKey === "string").map((entry) => ({ id: entry.id || uid("journal"), dateKey: entry.dateKey, content: entry.content || "", created: entry.created || now(), updated: entry.updated || entry.created || now() }));
   const pins = (Array.isArray(input?.pins) ? input.pins : fallback.pins).filter((pin): pin is Pin => !!pin && typeof pin.id === "string" && ["note", "task", "folder"].includes(pin.type));
@@ -115,6 +115,7 @@ let folderDropInsertion: "before" | "after" | "inside" = "inside";
 let dragImage: HTMLElement | null = null;
 let plannerDate = new Date(); plannerDate.setHours(0, 0, 0, 0);
 let taskMenuTodoId = "";
+let taskDetailId = "";
 let plannerPopover: { x: number; y: number; returnId: string } | null = null;
 let plannerPointerDragging = false;
 let plannerPointerDrop: { date: string; minute: number } | null = null;
@@ -125,6 +126,8 @@ let pinPickerQuery = "";
 let selectedJournalDate = "";
 let journalOpening = false;
 let journalSaveTimer = 0;
+let taskDetailSaveTimer = 0;
+let activeRichEditor: HTMLElement | null = null;
 
 const commands = [
   { label: "Text", detail: "Just start writing.", icon: "ph-text-t", value: "" },
@@ -257,10 +260,26 @@ function renderSidebar() {
     <div class="panel-label-row"><span>Folders</span><button class="icon-button" id="new-folder" title="New folder (${modLabel}+Shift+N)"><i class="ph ph-plus"></i></button></div><nav class="folder-tree" id="folder-tree">${state.folders.filter((folder) => folder.parentId === null && folder.id !== "inbox").map((folder) => renderFolder(folder)).join("")}</nav>
     <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
 }
+function renderMiniTodo(todo: Todo) { const category = categoryFor(todo); return `<article class="mini-task ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="mini-task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><span class="mini-task-text">${escapeHtml(todo.text)}</span><span class="mini-task-dot" style="--category:${attr(todo.color||category.color)}"></span><button class="mini-task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
 function renderTasksMini() {
   const tasks = state.todos.filter((todo) => !todo.completed && !todo.scheduledStart);
-  return `<aside class="tasks-mini"><header class="tasks-mini-header"><h2>Tasks</h2><span>${tasks.length}</span></header><div class="tasks-mini-list">${state.todoCategories.map((category) => { const categoryTasks = tasks.filter((todo) => todo.categoryId === category.id); return `<section class="tasks-mini-category"><h3>${escapeHtml(category.name)}</h3>${categoryTasks.map(renderPlannerTodo).join("") || '<p class="tasks-empty">No open tasks</p>'}</section>`; }).join("")}</div></aside>`;
+  return `<aside class="tasks-mini"><header class="tasks-mini-header"><h2>Tasks</h2><span>${tasks.length}</span></header><div class="tasks-mini-list">${tasks.length ? tasks.map(renderMiniTodo).join("") : '<p class="tasks-empty">No open tasks</p>'}</div></aside>`;
 }
+function renderTaskDetail() {
+  if (!taskDetailId) return "";
+  const todo = state.todos.find((item) => item.id === taskDetailId);
+  if (!todo) return "";
+  const category = categoryFor(todo);
+  const statusOptions = ["todo", "in_progress", "review", "planning", "done"];
+  const priorityOptions = ["low", "medium", "high", "urgent"];
+  const effortOptions = [1, 2, 3, 4, 5];
+  const durationOptions = [15, 30, 45, 60, 90, 120, 150, 180, 240];
+  const select = (prop: string, options: (string | number)[], selected: string | number) => `<select data-task-prop="${attr(prop)}">${options.map((o) => `<option value="${attr(String(o))}" ${o === selected ? "selected" : ""}>${escapeHtml(String(o))}</option>`).join("")}</select>`;
+  const categories = state.todoCategories.map((c) => `<option value="${attr(c.id)}" ${c.id === todo.categoryId ? "selected" : ""}>${escapeHtml(c.name)}</option>`).join("");
+  return `<div id="task-detail-overlay" class="is-open" aria-modal="true" role="dialog" aria-label="Task details"><div class="task-detail"><header class="task-detail-header"><div class="task-detail-title" id="task-detail-title" data-title-editor contenteditable="true" role="textbox" aria-multiline="false" aria-label="Task title" spellcheck="true">${linkedPlainText(todo.text) || "<br>"}</div><button class="icon-button" id="close-task-detail" aria-label="Close task detail"><i class="ph ph-x"></i></button></header><div class="task-detail-body"><div class="task-detail-properties"><label class="task-property"><span>Status</span>${select("status", statusOptions, todo.status)}</label><label class="task-property"><span>Priority</span>${select("priority", priorityOptions, todo.priority)}</label><label class="task-property"><span>Effort</span>${select("effort", effortOptions, todo.effort)}</label><label class="task-property"><span>Category</span><select data-task-prop="categoryId">${categories}</select></label><label class="task-property"><span>Color</span><input type="color" data-task-prop="color" value="${attr(todo.color || category.color)}"></label><label class="task-property"><span>Schedule</span><input type="datetime-local" data-task-prop="scheduledStart" value="${todo.scheduledStart ? todo.scheduledStart.slice(0, 16) : ""}"></label><label class="task-property"><span>Duration</span>${select("durationMinutes", durationOptions, todo.durationMinutes)}</label></div><div class="task-detail-toolbar"><button class="icon-button" data-block="H1" title="Heading 1">H₁</button><button class="icon-button" data-block="H2" title="Heading 2">H₂</button><button class="icon-button" data-block="H3" title="Heading 3">H₃</button><span></span><button class="icon-button" data-rich-command="bold" title="Bold">B</button><button class="icon-button" data-rich-command="italic" title="Italic">I</button><button class="icon-button" data-rich-command="strikeThrough" title="Strike">S</button><span></span><button class="icon-button" data-block="UL" title="Bulleted list"><i class="ph ph-list-bullets"></i></button><button class="icon-button" data-rich-command="link" title="Add link"><i class="ph ph-link"></i></button><button class="icon-button" data-block="PRE" title="Code block"><i class="ph ph-code"></i></button></div><div id="task-detail-editor" class="rich-editor task-detail-editor" data-rich-editor contenteditable="true" role="textbox" aria-multiline="true" aria-label="Task description" spellcheck="true">${markdownToRich(todo.content)}</div></div></div></div>`;
+}
+function openTaskDetail(id: string) { taskMenuTodoId = ""; plannerPopover = null; taskDetailId = id; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLElement>("#task-detail-title")?.focus()); }
+function closeTaskDetail() { taskDetailId = ""; renderApp(); }
 function renderNotesPanel() {
   const ordering = state.sortMode === "manual" ? "manual order" : state.sortMode === "newest" ? "newest first" : "oldest first";
   return `<section class="notes-panel"><div class="global-bar"><label class="search-box"><i class="ph ph-magnifying-glass"></i><input id="search-input" type="search" placeholder="Search notes..." value="${attr(searchQuery)}"><kbd>${modLabel}+K</kbd></label><button class="new-note-button" id="new-note" title="New note (${modLabel}+N)"><i class="ph ph-note-pencil"></i></button></div><header class="notes-header"><div><strong id="note-list-title">${escapeHtml(viewTitle())}</strong><span id="note-count">${visibleNotes().length} notes · ${ordering}</span></div><button class="sort-button" id="list-menu" title="Change note order" aria-label="Change note order"><i class="ph ph-dots-three"></i></button></header><div class="note-list" id="note-list" tabindex="-1">${renderNoteRows()}</div></section>`;
@@ -369,6 +388,7 @@ function inlineMarkdown(markdown: string): string {
   // Escape first: documents are always modelled as text/semantic tags, never pasted HTML.
   let html = escapeHtml(markdown);
   html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1">');
   html = html.replace(/\[([^\]]+)\]\(([^\s)]+)\)/g, '<a href="$2" rel="noopener noreferrer">$1</a>');
   html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   html = html.replace(/~~([^~]+)~~/g, "<s>$1</s>");
@@ -402,6 +422,7 @@ function richInlineMarkdown(node: Node): string {
   if (node.tagName === "EM" || node.tagName === "I") return `_${inner}_`;
   if (node.tagName === "S" || node.tagName === "DEL" || node.tagName === "STRIKE") return `~~${inner}~~`;
   if (node.tagName === "CODE") return `\`${inner}\``;
+  if (node.tagName === "IMG") return `![${node.getAttribute("alt") || ""}](${node.getAttribute("src") || ""})`;
   if (node.tagName === "A") return node.hasAttribute("data-auto-link") ? inner : `[${inner}](${node.getAttribute("href") || "url"})`;
   if (node.tagName === "BR") return "\n";
   return inner;
@@ -446,13 +467,13 @@ function createTaskList(): HTMLElement { const list = document.createElement("ul
 function createTaskItem(): HTMLElement { const holder = document.createElement("template"); holder.innerHTML = richTask("", false); return holder.content.firstElementChild as HTMLElement; }
 function replaceRichBlock(editor: HTMLElement, next: HTMLElement) { const block = currentRichBlock(editor); if (block) block.replaceWith(next); else editor.append(next); const label = next.querySelector<HTMLElement>(".rich-task-label"); if (label) placeCaretInTaskLabel(label); else placeCaretEnd(next); }
 function applyRichBlock(type: RichBlock) {
-  const editor = document.querySelector<HTMLElement>("[data-rich-editor]"); if (!editor) return; editor.focus(); const block = currentRichBlock(editor); if (type === "UL" || type === "OL") { document.execCommand(type === "UL" ? "insertUnorderedList" : "insertOrderedList"); updateRichNote(editor); return; }
+  const editor = activeRichEditor ?? document.querySelector<HTMLElement>("[data-rich-editor]"); if (!editor) return; editor.focus(); const block = currentRichBlock(editor); if (type === "UL" || type === "OL") { document.execCommand(type === "UL" ? "insertUnorderedList" : "insertOrderedList"); (editor.id === "task-detail-editor" ? updateTaskContent : updateRichNote)(editor); return; }
   if (type === "PRE") { const pre = document.createElement("pre"); const code = document.createElement("code"); code.textContent = block?.textContent || ""; pre.append(code); replaceRichBlock(editor, pre); }
   else { document.execCommand("formatBlock", false, type); }
-  updateRichNote(editor);
+  (editor.id === "task-detail-editor" ? updateTaskContent : updateRichNote)(editor);
 }
-function applyRichInline(command: string) { const editor = document.querySelector<HTMLElement>("[data-rich-editor]"); if (!editor) return; editor.focus(); if (command === "link") { const href = "https://"; document.execCommand("createLink", false, href); } else document.execCommand(command); updateRichNote(editor); }
-function makeCurrentTask(editor: HTMLElement) { const list = createTaskList(); const item = createTaskItem(); list.append(item); replaceRichBlock(editor, list); updateRichNote(editor); }
+function applyRichInline(command: string) { const editor = activeRichEditor ?? document.querySelector<HTMLElement>("[data-rich-editor]"); if (!editor) return; editor.focus(); if (command === "link") { const href = "https://"; document.execCommand("createLink", false, href); } else document.execCommand(command); (editor.id === "task-detail-editor" ? updateTaskContent : updateRichNote)(editor); }
+function makeCurrentTask(editor: HTMLElement) { const list = createTaskList(); const item = createTaskItem(); list.append(item); replaceRichBlock(editor, list); (editor.id === "task-detail-editor" ? updateTaskContent : updateRichNote)(editor); }
 function renderEditor() {
   const note = selectedNote();
   if (!note) return `<main class="editor-panel empty-editor"><div class="app-actions"><span id="save-status"></span></div><div class="editor-empty"><span class="empty-icon"><i class="ph ph-note-pencil"></i></span><h2>No note selected</h2><p>Select a note, or start with a fresh page.</p><button class="primary-button" data-create-note>New note <kbd>${modLabel}+N</kbd></button></div></main>`;
@@ -486,7 +507,7 @@ function renderCalendarDayHeader(date: Date) {
   return `<div class="calendar-day-header ${today ? "is-today" : ""}"><div class="calendar-day-label"><span>${date.toLocaleDateString(undefined, { weekday: "short" })}</span><strong>${date.getDate()}</strong></div>${taskLines ? `<div class="day-task-lines">${taskLines}</div>` : ""}</div>`;
 }
 function renderCalendarColumn(date: Date) { const key=dateKey(date); const nowDate=new Date(); const isToday=key===dateKey(nowDate); const tasks=state.todos.filter(todo=>todo.scheduledStart && dateKey(new Date(todo.scheduledStart))===key); const slots=Array.from({length:48},(_,i)=>`<div class="calendar-slot" data-slot-date="${key}" data-slot-minute="${i*30}"></div>`).join(""); const current=isToday?`<div class="now-line" style="top:${(nowDate.getHours()*60+nowDate.getMinutes())/30*slotHeight}px"><span>Now</span></div>`:""; return `<div class="calendar-column" data-calendar-date="${key}">${slots}${tasks.map(renderCalendarTask).join("")}${current}</div>`; }
-function renderCalendarTask(todo: Todo) { const start=taskTime(todo)!; const category=categoryFor(todo); const minutes=start.getHours()*60+start.getMinutes(); const top=minutes/30*slotHeight; const height=Math.max(slotHeight,todo.durationMinutes/30*slotHeight); const ending=new Date(start.getTime()+todo.durationMinutes*60000); return `<article class="calendar-task ${todo.completed?"is-complete":""}" data-calendar-task="${attr(todo.id)}" data-todo-id="${attr(todo.id)}" tabindex="0" role="button" style="top:${top}px;height:${height}px;--task-color:${attr(todo.color||category.color)}"><div class="calendar-task-content"><span class="priority-band ${todo.priority}"></span><button class="calendar-check" data-toggle-todo="${attr(todo.id)}" aria-label="Complete task"><i class="ph ph-check"></i></button><div><small>${start.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})} – ${ending.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}</small><strong>${escapeHtml(todo.text)}</strong></div></div><span class="calendar-resize" data-resize-todo="${attr(todo.id)}" title="Resize duration"></span></article>`; }
+function renderCalendarTask(todo: Todo) { const start=taskTime(todo)!; const category=categoryFor(todo); const minutes=start.getHours()*60+start.getMinutes(); const top=minutes/30*slotHeight; const height=Math.max(slotHeight,todo.durationMinutes/30*slotHeight); const ending=new Date(start.getTime()+todo.durationMinutes*60000); const titleField = editingTodoId === todo.id ? `<input type="text" class="task-edit-input" data-edit-todo="${attr(todo.id)}" value="${attr(todo.text)}" autocomplete="off" placeholder="Task name">` : `<strong>${escapeHtml(todo.text)}</strong>`; return `<article class="calendar-task ${todo.completed?"is-complete":""}" data-calendar-task="${attr(todo.id)}" data-todo-id="${attr(todo.id)}" tabindex="0" role="button" style="top:${top}px;height:${height}px;--task-color:${attr(todo.color||category.color)}"><div class="calendar-task-content"><span class="priority-band ${todo.priority}"></span><button class="calendar-check" data-toggle-todo="${attr(todo.id)}" aria-label="Complete task"><i class="ph ph-check"></i></button><div><small>${start.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})} – ${ending.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}</small>${titleField}</div></div><span class="calendar-resize" data-resize-todo="${attr(todo.id)}" title="Resize duration"></span></article>`; }
 function renderPlannerProperties(todo: Todo) { const category=categoryFor(todo); const popover=plannerPopover ?? {x:window.innerWidth-315,y:90,returnId:todo.id}; return `<div class="planner-properties-backdrop"><section class="planner-properties" role="dialog" aria-modal="false" aria-label="Task properties" tabindex="-1" style="left:${popover.x}px;top:${popover.y}px"><header><div><span class="eyebrow">Task properties</span><h2>${escapeHtml(todo.text)}</h2></div><button class="icon-button" data-close-properties aria-label="Close"><i class="ph ph-x"></i></button></header><label>Category<select data-prop="categoryId">${state.todoCategories.map(c=>`<option value="${attr(c.id)}" ${c.id===todo.categoryId?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</select></label><div class="property-two"><label>Priority<select data-prop="priority">${["low","medium","high","urgent"].map(p=>`<option ${p===todo.priority?"selected":""}>${p}</option>`).join("")}</select></label><label>Effort<select data-prop="effort">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===todo.effort?"selected":""}>${n} / 5</option>`).join("")}</select></label></div><label>Color<input data-prop="color" type="color" value="${attr(todo.color||category.color)}"></label><label>Start<input data-prop="scheduledStart" type="datetime-local" value="${todo.scheduledStart?todo.scheduledStart.slice(0,16):""}"></label><label>Duration<select data-prop="durationMinutes">${[15,30,45,60,90,120,150,180,240].map(n=>`<option value="${n}" ${n===todo.durationMinutes?"selected":""}>${n} minutes</option>`).join("")}</select></label><footer><button class="secondary-button" data-unschedule>Unschedule</button><button class="secondary-button ${todo.completed?"":""}" data-toggle-todo="${attr(todo.id)}">${todo.completed?"Reopen":"Complete"}</button><button class="danger-button" data-delete-todo="${attr(todo.id)}">Delete</button></footer></section></div>`; }
 
 function journalDateLabel(key: string) { const date = new Date(`${key}T12:00:00`); return date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" }); }
@@ -589,8 +610,8 @@ function renderApp() {
   const plannerScrollPosition = previousPlannerScroll ? { top: previousPlannerScroll.scrollTop, left: previousPlannerScroll.scrollLeft } : null;
   const isInbox = currentView === "notes" && state.selectedFolderId === "inbox";
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}${isInbox ? " view-inbox" : ""}`;
-  const content = currentView === "tasks" ? renderTasks() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : (isInbox ? renderTasksMini() : "") + renderNotesPanel() + renderEditor();
-  app.innerHTML = `${renderSidebar()}${content}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
+  const content = currentView === "tasks" ? renderTasks() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
+  app.innerHTML = `${renderSidebar()}${content}${renderTaskDetail()}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
   updateSaveStatus(); bindEvents(); bindOdoDialog();
   if (currentView === "tasks") {
     const plannerScroll = document.querySelector<HTMLElement>("#calendar-scroll");
@@ -752,7 +773,7 @@ async function performMenuAction(action: string) {
     const todo = state.todos.find((item) => item.id === id); if (!todo) return;
     if (verb === "toggle") todo.completed = !todo.completed;
     if (verb === "edit") { editingTodoId = todo.id; renderApp(); focusTodoEditor(todo.id); return; }
-    if (verb === "duplicate") state.todos.push({ ...todo, id: uid("todo"), text: `${todo.text} copy`, created: now(), updated: now() });
+    if (verb === "duplicate") state.todos.push({ ...todo, id: uid("todo"), text: `${todo.text} copy`, created: now(), updated: now(), status: todo.status, content: todo.content });
     if (verb === "delete") { if (!await confirmOdo("Delete task?", `“${todo.text}” will be removed from your task list.`, "Delete task", true)) return; state.todos = state.todos.filter((item) => item.id !== todo.id); }
     todo.updated = now(); await saveState(false); renderApp();
   }
@@ -764,9 +785,10 @@ async function exportNote(note: Note) {
 
 function toggleTodo(id: string) { const todo = state.todos.find((item) => item.id === id); if (!todo) return; todo.completed = !todo.completed; todo.updated = now(); void saveState(false); renderApp(); }
 function focusTodoEditor(id: string) { requestAnimationFrame(() => { const input = document.querySelector<HTMLInputElement>(`[data-edit-todo="${CSS.escape(id)}"]`); input?.focus(); input?.select(); }); }
-function commitTodoEdit(input: HTMLInputElement) { const todo = state.todos.find((item) => item.id === input.dataset.editTodo); if (!todo) return; const text = input.value.trim(); if (text) { todo.text = text; todo.updated = now(); } editingTodoId = ""; void saveState(false); renderApp(); }
+function commitTodoEdit(input: HTMLInputElement) { const todo = state.todos.find((item) => item.id === input.dataset.editTodo); if (!todo) return; const text = input.value.trim(); if (text) { todo.text = text; todo.updated = now(); } else { state.todos = state.todos.filter((item) => item.id !== todo.id); } editingTodoId = ""; void saveState(false); renderApp(); }
 function updateSlashMenu() { const menu = document.querySelector<HTMLElement>("#slash-menu"); if (!menu) return; menu.classList.toggle("is-open", slashOpen); menu.querySelectorAll(".slash-command").forEach((item, index) => item.classList.toggle("is-active", index === slashIndex)); }
 function insertCommand(index: number) { const editor = document.querySelector<HTMLElement>("[data-rich-editor]"); if (!editor) return; slashOpen = false; updateSlashMenu(); const value = commands[index].value; if (value === "## ") applyRichBlock("H2"); else if (value === "- [ ] ") makeCurrentTask(editor); else if (value === "- ") applyRichBlock("UL"); else if (value === "> ") applyRichBlock("BLOCKQUOTE"); else if (value.includes("```")) applyRichBlock("PRE"); else { const block = currentRichBlock(editor) ?? editor.appendChild(document.createElement("p")); block.textContent = ""; placeCaretEnd(block); } }
+function updateTaskContent(editor: HTMLElement) { const todo = state.todos.find((item) => item.id === taskDetailId); if (!todo) return; todo.content = richToMarkdown(editor); todo.updated = now(); clearTimeout(taskDetailSaveTimer); taskDetailSaveTimer = window.setTimeout(() => void saveState(false), 350); }
 function updateRichNote(editor: HTMLElement) {
   const note = selectedNote(); if (!note || note.status !== "active") return;
   note.content = richToMarkdown(editor); note.updated = now(); const count = document.querySelector<HTMLElement>("#word-count"); if (count) count.textContent = `${wordCount(note.content)} words`; scheduleSave(); updateSelectedRowPreview();
@@ -803,9 +825,10 @@ function handleRichKeydown(event: KeyboardEvent, update = updateRichNote) {
 }
 function bindRichEditor(editor: HTMLElement, update: (element: HTMLElement) => void) {
   editor.addEventListener("input", (event) => { transformMarkdownShortcut(editor); if (shouldRefreshAutoLinks(event as InputEvent)) refreshAutoLinks(editor); update(editor); }); editor.addEventListener("keydown", (event) => handleRichKeydown(event, update)); editor.addEventListener("change", (event) => { const checkbox = (event.target as HTMLElement).closest<HTMLInputElement>(".rich-task-check"); if (checkbox) toggleRichTask(checkbox, update); else update(editor); });
+  editor.addEventListener("focusin", () => { activeRichEditor = editor; });
   editor.addEventListener("blur", () => { refreshAutoLinks(editor); update(editor); });
   editor.addEventListener("click", (event) => { const target = event.target as HTMLElement; const checkbox = target.closest<HTMLInputElement>(".rich-task-check"); if (checkbox) window.setTimeout(() => toggleRichTask(checkbox, update)); const anchor = target.closest<HTMLAnchorElement>("a[href]"); if (anchor) { event.preventDefault(); void openRichLink(anchor); } });
-  editor.addEventListener("paste", (event) => { event.preventDefault(); const text = event.clipboardData?.getData("text/plain") ?? ""; document.execCommand("insertText", false, text); });
+  editor.addEventListener("paste", (event) => { const data = event.clipboardData; if (!data) return; const image = [...data.files].find((f) => f.type.startsWith("image/")) ?? [...data.items].filter((i) => i.kind === "file").map((i) => i.getAsFile()).find((f) => f && f.type.startsWith("image/")); if (image) { event.preventDefault(); const reader = new FileReader(); reader.onload = () => { const img = document.createElement("img"); img.src = reader.result as string; img.alt = image.name; const selection = window.getSelection(); if (selection && selection.rangeCount) { const range = selection.getRangeAt(0); range.deleteContents(); range.insertNode(img); range.setStartAfter(img); range.collapse(true); selection.removeAllRanges(); selection.addRange(range); } update(editor); }; reader.readAsDataURL(image); return; } event.preventDefault(); const text = data.getData("text/plain") ?? ""; document.execCommand("insertText", false, text); });
 }
 
 async function openDetachedNote(note: Note) {
@@ -1276,10 +1299,29 @@ function bindEvents() {
     button.addEventListener("click", () => { const pin = { id: button.dataset.pinId!, type: button.dataset.pinType as PinType }; openPin(pin); });
     button.addEventListener("contextmenu", (event) => { event.preventDefault(); unpinItem(button.dataset.pinId!, button.dataset.pinType as PinType); });
   });
-  bindTaskEvents(); bindJournalEvents(); bindSettingsEvents();
-  document.querySelectorAll<HTMLElement>(".tasks-mini .planner-task-card").forEach((row) => { row.addEventListener("click", (event) => { if ((event.target as HTMLElement).closest("button")) return; setView("tasks"); }); });
+  bindTaskEvents(); bindTaskDetailEvents(); bindJournalEvents(); bindSettingsEvents();
+  document.querySelectorAll<HTMLElement>(".mini-task[data-todo-id]").forEach((row) => { row.addEventListener("click", (event) => { if (plannerPointerDragging || (event.target as HTMLElement).closest("button")) return; openTaskDetail(row.dataset.todoId!); }); row.addEventListener("contextmenu", (event) => { event.preventDefault(); openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("keydown", handleTaskKeydown); });
   document.querySelector("#close-help")?.addEventListener("click", () => { helpOpen = false; renderApp(); });
   document.querySelector("#help-overlay")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) { helpOpen = false; renderApp(); } });
+}
+function bindTaskDetailEvents() {
+  document.querySelector("#close-task-detail")?.addEventListener("click", closeTaskDetail);
+  document.querySelector("#task-detail-overlay")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closeTaskDetail(); });
+  const title = document.querySelector<HTMLElement>("#task-detail-title");
+  if (title) bindTitleEditor(title, (value) => { const todo = state.todos.find((item) => item.id === taskDetailId); if (!todo) return; todo.text = value; todo.updated = now(); clearTimeout(taskDetailSaveTimer); taskDetailSaveTimer = window.setTimeout(() => void saveState(false), 350); }, () => { const editor = document.querySelector<HTMLElement>("#task-detail-editor"); if (editor) placeCaretEnd(editor.lastElementChild as HTMLElement ?? editor); }, closeTaskDetail);
+  const editor = document.querySelector<HTMLElement>("#task-detail-editor");
+  if (editor) bindRichEditor(editor, updateTaskContent);
+  document.querySelectorAll<HTMLElement>("[data-task-prop]").forEach((el) => el.addEventListener("change", () => {
+    const todo = state.todos.find((item) => item.id === taskDetailId);
+    if (!todo) return;
+    const prop = el.dataset.taskProp!;
+    const value = (el as HTMLInputElement | HTMLSelectElement).value;
+    if (prop === "effort" || prop === "durationMinutes") (todo as any)[prop] = Number(value);
+    else if (prop === "scheduledStart") todo.scheduledStart = value ? new Date(value).toISOString() : null;
+    else if (prop === "status") { todo.status = value; todo.completed = value === "done"; }
+    else (todo as any)[prop] = value;
+    todo.updated = now(); clearTimeout(taskDetailSaveTimer); taskDetailSaveTimer = window.setTimeout(() => void saveState(false), 350);
+  }));
 }
 function bindJournalEvents() {
   const selectDay = (key: string, focus = false) => { ensureJournalEntry(key); void saveState(false); renderApp(); if (focus) requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-journal-editor]")?.focus()); };
@@ -1296,12 +1338,12 @@ function bindJournalEvents() {
 function bindTaskEvents() {
   document.querySelector("#quick-task-form")?.addEventListener("submit", (event) => { event.preventDefault(); const input = document.querySelector<HTMLInputElement>("#quick-task-input")!; const text = input.value.trim(); if (!text) return; addPlannerTodo(text); });
   document.querySelector("#add-category")?.addEventListener("click", () => { void (showOdoDialog({ kind:"prompt", title:"New category", message:"Name a task category.", label:"Category name", initialValue:"", confirmLabel:"Create category", cancelLabel:"Cancel", validate:(value:string)=>value.trim()?null:"A category needs a name." }) as Promise<string | null>).then((value:string | null) => { if (typeof value !== "string") return; const colors=["#7b8e7c","#7499b1","#9184a8","#c5903f","#bd7064","#71808c"]; state.todoCategories.push({id:uid("category"),name:value.trim(),color:colors[state.todoCategories.length%colors.length],icon:"ph-tag"}); void saveState(false); renderApp(); }); });
-  document.querySelectorAll<HTMLElement>("[data-category-add]").forEach(button => button.addEventListener("click", () => { const categoryId=button.dataset.categoryAdd!; const timestamp=now(); state.todos.unshift({id:uid("todo"),text:"Untitled task",completed:false,created:timestamp,updated:timestamp,categoryId,priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:30}); void saveState(false); renderApp(); }));
+  document.querySelectorAll<HTMLElement>("[data-category-add]").forEach(button => button.addEventListener("click", () => { const categoryId=button.dataset.categoryAdd!; const timestamp=now(); state.todos.unshift({id:uid("todo"),text:"Untitled task",completed:false,created:timestamp,updated:timestamp,categoryId,priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:30,status:"todo",content:""}); void saveState(false); renderApp(); }));
   document.querySelectorAll<HTMLElement>("[data-planner-nav]").forEach(button => button.addEventListener("click", () => { const action=button.dataset.plannerNav; if(action==="today") plannerDate=new Date(); else plannerDate.setDate(plannerDate.getDate()+(action==="next"?Number(state.plannerView):-Number(state.plannerView))); plannerDate.setHours(0,0,0,0); renderApp(); scrollPlannerToNow(); }));
   document.querySelector<HTMLSelectElement>("#planner-view")?.addEventListener("change", (event)=>{ state.plannerView=(event.target as HTMLSelectElement).value as PlannerView; void saveState(false); renderApp(); });
   document.querySelector<HTMLInputElement>("#planner-date")?.addEventListener("change", (event)=>{ const value=(event.target as HTMLInputElement).value; if(value) { plannerDate=new Date(`${value}T00:00:00`); renderApp(); } });
   document.querySelectorAll<HTMLElement>("[data-toggle-todo]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); toggleTodo(button.dataset.toggleTodo!); }));
-  document.querySelectorAll<HTMLElement>(".planner-task-card[data-todo-id]").forEach((row) => { row.removeAttribute("draggable"); row.addEventListener("click", (event)=> { if(plannerPointerDragging || (event.target as HTMLElement).closest("button")) return; openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("contextmenu", (event) => { event.preventDefault(); openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("keydown", handleTaskKeydown); row.addEventListener("pointerdown", (event)=> { if(!(event.target as HTMLElement).closest("button")) startPlannerPointerDrag(event, row); }); });
+  document.querySelectorAll<HTMLElement>(".planner-task-card[data-todo-id]").forEach((row) => { row.removeAttribute("draggable"); row.addEventListener("click", (event)=> { if(plannerPointerDragging || (event.target as HTMLElement).closest("button")) return; openTaskDetail(row.dataset.todoId!); }); row.addEventListener("contextmenu", (event) => { event.preventDefault(); openPlannerProperties(row.dataset.todoId!, row); }); row.addEventListener("keydown", handleTaskKeydown); row.addEventListener("pointerdown", (event)=> { if(!(event.target as HTMLElement).closest("button")) startPlannerPointerDrag(event, row); }); });
   document.querySelectorAll<HTMLElement>("[data-todo-menu]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); openPlannerProperties(button.dataset.todoMenu!, button); }));
   document.querySelectorAll<HTMLElement>("[data-calendar-task]").forEach((block) => {
     block.addEventListener("pointerdown", (event) => {
@@ -1318,6 +1360,7 @@ function bindTaskEvents() {
     block.addEventListener("keydown", handleTaskKeydown);
   });
   document.querySelectorAll<HTMLElement>("[data-resize-todo]").forEach(handle=>handle.addEventListener("pointerdown", startResize));
+  document.querySelectorAll<HTMLElement>(".calendar-slot").forEach((slot) => { slot.addEventListener("click", () => { const key = slot.dataset.slotDate!; const minute = Number(slot.dataset.slotMinute); const date = new Date(`${key}T00:00:00`); date.setMinutes(minute); const timestamp = now(); const id = uid("todo"); state.todos.unshift({ id, text: "", completed: false, created: timestamp, updated: timestamp, categoryId: "inbox", priority: "medium", effort: 2, color: "", scheduledStart: date.toISOString(), durationMinutes: 30, status: "todo", content: "" }); editingTodoId = id; void saveState(false); renderApp(); focusTodoEditor(id); }); });
   document.querySelector<HTMLElement>(".planner-properties-backdrop")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closePlannerProperties(); });
   document.querySelectorAll<HTMLElement>("[data-close-properties]").forEach((button) => button.addEventListener("click", () => closePlannerProperties()));
   document.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-prop]").forEach(input=>input.addEventListener("change",()=>{const todo=state.todos.find(t=>t.id===taskMenuTodoId); if(!todo) return; const field=input.dataset.prop as keyof Todo; let value:string|number|null=input.value; if(field==="effort"||field==="durationMinutes") value=Number(value); if(field==="scheduledStart") value=input.value ? new Date(input.value).toISOString() : null; (todo as unknown as Record<string,string|number|null>)[field]=value; todo.updated=now(); void saveState(false); renderApp();}));
@@ -1338,7 +1381,7 @@ function bindTaskEvents() {
   document.querySelector("#toggle-completed")?.addEventListener("click", () => { completedCollapsed = !completedCollapsed; renderApp(); });
   document.querySelector("#clear-completed")?.addEventListener("click", async () => { const count = state.todos.filter((todo) => todo.completed).length; if (await confirmOdo("Clear completed tasks?", `${count} completed ${count === 1 ? "task" : "tasks"} will be permanently removed.`, "Clear completed", true)) { state.todos = state.todos.filter((todo) => !todo.completed); void saveState(false); renderApp(); } });
 }
-function addPlannerTodo(text:string) { const timestamp=now(); state.todos.unshift({id:uid("todo"),text,completed:false,created:timestamp,updated:timestamp,categoryId:"inbox",priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:30}); void saveState(false); renderApp(); requestAnimationFrame(()=>document.querySelector<HTMLInputElement>("#quick-task-input")?.focus()); }
+function addPlannerTodo(text:string) { const timestamp=now(); state.todos.unshift({id:uid("todo"),text,completed:false,created:timestamp,updated:timestamp,categoryId:"inbox",priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:30,status:"todo",content:""}); void saveState(false); renderApp(); requestAnimationFrame(()=>document.querySelector<HTMLInputElement>("#quick-task-input")?.focus()); }
 function openPlannerProperties(id:string, trigger:HTMLElement) { const rect=trigger.getBoundingClientRect(); const width=285; const height=420; const x=Math.max(8,Math.min(rect.right+10,window.innerWidth-width-8)); const y=Math.max(8,Math.min(rect.top,window.innerHeight-height-8)); taskMenuTodoId=id; plannerPopover={x,y,returnId:id}; renderApp(); }
 function closePlannerProperties() { const returnId=plannerPopover?.returnId; taskMenuTodoId=""; plannerPopover=null; renderApp(); if(returnId) requestAnimationFrame(()=>document.querySelector<HTMLElement>(`[data-todo-id="${CSS.escape(returnId)}"]`)?.focus()); }
 function plannerDropAt(todoId: string, clientX: number, clientY: number, fromCalendar = false) {
@@ -1436,7 +1479,7 @@ function handleTaskKeydown(event: KeyboardEvent) {
   if ((event.target as HTMLElement).matches("input")) return; const row = event.currentTarget as HTMLElement; const id = row.dataset.todoId!; const rows = [...document.querySelectorAll<HTMLElement>("[data-todo-id]")]; const index = rows.indexOf(row);
   if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); rows[index + (event.key === "ArrowDown" ? 1 : -1)]?.focus(); }
   if (event.key === " ") { event.preventDefault(); toggleTodo(id); }
-  if (event.key === "Enter") { event.preventDefault(); openPlannerProperties(id, row); }
+  if (event.key === "Enter") { event.preventDefault(); openTaskDetail(id); }
   if (event.key === "Delete") { event.preventDefault(); const todo = state.todos.find((item) => item.id === id); if (todo) void (async () => { if (await confirmOdo("Delete task?", `“${todo.text}” will be removed from your task list.`, "Delete task", true)) { state.todos = state.todos.filter((item) => item.id !== id); await saveState(false); renderApp(); } })(); }
 }
 function bindSettingsEvents() {
