@@ -65,6 +65,8 @@ struct Todo {
     duration_minutes: i64,
     #[serde(default)]
     project_id: Option<String>,
+    #[serde(default)]
+    milestone_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +98,20 @@ struct Project {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct Milestone {
+    id: String,
+    project_id: String,
+    name: String,
+    #[serde(default)]
+    target_date: Option<String>,
+    #[serde(default)]
+    completed: bool,
+    created: String,
+    updated: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JournalEntry {
     id: String,
     date_key: String,
@@ -115,6 +131,8 @@ struct Workspace {
     todo_categories: Vec<TodoCategory>,
     #[serde(default)]
     projects: Vec<Project>,
+    #[serde(default)]
+    milestones: Vec<Milestone>,
     #[serde(default)]
     journal_entries: Vec<JournalEntry>,
     selected_folder_id: String,
@@ -227,6 +245,9 @@ pub fn initialize_database(connection: &Connection) -> Result<(), String> {
              CREATE TABLE IF NOT EXISTS projects (
                id TEXT PRIMARY KEY, name TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'backlog', target_date TEXT, created TEXT NOT NULL, updated TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0
              );
+             CREATE TABLE IF NOT EXISTS milestones (
+               id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, target_date TEXT, completed INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL, updated TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0
+             );
              CREATE TABLE IF NOT EXISTS journal_entries (
                id TEXT PRIMARY KEY, date_key TEXT NOT NULL UNIQUE, content TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, updated TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0
              );",
@@ -283,9 +304,10 @@ pub fn initialize_database(connection: &Connection) -> Result<(), String> {
             "duration_minutes",
             "ALTER TABLE todos ADD COLUMN duration_minutes INTEGER NOT NULL DEFAULT 30",
         ),
+        ("project_id", "ALTER TABLE todos ADD COLUMN project_id TEXT"),
         (
-            "project_id",
-            "ALTER TABLE todos ADD COLUMN project_id TEXT",
+            "milestone_id",
+            "ALTER TABLE todos ADD COLUMN milestone_id TEXT",
         ),
     ] {
         if !todo_columns.iter().any(|item| item == column) {
@@ -321,6 +343,7 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
         .execute_batch(
             "DELETE FROM folders;
              DELETE FROM todos;
+             DELETE FROM milestones;
              DELETE FROM projects;
              DELETE FROM todo_categories;
              DELETE FROM journal_entries;
@@ -420,18 +443,27 @@ fn write_workspace(connection: &mut Connection, contents: &str) -> Result<(), St
             )
             .map_err(|error| format!("Could not save a project: {error}"))?;
     }
+    for (position, milestone) in workspace.milestones.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO milestones (id, project_id, name, target_date, completed, created, updated, position)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![milestone.id, milestone.project_id, milestone.name, milestone.target_date, milestone.completed, milestone.created, milestone.updated, position as i64],
+            )
+            .map_err(|error| format!("Could not save a milestone: {error}"))?;
+    }
     for (position, todo) in workspace.todos.iter().enumerate() {
         transaction
             .execute(
-                "INSERT INTO todos (id, text, completed, created, updated, position, category_id, priority, effort, color, scheduled_start, duration_minutes, project_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO todos (id, text, completed, created, updated, position, category_id, priority, effort, color, scheduled_start, duration_minutes, project_id, milestone_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     todo.id,
                     todo.text,
                     todo.completed,
                     todo.created,
                     todo.updated,
-                    position as i64, todo.category_id, todo.priority, todo.effort, todo.color, todo.scheduled_start, todo.duration_minutes, todo.project_id
+                    position as i64, todo.category_id, todo.priority, todo.effort, todo.color, todo.scheduled_start, todo.duration_minutes, todo.project_id, todo.milestone_id
                 ],
             )
             .map_err(|error| format!("Could not save a task: {error}"))?;
@@ -527,7 +559,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .map_err(|error| format!("Could not decode notes: {error}"))?;
 
     let mut todo_statement = connection
-        .prepare("SELECT id, text, completed, created, updated, category_id, priority, effort, color, scheduled_start, duration_minutes, project_id FROM todos ORDER BY position")
+        .prepare("SELECT id, text, completed, created, updated, category_id, priority, effort, color, scheduled_start, duration_minutes, project_id, milestone_id FROM todos ORDER BY position")
         .map_err(|error| format!("Could not read tasks: {error}"))?;
     let todos = todo_statement
         .query_map([], |row| {
@@ -544,6 +576,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
                 scheduled_start: row.get(9)?,
                 duration_minutes: row.get(10)?,
                 project_id: row.get(11)?,
+                milestone_id: row.get(12)?,
             })
         })
         .map_err(|error| format!("Could not query tasks: {error}"))?
@@ -583,6 +616,24 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         .map_err(|error| format!("Could not query projects: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Could not decode projects: {error}"))?;
+    let mut milestone_statement = connection
+        .prepare("SELECT id,project_id,name,target_date,completed,created,updated FROM milestones ORDER BY position")
+        .map_err(|error| format!("Could not read milestones: {error}"))?;
+    let milestones = milestone_statement
+        .query_map([], |row| {
+            Ok(Milestone {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                name: row.get(2)?,
+                target_date: row.get(3)?,
+                completed: row.get(4)?,
+                created: row.get(5)?,
+                updated: row.get(6)?,
+            })
+        })
+        .map_err(|error| format!("Could not query milestones: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Could not decode milestones: {error}"))?;
     let mut journal_statement = connection.prepare("SELECT id,date_key,content,created,updated FROM journal_entries ORDER BY date_key DESC, position").map_err(|error| format!("Could not read journal entries: {error}"))?;
     let journal_entries = journal_statement
         .query_map([], |row| {
@@ -646,6 +697,7 @@ fn read_workspace(connection: &Connection) -> Result<Option<Workspace>, String> 
         todos,
         todo_categories,
         projects,
+        milestones,
         journal_entries,
         selected_folder_id,
         selected_note_id,
@@ -1197,14 +1249,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_round_trip_preserves_notes_folders_and_tasks() {
+    fn workspace_round_trip_preserves_notes_folders_tasks_and_milestones() {
         let mut connection = Connection::open_in_memory().expect("open in-memory database");
         initialize_database(&connection).expect("initialize schema");
         let input = r###"{
           "folders":[{"id":"inbox","name":"Inbox","parentId":null,"open":true,"icon":"ph-tray"}],
           "notes":[{"id":"note-1","folderId":"inbox","title":"Test","content":"Body","updated":"2026-07-15T00:00:00.000Z","status":"active","pinned":true}],
-          "todos":[{"id":"todo-1","text":"Ship it","completed":false,"created":"2026-07-15T00:00:00.000Z","updated":"2026-07-15T00:00:00.000Z","categoryId":"work","priority":"high","effort":4,"color":"#7499b1","scheduledStart":"2026-07-15T09:00:00.000Z","durationMinutes":90}],
+          "todos":[{"id":"todo-1","text":"Ship it","completed":false,"created":"2026-07-15T00:00:00.000Z","updated":"2026-07-15T00:00:00.000Z","categoryId":"work","priority":"high","effort":4,"color":"#7499b1","scheduledStart":"2026-07-15T09:00:00.000Z","durationMinutes":90,"projectId":"project-1","milestoneId":"milestone-1"}],
           "todoCategories":[{"id":"inbox","name":"Inbox","color":"#7b8e7c"},{"id":"work","name":"Work","color":"#7499b1"}],
+          "projects":[{"id":"project-1","name":"Launch","summary":"","description":"","status":"in_progress","targetDate":"2026-08-28","created":"2026-07-15T00:00:00.000Z","updated":"2026-07-15T00:00:00.000Z"}],
+          "milestones":[{"id":"milestone-1","projectId":"project-1","name":"Release candidate","targetDate":"2026-08-21","completed":false,"created":"2026-07-15T00:00:00.000Z","updated":"2026-07-15T00:00:00.000Z"}],
           "journalEntries":[{"id":"journal-1","dateKey":"2026-07-15","content":"## 9:30 AM\n\nA calm start.","created":"2026-07-15T09:30:00.000Z","updated":"2026-07-15T09:30:00.000Z"}],
           "selectedFolderId":"inbox",
           "selectedNoteId":"note-1",
@@ -1226,7 +1280,15 @@ mod tests {
             Some("2026-07-15T09:00:00.000Z")
         );
         assert_eq!(workspace.todos[0].duration_minutes, 90);
+        assert_eq!(workspace.todos[0].project_id.as_deref(), Some("project-1"));
+        assert_eq!(
+            workspace.todos[0].milestone_id.as_deref(),
+            Some("milestone-1")
+        );
         assert_eq!(workspace.todo_categories.len(), 2);
+        assert_eq!(workspace.projects.len(), 1);
+        assert_eq!(workspace.milestones.len(), 1);
+        assert_eq!(workspace.milestones[0].name, "Release candidate");
         assert_eq!(workspace.journal_entries.len(), 1);
         assert_eq!(workspace.journal_entries[0].date_key, "2026-07-15");
         assert_eq!(workspace.planner_view, "4");

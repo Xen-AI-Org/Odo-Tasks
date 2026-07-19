@@ -554,6 +554,30 @@ html.no-motion *, html.no-motion *::before, html.no-motion *::after { scroll-beh
 .project-overview-grid + .project-related { border-top: 1px solid var(--line); }
 .project-related > header { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
 .project-related h2 { margin: 4px 0 0; color: #37342f; font: 500 22px/1 Georgia, serif; }
+.milestone-list { display: flex; flex-direction: column; gap: 10px; }
+.milestone-card { overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: #fff; box-shadow: 0 1px 2px rgba(42,38,29,.025); }
+.milestone-card > header { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: start; gap: 10px; padding: 15px 14px 12px; }
+.milestone-toggle { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid #d8d3ca; border-radius: 50%; background: #fffefa; color: #a97708; font-size: 13px; }
+.milestone-toggle:hover { border-color: #bf8a16; background: var(--sun-soft); }
+.milestone-toggle:focus-visible, .milestone-name:focus-visible, .milestone-date input:focus-visible { outline: 2px solid #a97708; outline-offset: 2px; }
+.milestone-card.is-complete .milestone-toggle { border-color: var(--green); background: var(--green); color: #fff; }
+.milestone-card.is-complete .milestone-name { color: #7f7a72; text-decoration: line-through; }
+.milestone-card > header > div { min-width: 0; display: grid; gap: 7px; }
+.milestone-name { width: 100%; min-width: 0; padding: 1px 3px; border: 0; border-radius: 3px; outline: 0; background: transparent; color: #3d3a34; font: 600 13.5px/1.35 inherit; }
+.milestone-date { width: fit-content; display: inline-flex; align-items: center; gap: 5px; color: #938e85; font-size: 9.5px; }
+.milestone-date input { width: 112px; padding: 1px 3px; border: 0; border-radius: 3px; outline: 0; background: transparent; color: #6e6a62; font: 10px inherit; }
+.milestone-card .secondary-button { white-space: nowrap; }
+.milestone-progress { height: 3px; margin: 0 14px; overflow: hidden; border-radius: 2px; background: #efede7; }
+.milestone-progress span { display: block; height: 100%; border-radius: inherit; background: #c99526; transition: width 160ms ease-out; }
+.milestone-card.is-complete .milestone-progress span { background: var(--green); }
+.milestone-progress-copy { margin: 7px 14px 11px; color: #908b82; font-size: 9.5px; }
+.milestone-card .project-task-list { border-width: 1px 0 0; border-radius: 0; }
+.milestone-task-empty { min-height: 47px; display: flex; align-items: center; padding: 0 14px; color: #99948b; font-size: 10.5px; }
+.milestone-empty { border: 1px dashed #dedad2; border-radius: 9px; background: #fff; }
+.unassigned-tasks { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+.unassigned-tasks > header { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 10px; }
+.unassigned-tasks h3 { margin: 0; color: #4a4741; font-size: 12px; }
+.unassigned-tasks p { margin: 4px 0 0; color: #918c84; font-size: 10px; }
 .project-task-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
 .project-task-row { min-height: 58px; display: grid; grid-template-columns: 24px minmax(0, 1fr) 18px; align-items: center; gap: 9px; padding: 8px 14px; border-bottom: 1px solid #efede7; color: inherit; text-align: left; }
 .project-task-row:last-child { border-bottom: 0; }
@@ -570,7 +594,7 @@ html.no-motion *, html.no-motion *::before, html.no-motion *::after { scroll-beh
 .project-detail-empty strong { color: #5b5750; font-size: 12px; }
 .project-detail-empty span { font-size: 10.5px; }
 @media (max-width: 1100px) { .project-board { grid-template-columns: repeat(4, 270px); } }
-@media (max-width: 760px) { .projects-view, .project-detail-view { grid-column: 1; } .projects-toolbar { padding: 22px 18px 18px; } .projects-toolbar p { display: none; } .project-filter-row { padding: 0 18px; } .project-board { grid-template-columns: repeat(4, min(82vw, 300px)); scroll-snap-type: x proximity; } .project-column { min-width: 0; scroll-snap-align: start; } .project-detail-scroll { padding: 34px 17px 70px; } .project-overview-grid { grid-template-columns: 1fr; } .project-progress-card { min-height: 140px; } .project-name-editor { font-size: 27px; } }
+@media (max-width: 760px) { .projects-view, .project-detail-view { grid-column: 1; } .projects-toolbar { padding: 22px 18px 18px; } .projects-toolbar p { display: none; } .project-filter-row { padding: 0 18px; } .project-board { grid-template-columns: repeat(4, min(82vw, 300px)); scroll-snap-type: x proximity; } .project-column { min-width: 0; scroll-snap-align: start; } .project-detail-scroll { padding: 34px 17px 70px; } .project-overview-grid { grid-template-columns: 1fr; } .project-progress-card { min-height: 140px; } .project-name-editor { font-size: 27px; } .milestone-card > header { grid-template-columns: 28px minmax(0, 1fr); } .milestone-card > header > .secondary-button { grid-column: 2; justify-self: start; } .unassigned-tasks > header { align-items: start; } }
 
 /* Planner — a deliberately dense, paper-like daily workspace. */
 .planner-view { grid-column: 2 / -1; min-width: 0; min-height: 0; display: grid; grid-template-columns: 350px minmax(0,1fr); background: #f8f6f0; overflow: hidden; }
