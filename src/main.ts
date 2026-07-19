@@ -40,6 +40,18 @@ const isMac = navigator.platform.toLowerCase().includes("mac");
 const modLabel = isMac ? "Cmd" : "Ctrl";
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 const now = () => new Date().toISOString();
+function dateAfterBusinessDays(start: Date, businessDays: number) {
+  const date = new Date(start);
+  let remaining = businessDays;
+  while (remaining > 0) {
+    date.setDate(date.getDate() + 1);
+    if (date.getDay() !== 0 && date.getDay() !== 6) remaining -= 1;
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
 const ALLOWED_FOLDER_ICONS = new Set([
   "ph-folder", "ph-briefcase", "ph-user-circle", "ph-book", "ph-book-open", "ph-notebook", "ph-file-text", "ph-lightbulb", "ph-star", "ph-heart",
   "ph-house", "ph-buildings", "ph-bank", "ph-graduation-cap", "ph-flask", "ph-code", "ph-terminal-window", "ph-globe", "ph-map-pin", "ph-airplane",
@@ -536,7 +548,7 @@ function renderMilestoneCard(milestone: Milestone) {
   const tasks = milestoneTasks(milestone.id);
   const completed = tasks.filter((todo) => todo.completed).length;
   const progress = tasks.length ? Math.round(completed / tasks.length * 100) : 0;
-  return `<article class="milestone-card ${milestone.completed ? "is-complete" : ""}" data-milestone-id="${attr(milestone.id)}"><header><button class="milestone-toggle" data-toggle-milestone="${attr(milestone.id)}" aria-label="${milestone.completed ? "Reopen" : "Complete"} ${attr(milestone.name)} milestone"><i class="ph ph-${milestone.completed ? "check" : "flag"}"></i></button><div><input class="milestone-name" data-milestone-name="${attr(milestone.id)}" value="${attr(milestone.name)}" aria-label="Milestone name"><label class="milestone-date"><i class="ph ph-calendar-blank"></i><span>Due</span><input type="date" data-milestone-date="${attr(milestone.id)}" value="${attr(milestone.targetDate || "")}" aria-label="${attr(milestone.name)} due date"></label></div><button class="secondary-button" data-add-milestone-task="${attr(milestone.id)}"><i class="ph ph-plus"></i>Add task</button></header><div class="milestone-progress" aria-label="${progress}% of milestone tasks complete"><span style="width:${progress}%"></span></div><p class="milestone-progress-copy">${completed} of ${tasks.length} ${tasks.length === 1 ? "task" : "tasks"} complete</p><div class="project-task-list">${tasks.map(renderProjectTask).join("") || '<div class="milestone-task-empty">No tasks attached to this milestone.</div>'}</div></article>`;
+  return `<article class="milestone-card ${milestone.completed ? "is-complete" : ""}" data-milestone-id="${attr(milestone.id)}"><header><button class="milestone-toggle" data-toggle-milestone="${attr(milestone.id)}" aria-label="${milestone.completed ? "Reopen" : "Complete"} ${attr(milestone.name)} milestone"><i class="ph ph-${milestone.completed ? "check" : "flag"}"></i></button><div class="milestone-fields"><input class="milestone-name" data-milestone-name="${attr(milestone.id)}" value="${attr(milestone.name)}" aria-label="Milestone name"><label class="milestone-date"><i class="ph ph-calendar-blank"></i><span>Due</span><input type="${milestone.targetDate ? "date" : "text"}" data-milestone-date="${attr(milestone.id)}" value="${attr(milestone.targetDate || "")}" placeholder="No date" aria-label="${attr(milestone.name)} due date"></label></div><div class="milestone-actions"><button class="secondary-button" data-add-milestone-task="${attr(milestone.id)}"><i class="ph ph-plus"></i>Add task</button><button class="icon-button milestone-delete" data-delete-milestone="${attr(milestone.id)}" aria-label="Delete ${attr(milestone.name)} milestone"><i class="ph ph-trash"></i></button></div></header><div class="milestone-progress" aria-label="${progress}% of milestone tasks complete"><span style="width:${progress}%"></span></div><p class="milestone-progress-copy">${completed} of ${tasks.length} ${tasks.length === 1 ? "task" : "tasks"} complete</p><div class="project-task-list">${tasks.map(renderProjectTask).join("") || '<div class="milestone-task-empty">No tasks attached to this milestone.</div>'}</div></article>`;
 }
 function renderProjectMilestones(project: Project) {
   const milestones = projectMilestones(project.id);
@@ -680,6 +692,8 @@ function renderApp() {
   const app = document.querySelector<HTMLElement>("#app")!;
   const previousPlannerScroll = currentView === "tasks" ? document.querySelector<HTMLElement>("#calendar-scroll") : null;
   const plannerScrollPosition = previousPlannerScroll ? { top: previousPlannerScroll.scrollTop, left: previousPlannerScroll.scrollLeft } : null;
+  const previousProjectScroll = currentView === "projects" ? document.querySelector<HTMLElement>(".project-detail-scroll") : null;
+  const projectScrollTop = previousProjectScroll?.scrollTop ?? null;
   const isInbox = currentView === "notes" && state.selectedFolderId === "inbox";
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}${isInbox ? " view-inbox" : ""}`;
   const content = currentView === "tasks" ? renderTasks() : currentView === "projects" ? renderProjects() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
@@ -691,6 +705,10 @@ function renderApp() {
       plannerScroll.scrollTop = plannerScrollPosition.top;
       plannerScroll.scrollLeft = plannerScrollPosition.left;
     } else requestAnimationFrame(() => scrollPlannerToNow());
+  }
+  if (projectScrollTop !== null) {
+    const projectScroll = document.querySelector<HTMLElement>(".project-detail-scroll");
+    if (projectScroll) projectScroll.scrollTop = projectScrollTop;
   }
   if (newRowId) requestAnimationFrame(() => { document.querySelector(`[data-note-id="${CSS.escape(newRowId)}"]`)?.classList.remove("is-new"); newRowId = ""; });
 }
@@ -1387,7 +1405,7 @@ async function createMilestone(project: Project) {
   const name = await promptOdo("New milestone", `What outcome should “${project.name}” reach?`, "Untitled milestone");
   if (!name) return;
   const timestamp = now();
-  state.milestones.push({ id: uid("milestone"), projectId: project.id, name, targetDate: null, completed: false, created: timestamp, updated: timestamp });
+  state.milestones.push({ id: uid("milestone"), projectId: project.id, name, targetDate: dateAfterBusinessDays(new Date(timestamp), 7), completed: false, created: timestamp, updated: timestamp });
   project.updated = timestamp; projectTab = "milestones"; await saveState(false); renderApp();
 }
 async function createProjectTask(project: Project, milestoneId: string | null = null) {
@@ -1509,9 +1527,22 @@ function bindProjectsEvents() {
   document.querySelector("#add-project-milestone")?.addEventListener("click", () => void createMilestone(project));
   document.querySelector("#add-unassigned-project-task")?.addEventListener("click", () => void createProjectTask(project));
   document.querySelectorAll<HTMLElement>("[data-add-milestone-task]").forEach((button) => button.addEventListener("click", () => void createProjectTask(project, button.dataset.addMilestoneTask!)));
+  document.querySelectorAll<HTMLElement>("[data-delete-milestone]").forEach((button) => button.addEventListener("click", async () => {
+    const milestone = state.milestones.find((item) => item.id === button.dataset.deleteMilestone); if (!milestone) return;
+    const taskCount = state.todos.filter((todo) => todo.milestoneId === milestone.id).length;
+    const taskMessage = taskCount ? ` ${taskCount} attached ${taskCount === 1 ? "task" : "tasks"} will remain in the project without a milestone.` : "";
+    if (!await confirmOdo("Delete milestone?", `“${milestone.name}” will be permanently deleted.${taskMessage}`, "Delete milestone", true)) return;
+    state.todos.forEach((todo) => { if (todo.milestoneId === milestone.id) { todo.milestoneId = null; todo.updated = now(); } });
+    state.milestones = state.milestones.filter((item) => item.id !== milestone.id);
+    project.updated = now(); await saveState(false); renderApp();
+  }));
   document.querySelectorAll<HTMLElement>("[data-toggle-milestone]").forEach((button) => button.addEventListener("click", () => { const milestone = state.milestones.find((item) => item.id === button.dataset.toggleMilestone); if (!milestone) return; milestone.completed = !milestone.completed; milestone.updated = now(); project.updated = milestone.updated; void saveState(false); renderApp(); }));
   document.querySelectorAll<HTMLInputElement>("[data-milestone-name]").forEach((input) => input.addEventListener("input", () => { const milestone = state.milestones.find((item) => item.id === input.dataset.milestoneName); if (!milestone) return; milestone.name = input.value || "Untitled milestone"; milestone.updated = now(); project.updated = milestone.updated; scheduleSave(); }));
-  document.querySelectorAll<HTMLInputElement>("[data-milestone-date]").forEach((input) => input.addEventListener("change", () => { const milestone = state.milestones.find((item) => item.id === input.dataset.milestoneDate); if (!milestone) return; milestone.targetDate = input.value || null; milestone.updated = now(); project.updated = milestone.updated; void saveState(false); }));
+  document.querySelectorAll<HTMLInputElement>("[data-milestone-date]").forEach((input) => {
+    input.addEventListener("focus", () => { if (input.type === "text") input.type = "date"; });
+    input.addEventListener("blur", () => { if (!input.value) input.type = "text"; });
+    input.addEventListener("change", () => { const milestone = state.milestones.find((item) => item.id === input.dataset.milestoneDate); if (!milestone) return; milestone.targetDate = input.value || null; milestone.updated = now(); project.updated = milestone.updated; void saveState(false); });
+  });
   document.querySelectorAll<HTMLElement>("[data-project-task]").forEach((task) => task.addEventListener("click", () => openTaskDetail(task.dataset.projectTask!)));
 }
 function bindTaskDetailEvents() {
