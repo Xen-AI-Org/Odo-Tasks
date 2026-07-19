@@ -1,6 +1,9 @@
 import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
@@ -12,6 +15,12 @@ const root = realpathSync(fileURLToPath(new URL(".", import.meta.url)));
 export default defineConfig(async () => ({
 
   root,
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(root, "src"),
+    },
+  },
   // The Tauri API already ships as browser-ready ESM. Keeping it out of
   // Vite's pre-bundler avoids a Node 25 optimizer crash on redirected
   // OneDrive workspaces while preserving normal dev-server behavior.
