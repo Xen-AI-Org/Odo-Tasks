@@ -16,6 +16,112 @@ async function storedProjectStatus(page: Page, projectId: string) {
   }, { key: storageKey, id: projectId });
 }
 
+async function storedMilestone(page: Page, name: string) {
+  return page.evaluate(({ key, milestoneName }) => {
+    const workspace = JSON.parse(localStorage.getItem(key) ?? "null");
+    return workspace?.milestones.find((milestone: { name: string }) => milestone.name === milestoneName);
+  }, { key: storageKey, milestoneName: name });
+}
+
+function dateAfterBusinessDays(start: Date, businessDays: number) {
+  const date = new Date(start);
+  let remaining = businessDays;
+  while (remaining > 0) {
+    date.setDate(date.getDate() + 1);
+    if (date.getDay() !== 0 && date.getDay() !== 6) remaining -= 1;
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+test("defaults a new milestone's due date to seven business days", async ({ page }) => {
+  await openProjects(page);
+
+  await page.locator('[data-project-id="summer-launch"]').click();
+  await page.getByRole("button", { name: /^Milestones/ }).click();
+  await page.getByRole("button", { name: "Add milestone" }).click();
+  const milestoneDialog = page.getByRole("dialog", { name: "New milestone" });
+  await milestoneDialog.getByRole("textbox", { name: "Name" }).fill("Business week milestone");
+  await milestoneDialog.getByRole("button", { name: "Save" }).click();
+
+  const milestone = await storedMilestone(page, "Business week milestone");
+  expect(milestone).toBeTruthy();
+  expect(milestone.targetDate).toBe(dateAfterBusinessDays(new Date(milestone.created), 7));
+  await expect(page.locator(`[data-milestone-date="${milestone.id}"]`)).toHaveValue(milestone.targetDate);
+});
+
+test("shows an undated milestone as having no date", async ({ page }) => {
+  await openProjects(page);
+  await page.locator('[data-project-id="summer-launch"]').click();
+  await page.getByRole("button", { name: /^Milestones/ }).click();
+  await page.getByRole("button", { name: "Add milestone" }).click();
+  const milestoneDialog = page.getByRole("dialog", { name: "New milestone" });
+  await milestoneDialog.getByRole("textbox", { name: "Name" }).fill("Undated milestone");
+  await milestoneDialog.getByRole("button", { name: "Save" }).click();
+
+  const milestone = await storedMilestone(page, "Undated milestone");
+  const dueDate = page.locator(`[data-milestone-date="${milestone.id}"]`);
+  await dueDate.fill("");
+  await dueDate.blur();
+  await expect(dueDate).toHaveAttribute("type", "text");
+  await expect(dueDate).toHaveAttribute("placeholder", "No date");
+  await expect(dueDate).toHaveValue("");
+});
+
+test("deletes a milestone while keeping its tasks in the project", async ({ page }) => {
+  await openProjects(page);
+  await page.locator('[data-project-id="summer-launch"]').click();
+  await page.getByRole("button", { name: /^Milestones/ }).click();
+  for (let index = 1; index <= 6; index += 1) {
+    await page.getByRole("button", { name: "Add milestone" }).click();
+    const fillerDialog = page.getByRole("dialog", { name: "New milestone" });
+    await fillerDialog.getByRole("textbox", { name: "Name" }).fill(`Filler milestone ${index}`);
+    await fillerDialog.getByRole("button", { name: "Save" }).click();
+  }
+  await page.getByRole("button", { name: "Add milestone" }).click();
+  const milestoneDialog = page.getByRole("dialog", { name: "New milestone" });
+  await milestoneDialog.getByRole("textbox", { name: "Name" }).fill("Milestone to delete");
+  await milestoneDialog.getByRole("button", { name: "Save" }).click();
+
+  const milestone = await storedMilestone(page, "Milestone to delete");
+  const milestoneCard = page.locator(`[data-milestone-id="${milestone.id}"]`);
+  const addTaskButton = milestoneCard.getByRole("button", { name: "Add task" });
+  const deleteButton = milestoneCard.getByRole("button", { name: "Delete Milestone to delete milestone" });
+  const addTaskBox = await addTaskButton.boundingBox();
+  const deleteBox = await deleteButton.boundingBox();
+  expect(deleteBox?.x).toBeGreaterThan((addTaskBox?.x ?? 0) + (addTaskBox?.width ?? 0));
+  expect((deleteBox?.y ?? 0) + (deleteBox?.height ?? 0) / 2).toBeCloseTo((addTaskBox?.y ?? 0) + (addTaskBox?.height ?? 0) / 2, 0);
+  await addTaskButton.click();
+  const taskDialog = page.getByRole("dialog", { name: "Add a task" });
+  await taskDialog.getByRole("textbox", { name: "Name" }).fill("Task that stays");
+  await taskDialog.getByRole("button", { name: "Save" }).click();
+  await page.getByRole("button", { name: "Close task detail" }).click();
+
+  const projectScroll = page.locator(".project-detail-scroll");
+  await milestoneCard.scrollIntoViewIfNeeded();
+  const scrollBeforeDelete = await projectScroll.evaluate((element) => element.scrollTop);
+  expect(scrollBeforeDelete).toBeGreaterThan(0);
+  await deleteButton.click();
+  const deleteDialog = page.getByRole("dialog", { name: "Delete milestone?" });
+  await expect.poll(() => projectScroll.evaluate((element) => element.scrollTop)).toBe(scrollBeforeDelete);
+  await expect(deleteDialog).toContainText("1 attached task will remain in the project without a milestone");
+  await deleteDialog.getByRole("button", { name: "Delete milestone" }).click();
+
+  await expect(milestoneCard).toHaveCount(0);
+  await expect.poll(() => projectScroll.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await expect(page.locator(".unassigned-tasks")).toContainText("Task that stays");
+  const persisted = await page.evaluate(({ key, milestoneId }) => {
+    const workspace = JSON.parse(localStorage.getItem(key) ?? "null");
+    return {
+      milestoneExists: workspace.milestones.some((item: { id: string }) => item.id === milestoneId),
+      taskMilestoneId: workspace.todos.find((item: { text: string }) => item.text === "Task that stays")?.milestoneId,
+    };
+  }, { key: storageKey, milestoneId: milestone.id });
+  expect(persisted).toEqual({ milestoneExists: false, taskMilestoneId: null });
+});
+
 test("opens the Projects board between Tasks and Journal", async ({ page }) => {
   await page.goto("/");
 
