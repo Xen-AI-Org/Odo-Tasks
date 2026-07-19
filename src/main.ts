@@ -1,7 +1,10 @@
 import "@phosphor-icons/web/regular/style.css";
+import "@fontsource-variable/geist";
+import "@fontsource-variable/newsreader";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { mountOdoUiBridges, unmountOdoUiBridges } from "./ui-bridges";
 import "./styles.css";
 
 type NoteStatus = "active" | "archived" | "trash";
@@ -77,7 +80,11 @@ const starterProjects: Project[] = [
   { id: "weekly-review", name: "Weekly review refresh", summary: "Make the weekly reset faster and easier to scan.", description: "Refine the review flow so priorities, unfinished tasks, and notes are easy to carry into the next week.", status: "planned", targetDate: null, created: now(), updated: now() },
   { id: "mobile-capture", name: "Mobile capture", summary: "Explore a lightweight way to capture tasks away from the desk.", description: "Collect the smallest useful mobile capture flow before committing to a full companion app.", status: "backlog", targetDate: null, created: now(), updated: now() },
 ];
-const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: [], todoCategories: [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }], projects: structuredClone(starterProjects), milestones: [], journalEntries: [], pins: [], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest", plannerView: "3" });
+const starterTodos: Todo[] = [
+  { id: "plan-launch-brief", text: "Plan launch brief", completed: false, created: now(), updated: now(), categoryId: "inbox", priority: "high", effort: 3, color: "#059669", scheduledStart: null, durationMinutes: 45, status: "todo", content: "", projectId: "summer-launch", milestoneId: null },
+  { id: "review-weekly-priorities", text: "Review weekly priorities", completed: false, created: now(), updated: now(), categoryId: "inbox", priority: "medium", effort: 2, color: "#059669", scheduledStart: null, durationMinutes: 30, status: "todo", content: "" },
+];
+const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFolders), notes: structuredClone(starterNotes), todos: structuredClone(starterTodos), todoCategories: [{ id: "inbox", name: "Inbox", color: "#059669", icon: "ph-tray" }], projects: structuredClone(starterProjects), milestones: [], journalEntries: [], pins: [], selectedFolderId: "inbox", selectedNoteId: "welcome", sortMode: "newest", plannerView: "3" });
 
 const escapeHtml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#039;");
 const attr = escapeHtml;
@@ -87,7 +94,7 @@ function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Works
   if (!folders.some((folder) => folder.id === "inbox")) folders.unshift({ id: "inbox", name: "Inbox", parentId: null, open: true, icon: "ph-tray" });
   const notes = (Array.isArray(input?.notes) ? input.notes : fallback.notes).map((note) => ({ ...note, revision: note.revision ?? 0 }));
   const sortMode: SortMode = input?.sortMode === "manual" || input?.sortMode === "oldest" ? input.sortMode : "newest";
-  const categories = Array.isArray(input?.todoCategories) && input.todoCategories.length ? input.todoCategories : [{ id: "inbox", name: "Inbox", color: "#7b8e7c", icon: "ph-tray" }];
+  const categories = Array.isArray(input?.todoCategories) && input.todoCategories.length ? input.todoCategories : [{ id: "inbox", name: "Inbox", color: "#059669", icon: "ph-tray" }];
   const projects = (Array.isArray(input?.projects) ? input.projects : fallback.projects).filter((project): project is Project => !!project && typeof project.id === "string" && typeof project.name === "string").map((project) => ({ ...project, summary: project.summary || "", description: project.description || "", status: (["backlog", "planned", "in_progress", "completed"].includes(project.status) ? project.status : "backlog") as ProjectStatus, targetDate: project.targetDate || null, created: project.created || now(), updated: project.updated || project.created || now() }));
   const projectIds = new Set(projects.map((project) => project.id));
   const milestones = (Array.isArray(input?.milestones) ? input.milestones : []).filter((milestone): milestone is Milestone => !!milestone && typeof milestone.id === "string" && typeof milestone.name === "string" && typeof milestone.projectId === "string" && projectIds.has(milestone.projectId)).map((milestone) => ({ ...milestone, targetDate: milestone.targetDate || null, completed: Boolean(milestone.completed), created: milestone.created || now(), updated: milestone.updated || milestone.created || now() }));
@@ -152,6 +159,7 @@ let plannerPopover: { x: number; y: number; returnId: string } | null = null;
 let plannerPointerDragging = false;
 let plannerPointerDrop: { date: string; minute: number } | null = null;
 let plannerInboxTab: "inbox" | "scheduled" = "inbox";
+let inspectorTab: "tasks" | "details" = "tasks";
 const matchesInboxTab = (todo: Todo) => plannerInboxTab === "scheduled" ? !!todo.scheduledStart : !todo.scheduledStart;
 let pinPickerOpen = false;
 let pinPickerQuery = "";
@@ -292,11 +300,7 @@ function renderSidebar() {
     <div class="panel-label-row"><span>Folders</span><button class="icon-button" id="new-folder" title="New folder (${modLabel}+Shift+N)"><i class="ph ph-plus"></i></button></div><nav class="folder-tree" id="folder-tree">${state.folders.filter((folder) => folder.parentId === null && folder.id !== "inbox").map((folder) => renderFolder(folder)).join("")}</nav>
     <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
 }
-function renderMiniTodo(todo: Todo) { const category = categoryFor(todo); return `<article class="mini-task ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="mini-task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><span class="mini-task-text">${escapeHtml(todo.text)}</span><span class="mini-task-dot" style="--category:${attr(todo.color||category.color)}"></span><button class="mini-task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
-function renderTasksMini() {
-  const tasks = state.todos.filter((todo) => !todo.completed && !todo.scheduledStart);
-  return `<aside class="tasks-mini"><header class="tasks-mini-header"><h2>Tasks</h2><span>${tasks.length}</span></header><div class="tasks-mini-list">${tasks.length ? tasks.map(renderMiniTodo).join("") : '<p class="tasks-empty">No open tasks</p>'}</div></aside>`;
-}
+function renderTasksMini() { return '<aside class="tasks-mini" id="shadcn-inspector" aria-label="Note context"></aside>'; }
 function renderTaskDetail() {
   if (!taskDetailId) return "";
   const todo = state.todos.find((item) => item.id === taskDetailId);
@@ -316,8 +320,9 @@ function openTaskDetail(id: string) { taskMenuTodoId = ""; plannerPopover = null
 function closeTaskDetail() { taskDetailId = ""; renderApp(); }
 function renderNotesPanel() {
   const ordering = state.sortMode === "manual" ? "manual order" : state.sortMode === "newest" ? "newest first" : "oldest first";
-  return `<section class="notes-panel"><div class="global-bar"><label class="search-box"><i class="ph ph-magnifying-glass"></i><input id="search-input" type="search" placeholder="Search notes..." value="${attr(searchQuery)}"><kbd>${modLabel}+K</kbd></label><button class="new-note-button" id="new-note" title="New note (${modLabel}+N)"><i class="ph ph-note-pencil"></i></button></div><header class="notes-header"><div><strong id="note-list-title">${escapeHtml(viewTitle())}</strong><span id="note-count">${visibleNotes().length} notes · ${ordering}</span></div><button class="sort-button" id="list-menu" title="Change note order" aria-label="Change note order"><i class="ph ph-dots-three"></i></button></header><div class="note-list" id="note-list" tabindex="-1">${renderNoteRows()}</div></section>`;
+  return `<section class="notes-panel"><header class="notes-header"><div><strong id="note-list-title">${escapeHtml(viewTitle())}</strong><span id="note-count">${visibleNotes().length} notes · ${ordering}</span></div><div class="notes-header-actions"><button class="sort-button" id="list-menu" title="Change note order" aria-label="Change note order"><i class="ph ph-funnel"></i></button><button class="sort-button" data-create-note title="New note" aria-label="New note"><i class="ph ph-note-pencil"></i></button></div></header><div class="note-list" id="note-list" tabindex="-1">${renderNoteRows()}</div></section>`;
 }
+function renderCommandBar() { return '<header class="command-strip" id="shadcn-command-bar" aria-label="Workspace commands"></header>'; }
 function renderNoteRows() {
   const notes = visibleNotes();
   if (!notes.length) return `<div class="empty-state"><span class="empty-icon"><i class="ph ${currentView === "trash" ? "ph-trash" : currentView === "archived" ? "ph-archive-tray" : "ph-note-blank"}"></i></span><strong>${searchQuery ? "No matching notes" : currentView === "trash" ? "Trash is empty" : currentView === "archived" ? "Nothing archived" : "A clear page awaits"}</strong><p>${searchQuery ? "Try a different search." : "Capture a thought and give it somewhere to grow."}</p>${currentView === "notes" && !searchQuery ? '<button class="primary-button" data-create-note>Create a note</button>' : ""}</div>`;
@@ -688,6 +693,7 @@ function renderApp() {
   if (detachedNoteId) return;
   if (!workspaceReady) { document.querySelector<HTMLElement>("#app")!.innerHTML = '<main class="loading-shell" aria-label="Loading Odo"><span class="loading-wordmark">Odo</span><span class="loading-line"></span><span>Opening your workspace…</span></main>'; return; }
   repairState(); closeMenu(false);
+  unmountOdoUiBridges();
   document.documentElement.classList.toggle("no-motion", !motionEnabled);
   const app = document.querySelector<HTMLElement>("#app")!;
   const previousPlannerScroll = currentView === "tasks" ? document.querySelector<HTMLElement>("#calendar-scroll") : null;
@@ -697,8 +703,36 @@ function renderApp() {
   const isInbox = currentView === "notes" && state.selectedFolderId === "inbox";
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}${isInbox ? " view-inbox" : ""}`;
   const content = currentView === "tasks" ? renderTasks() : currentView === "projects" ? renderProjects() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
-  app.innerHTML = `${renderSidebar()}${content}${renderTaskDetail()}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
+  app.innerHTML = `${renderSidebar()}${renderCommandBar()}${content}${renderTaskDetail()}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
   updateSaveStatus(); bindEvents(); bindOdoDialog();
+  const activeNote = selectedNote();
+  mountOdoUiBridges({
+    commandSlot: document.querySelector<HTMLElement>("#shadcn-command-bar"),
+    inspectorSlot: document.querySelector<HTMLElement>("#shadcn-inspector"),
+    searchValue: searchQuery,
+    viewLabel: currentView === "notes" ? viewTitle() : currentView[0].toUpperCase() + currentView.slice(1),
+    shortcutLabel: `${modLabel === "Cmd" ? "⌘" : "Ctrl+"}K`,
+    canArchive: !!activeNote && activeNote.status === "active" && currentView === "notes",
+    focusMode,
+    tasks: state.todos.filter((todo) => !todo.scheduledStart).slice(0, 8).map((todo) => ({ id: todo.id, text: todo.text, completed: todo.completed })),
+    inspectorTab,
+    noteDetails: activeNote ? { folder: currentFolder().name, updated: formatEditorDate(activeNote.updated), words: wordCount(activeNote.content), linkedProject: "Summer launch" } : null,
+    onSearch: (value) => {
+      searchQuery = value;
+      if (!["notes", "archived", "trash"].includes(currentView)) { currentView = "notes"; state.selectedFolderId = "inbox"; renderApp(); }
+      else reconcileNoteList();
+    },
+    onNewNote: () => createNoteAndFocusTitle(),
+    onNewFolder: () => openFolderDialog(),
+    onNewTask: () => { setView("tasks"); requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#quick-task-input")?.focus()); },
+    onGoInbox: () => { state.selectedFolderId = "inbox"; setView("notes"); },
+    onToggleSidebar: () => { sidebarCollapsed = !sidebarCollapsed; renderApp(); },
+    onToggleFocus: () => { focusMode = !focusMode; if (currentView !== "notes") currentView = "notes"; renderApp(); },
+    onArchive: () => { if (activeNote) void performMenuAction(`note:archive:${activeNote.id}`); },
+    onToggleTask: (id) => toggleTodo(id),
+    onOpenTasks: () => setView("tasks"),
+    onInspectorTab: (value) => { inspectorTab = value; },
+  });
   if (currentView === "tasks") {
     const plannerScroll = document.querySelector<HTMLElement>("#calendar-scroll");
     if (plannerScrollPosition && plannerScroll) {
@@ -1588,7 +1622,7 @@ function bindJournalEvents() {
 }
 function bindTaskEvents() {
   document.querySelector("#quick-task-form")?.addEventListener("submit", (event) => { event.preventDefault(); const input = document.querySelector<HTMLInputElement>("#quick-task-input")!; const text = input.value.trim(); if (!text) return; addPlannerTodo(text); });
-  document.querySelector("#add-category")?.addEventListener("click", () => { void (showOdoDialog({ kind:"prompt", title:"New category", message:"Name a task category.", label:"Category name", initialValue:"", confirmLabel:"Create category", cancelLabel:"Cancel", validate:(value:string)=>value.trim()?null:"A category needs a name." }) as Promise<string | null>).then((value:string | null) => { if (typeof value !== "string") return; const colors=["#7b8e7c","#7499b1","#9184a8","#c5903f","#bd7064","#71808c"]; state.todoCategories.push({id:uid("category"),name:value.trim(),color:colors[state.todoCategories.length%colors.length],icon:"ph-tag"}); void saveState(false); renderApp(); }); });
+  document.querySelector("#add-category")?.addEventListener("click", () => { void (showOdoDialog({ kind:"prompt", title:"New category", message:"Name a task category.", label:"Category name", initialValue:"", confirmLabel:"Create category", cancelLabel:"Cancel", validate:(value:string)=>value.trim()?null:"A category needs a name." }) as Promise<string | null>).then((value:string | null) => { if (typeof value !== "string") return; const colors=["#059669","#0284c7","#7c3aed","#d97706","#dc2626","#4f46e5"]; state.todoCategories.push({id:uid("category"),name:value.trim(),color:colors[state.todoCategories.length%colors.length],icon:"ph-tag"}); void saveState(false); renderApp(); }); });
   document.querySelectorAll<HTMLElement>("[data-category-add]").forEach(button => button.addEventListener("click", () => { const categoryId=button.dataset.categoryAdd!; const timestamp=now(); state.todos.unshift({id:uid("todo"),text:"Untitled task",completed:false,created:timestamp,updated:timestamp,categoryId,priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:30,status:"todo",content:""}); void saveState(false); renderApp(); }));
   document.querySelectorAll<HTMLElement>("[data-planner-nav]").forEach(button => button.addEventListener("click", () => { const action=button.dataset.plannerNav; if(action==="today") plannerDate=new Date(); else plannerDate.setDate(plannerDate.getDate()+(action==="next"?Number(state.plannerView):-Number(state.plannerView))); plannerDate.setHours(0,0,0,0); renderApp(); scrollPlannerToNow(); }));
   document.querySelector<HTMLSelectElement>("#planner-view")?.addEventListener("change", (event)=>{ state.plannerView=(event.target as HTMLSelectElement).value as PlannerView; void saveState(false); renderApp(); });

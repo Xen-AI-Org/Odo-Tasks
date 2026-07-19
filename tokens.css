@@ -1,0 +1,80 @@
+:root {
+  --color-paper: oklch(98.5% 0.001 106.423); /* Tailwind stone-50 */
+  --color-paper-2: oklch(97% 0.001 106.424); /* Tailwind stone-100 */
+  --color-paper-3: oklch(92.3% 0.003 48.717); /* Tailwind stone-200 */
+  --color-ink: oklch(14.7% 0.004 49.25); /* Tailwind stone-950 */
+  --color-ink-2: oklch(37.4% 0.01 67.558); /* Tailwind stone-700 */
+  --color-rule: oklch(92.3% 0.003 48.717); /* Tailwind stone-200 */
+  --color-rule-2: oklch(86.9% 0.005 56.366); /* Tailwind stone-300 */
+  --color-muted: oklch(55.3% 0.013 58.071); /* Tailwind stone-500 */
+  --color-neutral: oklch(44.4% 0.011 73.639); /* Tailwind stone-600 */
+  --color-brand: oklch(76.9% 0.188 70.08); /* Tailwind amber-500 */
+  --color-brand-strong: oklch(66.6% 0.179 58.318); /* Tailwind amber-600 */
+  --color-brand-soft: oklch(98.7% 0.022 95.277); /* Tailwind amber-50 */
+  --color-brand-ink: oklch(14.7% 0.004 49.25); /* Tailwind stone-950 */
+  --color-success: oklch(59.6% 0.145 163.225); /* Tailwind emerald-600 */
+  --color-success-strong: oklch(50.8% 0.118 165.612); /* Tailwind emerald-700 */
+  --color-danger: oklch(57.7% 0.245 27.325); /* Tailwind red-600 */
+  --color-focus: oklch(76.9% 0.188 70.08); /* Tailwind amber-500 */
+
+  --font-display: "Newsreader Variable", Newsreader, ui-serif, Georgia, serif;
+  --font-body: "Geist Variable", Geist, ui-sans-serif, system-ui, sans-serif;
+  --font-outlier: "Geist Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+
+  --space-3xs: 0.25rem;
+  --space-2xs: 0.5rem;
+  --space-xs: 0.75rem;
+  --space-sm: 1rem;
+  --space-md: 1.5rem;
+  --space-lg: 2rem;
+  --space-xl: 3rem;
+  --space-2xl: 4.5rem;
+  --space-3xl: 7rem;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-md: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.75rem;
+  --text-2xl: 2.25rem;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms;
+  --dur-short: 180ms;
+  --dur-long: 300ms;
+  --rule-hair: 1px;
+  --rule-fine: 2px;
+  --radius-card: 0.5rem;
+  --radius-input: 0.5rem;
+  --radius-pill: 999px;
+  --shadow-card: 0 1px 2px color-mix(in oklab, var(--color-ink) 5%, transparent);
+}
+
+@theme inline {
+  --color-background: var(--color-paper);
+  --color-foreground: var(--color-ink);
+  --color-card: white;
+  --color-card-foreground: var(--color-ink);
+  --color-popover: white;
+  --color-popover-foreground: var(--color-ink);
+  --color-primary: var(--color-brand);
+  --color-primary-foreground: var(--color-brand-ink);
+  --color-secondary: var(--color-paper-2);
+  --color-secondary-foreground: var(--color-ink);
+  --color-muted: var(--color-paper-2);
+  --color-muted-foreground: var(--color-muted);
+  --color-accent: var(--color-brand-soft);
+  --color-accent-foreground: var(--color-ink);
+  --color-destructive: var(--color-danger);
+  --color-border: var(--color-rule);
+  --color-input: var(--color-rule);
+  --color-ring: var(--color-focus);
+  --font-sans: var(--font-body);
+  --font-serif: var(--font-display);
+  --font-mono: var(--font-outlier);
+  --radius-sm: calc(var(--radius-card) * 0.75);
+  --radius-md: var(--radius-card);
+  --radius-lg: calc(var(--radius-card) * 1.25);
+}

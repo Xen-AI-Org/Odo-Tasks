@@ -1,0 +1,9 @@
+{
+  "date": "2026-07-18",
+  "framework": "Vite 6 + TypeScript + Tauri 2",
+  "font_stack": "system sans + Georgia before redesign",
+  "palette": "warm cream, charcoal, amber, emerald",
+  "motion": "motion-cut with lightweight CSS transitions",
+  "spacing": "compact desktop scale",
+  "source_files": ["package.json", "src/main.ts", "src/styles.css"]
+}
