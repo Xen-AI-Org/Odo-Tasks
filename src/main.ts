@@ -1404,6 +1404,9 @@ function bindProjectPointerDrag(card: HTMLElement) {
 
     const pointerId = event.pointerId;
     const origin = { x: event.clientX, y: event.clientY };
+    const sourceRect = card.getBoundingClientRect();
+    const grabX = Math.max(0, Math.min(sourceRect.width, event.clientX - sourceRect.left));
+    const grabY = Math.max(0, Math.min(sourceRect.height, event.clientY - sourceRect.top));
     let started = false;
     let activeStatus: ProjectStatus | null = null;
     const cleanup = () => {
@@ -1422,15 +1425,19 @@ function bindProjectPointerDrag(card: HTMLElement) {
         projectDragPreview.classList.remove("is-dragging");
         projectDragPreview.classList.add("project-drag-preview");
         projectDragPreview.setAttribute("aria-hidden", "true");
+        projectDragPreview.setAttribute("tabindex", "-1");
         projectDragPreview.removeAttribute("draggable");
-        projectDragPreview.style.width = `${card.getBoundingClientRect().width}px`;
+        projectDragPreview.querySelectorAll<HTMLElement>("button,[tabindex]").forEach((element) => element.setAttribute("tabindex", "-1"));
+        projectDragPreview.style.width = `${sourceRect.width}px`;
+        projectDragPreview.style.height = `${sourceRect.height}px`;
+        projectDragPreview.style.transform = `translate3d(${moveEvent.clientX - grabX}px, ${moveEvent.clientY - grabY}px, 0)`;
         document.body.append(projectDragPreview);
         window.getSelection()?.removeAllRanges();
         announceDrag(`Moving “${project.name}”. Choose another stage.`);
       }
       moveEvent.preventDefault();
       window.getSelection()?.removeAllRanges();
-      if (projectDragPreview) projectDragPreview.style.transform = `translate3d(${moveEvent.clientX + 14}px, ${moveEvent.clientY + 14}px, 0)`;
+      if (projectDragPreview) projectDragPreview.style.transform = `translate3d(${moveEvent.clientX - grabX}px, ${moveEvent.clientY - grabY}px, 0)`;
       const nextStatus = projectStatusAt(moveEvent.clientX, moveEvent.clientY);
       if (nextStatus !== activeStatus) { activeStatus = nextStatus; highlightProjectStatus(activeStatus); }
     };

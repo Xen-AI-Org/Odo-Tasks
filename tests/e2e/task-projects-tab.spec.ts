@@ -47,13 +47,23 @@ test("drags a project to another stage with mouse input and persists the status"
   const sourceBox = await project.boundingBox();
   const targetBox = await completed.locator(".project-column-list").boundingBox();
   if (!sourceBox || !targetBox) throw new Error("Expected project and destination stage to be visible");
+  const end = { x: targetBox.x + targetBox.width / 2, y: targetBox.y + Math.min(targetBox.height / 2, 90) };
   await page.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
   await page.mouse.down();
-  await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + Math.min(targetBox.height / 2, 90), { steps: 12 });
+  await page.mouse.move(end.x, end.y, { steps: 12 });
   await expect(completed).toHaveClass(/is-drop-target/);
+  const preview = page.locator(".project-drag-preview");
+  await expect(preview).toBeVisible();
+  const previewBox = await preview.boundingBox();
+  expect(previewBox?.width).toBeCloseTo(sourceBox.width, 0);
+  expect(previewBox?.height).toBeCloseTo(sourceBox.height, 0);
+  expect(previewBox?.x).toBeCloseTo(end.x - sourceBox.width / 2, 0);
+  expect(previewBox?.y).toBeCloseTo(end.y - sourceBox.height / 2, 0);
+  await expect.poll(() => preview.evaluate((element) => getComputedStyle(element).transitionDuration)).toBe("0s");
   await page.mouse.up();
 
   await expect(page.locator('main.projects-view[aria-label="Projects"]')).toBeVisible();
+  await expect(preview).not.toBeVisible();
   await expect(completed.locator('[data-project-id="summer-launch"]')).toBeVisible();
   await expect.poll(() => storedProjectStatus(page, "summer-launch")).toBe("completed");
 
