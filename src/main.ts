@@ -32,6 +32,7 @@ type DialogState = { options: DialogOptions; trigger: HTMLElement | null; resolv
 
 const STORAGE_KEY = "odo-notes-workspace-v2";
 const MOTION_KEY = "odo-motion-enabled";
+const DARK_KEY = "odo-dark-mode";
 const NOTE_DRAG_TYPE = "application/x-odo-note";
 const FOLDER_DRAG_TYPE = "application/x-odo-folder";
 const isDesktopApp = "__TAURI_INTERNALS__" in window;
@@ -133,6 +134,7 @@ let mcpSettingsError = "";
 let lastMcpChangeVersion = -1;
 let reloadingWorkspace = false;
 let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
+let darkMode = localStorage.getItem(DARK_KEY) === "true";
 let draggingNoteId = "";
 let draggingFolderId = "";
 let projectDragPreview: HTMLElement | null = null;
@@ -305,7 +307,7 @@ function renderTaskDetail() {
   const statusOptions = ["todo", "in_progress", "review", "planning", "done"];
   const priorityOptions = ["low", "medium", "high", "urgent"];
   const effortOptions = [1, 2, 3, 4, 5];
-  const durationOptions = [15, 30, 45, 60, 90, 120, 150, 180, 240];
+  const durationOptions = [5, 10, 15, 30, 45, 60, 90, 120, 150, 180, 240];
   const select = (prop: string, options: (string | number)[], selected: string | number) => `<select data-task-prop="${attr(prop)}">${options.map((o) => `<option value="${attr(String(o))}" ${o === selected ? "selected" : ""}>${escapeHtml(String(o))}</option>`).join("")}</select>`;
   const categories = state.todoCategories.map((c) => `<option value="${attr(c.id)}" ${c.id === todo.categoryId ? "selected" : ""}>${escapeHtml(c.name)}</option>`).join("");
   const projects = `<option value="">No project</option>${state.projects.map((project) => `<option value="${attr(project.id)}" ${project.id === todo.projectId ? "selected" : ""}>${escapeHtml(project.name)}</option>`).join("")}`;
@@ -566,7 +568,9 @@ function renderProjects() {
   const project = state.projects.find((item) => item.id === selectedProjectId);
   return project ? renderProjectDetail(project) : renderProjectsBoard();
 }
-const slotHeight = 32;
+let slotHeight = 32;
+const SLOT_HEIGHT_MIN = 16;
+const SLOT_HEIGHT_MAX = 120;
 const categoryFor = (todo: Todo) => state.todoCategories.find((category) => category.id === todo.categoryId) ?? state.todoCategories[0];
 const dateKey = (date: Date) => `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;
 const dayStart = (offset: number) => { const date = new Date(plannerDate); date.setDate(date.getDate() + offset); return date; };
@@ -576,9 +580,9 @@ function renderTasks() {
   const days = Number(state.plannerView); const active = state.todos.filter((todo) => !todo.completed && matchesInboxTab(todo)); const rangeEnd = dayStart(days - 1);
   const title = days === 1 ? plannerDate.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"}) : `${plannerDate.toLocaleDateString(undefined,{month:"short",day:"numeric"})} – ${rangeEnd.toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric"})}`;
   const taskList = `<form id="quick-task-form" class="planner-quick-add"><i class="ph ph-plus"></i><input id="quick-task-input" autocomplete="off" placeholder="Add a task…" aria-label="New task"><kbd>Enter</kbd></form><div class="planner-inbox-meta"><span>${active.length} open</span><span>${state.todos.filter(t=>t.scheduledStart && !t.completed).length} scheduled</span></div><div class="planner-categories">${state.todoCategories.map(category => { const tasks = state.todos.filter(todo=>todo.categoryId===category.id && matchesInboxTab(todo)); return `<section class="planner-category" data-category-id="${attr(category.id)}"><header><span class="category-dot" style="--category:${attr(category.color)}"></span><strong>${escapeHtml(category.name)}</strong><small>${tasks.filter(t=>!t.completed).length}</small><button data-category-add="${attr(category.id)}" aria-label="Add ${attr(category.name)} task"><i class="ph ph-plus"></i></button></header><div class="planner-task-list">${tasks.filter(todo=>!todo.completed).map(renderPlannerTodo).join("") || '<p class="planner-empty">No open tasks</p>'}</div></section>`; }).join("")}</div><section class="planner-complete"><button id="toggle-completed" aria-expanded="${!completedCollapsed}"><i class="ph ph-caret-${completedCollapsed?"right":"down"}"></i> Completed <small>${state.todos.filter(t=>t.completed).length}</small></button>${completedCollapsed?"":`<div>${state.todos.filter(t=>t.completed).map(renderPlannerTodo).join("")}</div>`}</section>`;
-  return `<main class="planner-view" aria-label="Task planner"><aside class="planner-inbox"><header><div><span class="eyebrow">Daily workspace</span><h1>Tasks</h1></div><button class="icon-button" id="add-category" title="Add category" aria-label="Add category"><i class="ph ph-plus"></i></button></header><nav class="planner-tabs" aria-label="Task views"><button class="${plannerInboxTab==="inbox"?"is-active":""}" data-task-tab="inbox">Inbox</button><button class="${plannerInboxTab==="scheduled"?"is-active":""}" data-task-tab="scheduled">Scheduled</button></nav>${taskList}</aside><section class="planner-calendar"><header class="planner-toolbar"><div><button class="icon-button" data-planner-nav="prev" aria-label="Previous dates"><i class="ph ph-caret-left"></i></button><button class="today-button" data-planner-nav="today">Today</button><button class="icon-button" data-planner-nav="next" aria-label="Next dates"><i class="ph ph-caret-right"></i></button><h2>${title}</h2></div><div><input id="planner-date" type="date" value="${dateKey(plannerDate)}" aria-label="Jump to date"><select id="planner-view" aria-label="Calendar view">${[["1","1 day"],["3","3 days"],["4","4 days"],["7","Week"]].map(([value,label])=>`<option value="${value}" ${state.plannerView===value?"selected":""}>${label}</option>`).join("")}</select></div></header><div class="calendar-scroll" id="calendar-scroll"><div class="calendar-grid" style="--days:${days}"><div class="calendar-days"><div class="time-gutter"></div>${Array.from({length:days},(_,index)=>renderCalendarDayHeader(dayStart(index))).join("")}</div><div class="calendar-body"><div class="time-axis">${Array.from({length:24},(_,hour)=>`<span style="top:${hour*2*slotHeight}px">${String(hour).padStart(2,"0")}:00</span>`).join("")}</div><div class="calendar-columns">${Array.from({length:days},(_,index)=>renderCalendarColumn(dayStart(index))).join("")}</div></div></div></div></section>${taskMenuTodoId ? renderPlannerProperties(state.todos.find(t=>t.id===taskMenuTodoId)!) : ""}<div class="planner-live" aria-live="polite"></div></main>`;
+  return `<main class="planner-view" aria-label="Task planner"><aside class="planner-inbox"><header><div><span class="eyebrow">Daily workspace</span><h1>Tasks</h1></div><button class="icon-button" id="add-category" title="Add category" aria-label="Add category"><i class="ph ph-plus"></i></button></header><nav class="planner-tabs" aria-label="Task views"><button class="${plannerInboxTab==="inbox"?"is-active":""}" data-task-tab="inbox">Inbox</button><button class="${plannerInboxTab==="scheduled"?"is-active":""}" data-task-tab="scheduled">Scheduled</button></nav>${taskList}</aside><section class="planner-calendar"><header class="planner-toolbar"><div><button class="icon-button" data-planner-nav="prev" aria-label="Previous dates"><i class="ph ph-caret-left"></i></button><button class="today-button" data-planner-nav="today">Today</button><button class="icon-button" data-planner-nav="next" aria-label="Next dates"><i class="ph ph-caret-right"></i></button><h2>${title}</h2></div><div><input id="planner-date" type="date" value="${dateKey(plannerDate)}" aria-label="Jump to date"><select id="planner-view" aria-label="Calendar view">${[["1","1 day"],["3","3 days"],["4","4 days"],["7","Week"]].map(([value,label])=>`<option value="${value}" ${state.plannerView===value?"selected":""}>${label}</option>`).join("")}</select></div></header><div class="calendar-scroll" id="calendar-scroll"><div class="calendar-grid" style="--days:${days};--slot-height:${slotHeight}px"><div class="calendar-days"><div class="time-gutter"></div>${Array.from({length:days},(_,index)=>renderCalendarDayHeader(dayStart(index))).join("")}</div><div class="calendar-body"><div class="time-axis">${Array.from({length:24},(_,hour)=>{const d=new Date();d.setHours(hour,0,0,0);return `<span style="top:${hour*2*slotHeight}px">${d.toLocaleTimeString([],{hour:"numeric",hour12:true})}</span>`;}).join("")}</div><div class="calendar-columns">${Array.from({length:days},(_,index)=>renderCalendarColumn(dayStart(index))).join("")}</div></div></div></div></section>${taskMenuTodoId ? renderPlannerProperties(state.todos.find(t=>t.id===taskMenuTodoId)!) : ""}<div class="planner-live" aria-live="polite"></div></main>`;
 }
-function renderPlannerTodo(todo: Todo) { const category = categoryFor(todo); const time = taskTime(todo); const timeLabel = time ? ` · ${time.toLocaleDateString(undefined,{month:"short",day:"numeric"})} · ${time.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}` : " · Unscheduled"; return `<article class="planner-task-card ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><div><strong>${escapeHtml(todo.text)}</strong><small><span class="priority-dot ${todo.priority}"></span>${"•".repeat(todo.effort)}${"·".repeat(5-todo.effort)} ${timeLabel}</small></div><span class="task-chip" style="--category:${attr(todo.color||category.color)}">${escapeHtml(category.name)}</span><button class="task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
+function renderPlannerTodo(todo: Todo) { const category = categoryFor(todo); const time = taskTime(todo); const timeLabel = time ? ` · ${time.toLocaleDateString(undefined,{month:"short",day:"numeric"})} · ${time.toLocaleTimeString([],{hour:"numeric",minute:"2-digit",hour12:true})}` : " · Unscheduled"; return `<article class="planner-task-card ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><div><strong>${escapeHtml(todo.text)}</strong><small><span class="priority-dot ${todo.priority}"></span>${"•".repeat(todo.effort)}${"·".repeat(5-todo.effort)} ${timeLabel}</small></div><span class="task-chip" style="--category:${attr(todo.color||category.color)}">${escapeHtml(category.name)}</span><button class="task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
 function renderCalendarDayHeader(date: Date) {
   const today = dateKey(date) === dateKey(new Date());
   const key = dateKey(date);
@@ -586,13 +590,37 @@ function renderCalendarDayHeader(date: Date) {
   const taskLines = dayTasks.map(todo => {
     const t = new Date(todo.scheduledStart!);
     const category = categoryFor(todo);
-    return `<div class="day-task-line" data-todo-id="${attr(todo.id)}"><span class="day-task-time">${t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</span><span class="day-task-text">${escapeHtml(todo.text)}</span><span class="day-task-dot" style="--category:${attr(todo.color || category.color)}"></span></div>`;
+    return `<div class="day-task-line" data-todo-id="${attr(todo.id)}"><span class="day-task-time">${t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true })}</span><span class="day-task-text">${escapeHtml(todo.text)}</span><span class="day-task-dot" style="--category:${attr(todo.color || category.color)}"></span></div>`;
   }).join("");
   return `<div class="calendar-day-header ${today ? "is-today" : ""}"><div class="calendar-day-label"><span>${date.toLocaleDateString(undefined, { weekday: "short" })}</span><strong>${date.getDate()}</strong></div>${taskLines ? `<div class="day-task-lines">${taskLines}</div>` : ""}</div>`;
 }
-function renderCalendarColumn(date: Date) { const key=dateKey(date); const nowDate=new Date(); const isToday=key===dateKey(nowDate); const tasks=state.todos.filter(todo=>todo.scheduledStart && dateKey(new Date(todo.scheduledStart))===key); const slots=Array.from({length:48},(_,i)=>`<div class="calendar-slot" data-slot-date="${key}" data-slot-minute="${i*30}"></div>`).join(""); const current=isToday?`<div class="now-line" style="top:${(nowDate.getHours()*60+nowDate.getMinutes())/30*slotHeight}px"><span>Now</span></div>`:""; return `<div class="calendar-column" data-calendar-date="${key}">${slots}${tasks.map(renderCalendarTask).join("")}${current}</div>`; }
-function renderCalendarTask(todo: Todo) { const start=taskTime(todo)!; const category=categoryFor(todo); const minutes=start.getHours()*60+start.getMinutes(); const top=minutes/30*slotHeight; const height=Math.max(slotHeight,todo.durationMinutes/30*slotHeight); const ending=new Date(start.getTime()+todo.durationMinutes*60000); const titleField = editingTodoId === todo.id ? `<input type="text" class="task-edit-input" data-edit-todo="${attr(todo.id)}" value="${attr(todo.text)}" autocomplete="off" placeholder="Task name">` : `<strong>${escapeHtml(todo.text)}</strong>`; return `<article class="calendar-task ${todo.completed?"is-complete":""}" data-calendar-task="${attr(todo.id)}" data-todo-id="${attr(todo.id)}" tabindex="0" role="button" style="top:${top}px;height:${height}px;--task-color:${attr(todo.color||category.color)}"><div class="calendar-task-content"><span class="priority-band ${todo.priority}"></span><button class="calendar-check" data-toggle-todo="${attr(todo.id)}" aria-label="Complete task"><i class="ph ph-check"></i></button><div><small>${start.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})} – ${ending.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}</small>${titleField}</div></div><span class="calendar-resize" data-resize-todo="${attr(todo.id)}" title="Resize duration"></span></article>`; }
-function renderPlannerProperties(todo: Todo) { const category=categoryFor(todo); const popover=plannerPopover ?? {x:window.innerWidth-315,y:90,returnId:todo.id}; return `<div class="planner-properties-backdrop"><section class="planner-properties" role="dialog" aria-modal="false" aria-label="Task properties" tabindex="-1" style="left:${popover.x}px;top:${popover.y}px"><header><div><span class="eyebrow">Task properties</span><h2>${escapeHtml(todo.text)}</h2></div><button class="icon-button" data-close-properties aria-label="Close"><i class="ph ph-x"></i></button></header><label>Category<select data-prop="categoryId">${state.todoCategories.map(c=>`<option value="${attr(c.id)}" ${c.id===todo.categoryId?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</select></label><div class="property-two"><label>Priority<select data-prop="priority">${["low","medium","high","urgent"].map(p=>`<option ${p===todo.priority?"selected":""}>${p}</option>`).join("")}</select></label><label>Effort<select data-prop="effort">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===todo.effort?"selected":""}>${n} / 5</option>`).join("")}</select></label></div><label>Color<input data-prop="color" type="color" value="${attr(todo.color||category.color)}"></label><label>Start<input data-prop="scheduledStart" type="datetime-local" value="${todo.scheduledStart?todo.scheduledStart.slice(0,16):""}"></label><label>Duration<select data-prop="durationMinutes">${[15,30,45,60,90,120,150,180,240].map(n=>`<option value="${n}" ${n===todo.durationMinutes?"selected":""}>${n} minutes</option>`).join("")}</select></label><footer><button class="secondary-button" data-unschedule>Unschedule</button><button class="secondary-button ${todo.completed?"":""}" data-toggle-todo="${attr(todo.id)}">${todo.completed?"Reopen":"Complete"}</button><button class="danger-button" data-delete-todo="${attr(todo.id)}">Delete</button></footer></section></div>`; }
+function computeTaskLayout(tasks: Todo[]): Map<string, { colIndex: number; colCount: number }> {
+  const layout = new Map<string, { colIndex: number; colCount: number }>();
+  if (tasks.length === 0) return layout;
+  const items = tasks.map(todo => { const s = taskTime(todo)!; const sm = s.getHours() * 60 + s.getMinutes(); return { todo, startMin: sm, endMin: sm + todo.durationMinutes }; }).sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
+  const assign = (cluster: typeof items) => {
+    if (cluster.length === 0) return;
+    const columns: number[] = [];
+    for (const item of cluster) {
+      let placed = false;
+      for (let c = 0; c < columns.length; c++) { if (columns[c] <= item.startMin) { columns[c] = item.endMin; layout.set(item.todo.id, { colIndex: c, colCount: 0 }); placed = true; break; } }
+      if (!placed) { columns.push(item.endMin); layout.set(item.todo.id, { colIndex: columns.length - 1, colCount: 0 }); }
+    }
+    for (const id of layout.keys()) { if (cluster.some(c => c.todo.id === id)) layout.set(id, { colIndex: layout.get(id)!.colIndex, colCount: columns.length }); }
+  };
+  let cluster: typeof items = []; let clusterEnd = -1;
+  for (const item of items) {
+    if (item.startMin > clusterEnd) { assign(cluster); cluster = [item]; clusterEnd = item.endMin; }
+    else { cluster.push(item); clusterEnd = Math.max(clusterEnd, item.endMin); }
+  }
+  assign(cluster);
+  return layout;
+}
+function renderCalendarColumn(date: Date) { const key=dateKey(date); const nowDate=new Date(); const isToday=key===dateKey(nowDate); const tasks=state.todos.filter(todo=>todo.scheduledStart && dateKey(new Date(todo.scheduledStart))===key); const layout=computeTaskLayout(tasks); const slots=Array.from({length:48},(_,i)=>`<div class="calendar-slot" data-slot-date="${key}" data-slot-minute="${i*30}"></div>`).join(""); const current=isToday?`<div class="now-line" style="top:${(nowDate.getHours()*60+nowDate.getMinutes())/30*slotHeight}px"><span>Now</span></div>`:""; return `<div class="calendar-column" data-calendar-date="${key}">${slots}${tasks.map(todo=>renderCalendarTask(todo,layout.get(todo.id))).join("")}${current}</div>`; }
+function taskStageClass(pxHeight: number): string { if (pxHeight >= 90) return ""; if (pxHeight >= 60) return "is-medium"; if (pxHeight >= 40) return "is-short"; return "is-tiny"; }
+function applyTaskStage(block: HTMLElement, pxHeight: number) { block.classList.remove("is-medium","is-short","is-tiny"); const cls = taskStageClass(pxHeight); if (cls) block.classList.add(cls); }
+function renderCalendarTask(todo: Todo, layout?: { colIndex: number; colCount: number }) { const start=taskTime(todo)!; const category=categoryFor(todo); const minutes=start.getHours()*60+start.getMinutes(); const top=minutes/30*slotHeight; const height=Math.max(26,todo.durationMinutes/30*slotHeight); const ending=new Date(start.getTime()+todo.durationMinutes*60000); const stage=taskStageClass(height); const singleLine=stage==="is-short"||stage==="is-tiny"; const colIndex=layout?.colIndex??0; const colCount=layout?.colCount??1; const sideBySide=colCount>1; const leftStyle=sideBySide?`left:calc(5px + ${colIndex} * (100% - 10px) / ${colCount});width:calc((100% - 10px) / ${colCount} - 3px);right:auto;`:""; const titleField = editingTodoId === todo.id ? `<input type="text" class="task-edit-input" data-edit-todo="${attr(todo.id)}" value="${attr(todo.text)}" autocomplete="off" placeholder="Task name">` : `<strong>${escapeHtml(todo.text)}</strong>`; const fullLabel=`${start.toLocaleTimeString([],{hour:"numeric",minute:"2-digit",hour12:true})} – ${ending.toLocaleTimeString([],{hour:"numeric",minute:"2-digit",hour12:true})}`; const shortLabel=`${start.toLocaleTimeString([],{hour:"numeric",minute:"2-digit",hour12:true})}`; return `<article class="calendar-task ${todo.completed?"is-complete":""} ${stage}" data-calendar-task="${attr(todo.id)}" data-todo-id="${attr(todo.id)}" tabindex="0" role="button" title="${attr(fullLabel)}" style="top:${top}px;height:${height}px;${leftStyle}--task-color:${attr(todo.color||category.color)}"><div class="calendar-task-content"><span class="priority-band ${todo.priority}"></span><button class="calendar-check" data-toggle-todo="${attr(todo.id)}" aria-label="Complete task"><i class="ph ph-check"></i></button><div><small>${singleLine?shortLabel:fullLabel}</small>${titleField}</div></div><span class="calendar-resize" data-resize-todo="${attr(todo.id)}" title="Resize duration"></span></article>`; }
+function renderPlannerProperties(todo: Todo) { const category=categoryFor(todo); const popover=plannerPopover ?? {x:window.innerWidth-315,y:90,returnId:todo.id}; return `<div class="planner-properties-backdrop"><section class="planner-properties" role="dialog" aria-modal="false" aria-label="Task properties" tabindex="-1" style="left:${popover.x}px;top:${popover.y}px"><header><div><span class="eyebrow">Task properties</span><h2>${escapeHtml(todo.text)}</h2></div><button class="icon-button" data-close-properties aria-label="Close"><i class="ph ph-x"></i></button></header><label>Category<select data-prop="categoryId">${state.todoCategories.map(c=>`<option value="${attr(c.id)}" ${c.id===todo.categoryId?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</select></label><div class="property-two"><label>Priority<select data-prop="priority">${["low","medium","high","urgent"].map(p=>`<option ${p===todo.priority?"selected":""}>${p}</option>`).join("")}</select></label><label>Effort<select data-prop="effort">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===todo.effort?"selected":""}>${n} / 5</option>`).join("")}</select></label></div><label>Color<input data-prop="color" type="color" value="${attr(todo.color||category.color)}"></label><label>Start<input data-prop="scheduledStart" type="datetime-local" value="${todo.scheduledStart?todo.scheduledStart.slice(0,16):""}"></label><label>Duration<select data-prop="durationMinutes">${[5,10,15,30,45,60,90,120,150,180,240].map(n=>`<option value="${n}" ${n===todo.durationMinutes?"selected":""}>${n} minutes</option>`).join("")}</select></label><footer><button class="secondary-button" data-unschedule>Unschedule</button><button class="secondary-button ${todo.completed?"":""}" data-toggle-todo="${attr(todo.id)}">${todo.completed?"Reopen":"Complete"}</button><button class="danger-button" data-delete-todo="${attr(todo.id)}">Delete</button></footer></section></div>`; }
 
 function journalDateLabel(key: string) { const date = new Date(`${key}T12:00:00`); return date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" }); }
 function journalTime(iso: string) { return new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", hour12: true }).replace(/\s([ap]m)$/i, (_match, marker: string) => ` ${marker.toUpperCase()}`); }
@@ -660,7 +688,7 @@ function renderSettings() {
   return `<main class="wide-view settings-view"><header class="wide-header"><div><span class="eyebrow">Preferences</span><h1>Settings</h1><p>Make Odo feel at home on this computer.</p></div><button class="icon-button close-wide" data-go-inbox title="Back to notes"><i class="ph ph-x"></i></button></header><div class="settings-sheet">
     ${renderMcpSettings()}
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-database"></i><div><h2>Storage & backups</h2><p>${isDesktopApp ? "Your workspace is stored locally on this computer." : "Browser mode stores this workspace in local storage."}</p></div></div>${isDesktopApp ? `<div class="path-grid"><span>Database</span><code>${escapeHtml(storageInfo?.databasePath ?? "Loading…")}</code><span>Backups</span><code>${escapeHtml(storageInfo?.backupDirectory ?? "Loading…")}</code></div><button class="secondary-button" id="create-backup" ${storageError ? "disabled" : ""}><i class="ph ph-cloud-arrow-up"></i>Create backup</button>${storageError ? `<p class="inline-error">${escapeHtml(storageError)}</p>` : ""}` : '<div class="browser-note"><i class="ph ph-info"></i>Install and open the desktop app to create file backups.</div>'}</section>
-    <section class="settings-section"><div class="settings-copy"><i class="ph ph-sparkle"></i><div><h2>Appearance & motion</h2><p>Keep transitions calm, quick, and comfortable.</p></div></div><label class="switch-row"><span>Interface motion<small>Menus, panels, and task feedback</small></span><input id="motion-toggle" type="checkbox" ${motionEnabled ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label></section>
+    <section class="settings-section"><div class="settings-copy"><i class="ph ph-sparkle"></i><div><h2>Appearance & motion</h2><p>Keep transitions calm, quick, and comfortable.</p></div></div><label class="switch-row"><span>Dark mode<small>Easier on the eyes in low light</small></span><input id="dark-toggle" type="checkbox" ${darkMode ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label><label class="switch-row"><span>Interface motion<small>Menus, panels, and task feedback</small></span><input id="motion-toggle" type="checkbox" ${motionEnabled ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label></section>
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-keyboard"></i><div><h2>Keyboard shortcuts</h2><p>Everything important stays within reach.</p></div></div><div class="shortcut-grid">${[["New note",`${modLabel}+N`],["New folder",`${modLabel}+Shift+N`],["Search",`${modLabel}+K`],["Tasks",`${modLabel}+2`],["Next note",`${modLabel}+Tab`],["Previous note",`${modLabel}+Shift+Tab`],["Save",`${modLabel}+S`],["Focus mode",`${modLabel}+Shift+F`]].map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join("")}</div><button class="secondary-button" id="show-help"><i class="ph ph-question"></i>View all shortcuts</button></section></div></main>`;
 }
 function renderDialogLayer() {
@@ -689,6 +717,7 @@ function renderApp() {
   if (!workspaceReady) { document.querySelector<HTMLElement>("#app")!.innerHTML = '<main class="loading-shell" aria-label="Loading Odo"><span class="loading-wordmark">Odo</span><span class="loading-line"></span><span>Opening your workspace…</span></main>'; return; }
   repairState(); closeMenu(false);
   document.documentElement.classList.toggle("no-motion", !motionEnabled);
+  document.documentElement.classList.toggle("dark-mode", darkMode);
   const app = document.querySelector<HTMLElement>("#app")!;
   const previousPlannerScroll = currentView === "tasks" ? document.querySelector<HTMLElement>("#calendar-scroll") : null;
   const plannerScrollPosition = previousPlannerScroll ? { top: previousPlannerScroll.scrollTop, left: previousPlannerScroll.scrollLeft } : null;
@@ -1411,7 +1440,7 @@ async function createMilestone(project: Project) {
 async function createProjectTask(project: Project, milestoneId: string | null = null) {
   const text = await promptOdo("Add a task", `Add a task to “${project.name}”.`, "Untitled task");
   if (!text) return;
-  const timestamp = now(); const todo: Todo = { id: uid("todo"), text, completed: false, created: timestamp, updated: timestamp, categoryId: "inbox", priority: "medium", effort: 2, color: "", scheduledStart: null, durationMinutes: 30, status: "todo", content: "", projectId: project.id, milestoneId };
+  const timestamp = now(); const todo: Todo = { id: uid("todo"), text, completed: false, created: timestamp, updated: timestamp, categoryId: "inbox", priority: "medium", effort: 2, color: "", scheduledStart: null, durationMinutes: 15, status: "todo", content: "", projectId: project.id, milestoneId };
   state.todos.unshift(todo); await saveState(false); renderApp(); openTaskDetail(todo.id);
 }
 function clearProjectDragVisuals() {
@@ -1589,7 +1618,7 @@ function bindJournalEvents() {
 function bindTaskEvents() {
   document.querySelector("#quick-task-form")?.addEventListener("submit", (event) => { event.preventDefault(); const input = document.querySelector<HTMLInputElement>("#quick-task-input")!; const text = input.value.trim(); if (!text) return; addPlannerTodo(text); });
   document.querySelector("#add-category")?.addEventListener("click", () => { void (showOdoDialog({ kind:"prompt", title:"New category", message:"Name a task category.", label:"Category name", initialValue:"", confirmLabel:"Create category", cancelLabel:"Cancel", validate:(value:string)=>value.trim()?null:"A category needs a name." }) as Promise<string | null>).then((value:string | null) => { if (typeof value !== "string") return; const colors=["#7b8e7c","#7499b1","#9184a8","#c5903f","#bd7064","#71808c"]; state.todoCategories.push({id:uid("category"),name:value.trim(),color:colors[state.todoCategories.length%colors.length],icon:"ph-tag"}); void saveState(false); renderApp(); }); });
-  document.querySelectorAll<HTMLElement>("[data-category-add]").forEach(button => button.addEventListener("click", () => { const categoryId=button.dataset.categoryAdd!; const timestamp=now(); state.todos.unshift({id:uid("todo"),text:"Untitled task",completed:false,created:timestamp,updated:timestamp,categoryId,priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:30,status:"todo",content:""}); void saveState(false); renderApp(); }));
+  document.querySelectorAll<HTMLElement>("[data-category-add]").forEach(button => button.addEventListener("click", () => { const categoryId=button.dataset.categoryAdd!; const timestamp=now(); state.todos.unshift({id:uid("todo"),text:"Untitled task",completed:false,created:timestamp,updated:timestamp,categoryId,priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:15,status:"todo",content:""}); void saveState(false); renderApp(); }));
   document.querySelectorAll<HTMLElement>("[data-planner-nav]").forEach(button => button.addEventListener("click", () => { const action=button.dataset.plannerNav; if(action==="today") plannerDate=new Date(); else plannerDate.setDate(plannerDate.getDate()+(action==="next"?Number(state.plannerView):-Number(state.plannerView))); plannerDate.setHours(0,0,0,0); renderApp(); scrollPlannerToNow(); }));
   document.querySelector<HTMLSelectElement>("#planner-view")?.addEventListener("change", (event)=>{ state.plannerView=(event.target as HTMLSelectElement).value as PlannerView; void saveState(false); renderApp(); });
   document.querySelector<HTMLInputElement>("#planner-date")?.addEventListener("change", (event)=>{ const value=(event.target as HTMLInputElement).value; if(value) { plannerDate=new Date(`${value}T00:00:00`); renderApp(); } });
@@ -1611,13 +1640,25 @@ function bindTaskEvents() {
     block.addEventListener("keydown", handleTaskKeydown);
   });
   document.querySelectorAll<HTMLElement>("[data-resize-todo]").forEach(handle=>handle.addEventListener("pointerdown", startResize));
-  document.querySelectorAll<HTMLElement>(".calendar-slot").forEach((slot) => { slot.addEventListener("click", () => { const key = slot.dataset.slotDate!; const minute = Number(slot.dataset.slotMinute); const date = new Date(`${key}T00:00:00`); date.setMinutes(minute); const timestamp = now(); const id = uid("todo"); state.todos.unshift({ id, text: "", completed: false, created: timestamp, updated: timestamp, categoryId: "inbox", priority: "medium", effort: 2, color: "", scheduledStart: date.toISOString(), durationMinutes: 30, status: "todo", content: "" }); editingTodoId = id; void saveState(false); renderApp(); focusTodoEditor(id); }); });
+  document.querySelectorAll<HTMLElement>(".calendar-slot").forEach((slot) => { slot.addEventListener("click", () => { const key = slot.dataset.slotDate!; const minute = Number(slot.dataset.slotMinute); const date = new Date(`${key}T00:00:00`); date.setMinutes(minute); const timestamp = now(); const id = uid("todo"); state.todos.unshift({ id, text: "", completed: false, created: timestamp, updated: timestamp, categoryId: "inbox", priority: "medium", effort: 2, color: "", scheduledStart: date.toISOString(), durationMinutes: 15, status: "todo", content: "" }); editingTodoId = id; void saveState(false); renderApp(); focusTodoEditor(id); }); });
   document.querySelector<HTMLElement>(".planner-properties-backdrop")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closePlannerProperties(); });
   document.querySelectorAll<HTMLElement>("[data-close-properties]").forEach((button) => button.addEventListener("click", () => closePlannerProperties()));
   document.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-prop]").forEach(input=>input.addEventListener("change",()=>{const todo=state.todos.find(t=>t.id===taskMenuTodoId); if(!todo) return; const field=input.dataset.prop as keyof Todo; let value:string|number|null=input.value; if(field==="effort"||field==="durationMinutes") value=Number(value); if(field==="scheduledStart") value=input.value ? new Date(input.value).toISOString() : null; (todo as unknown as Record<string,string|number|null>)[field]=value; todo.updated=now(); void saveState(false); renderApp();}));
   document.querySelector("[data-unschedule]")?.addEventListener("click",()=>{const todo=state.todos.find(t=>t.id===taskMenuTodoId);if(todo){todo.scheduledStart=null;todo.updated=now();taskMenuTodoId="";void saveState(false);renderApp();}});
   document.querySelectorAll<HTMLElement>("[data-delete-todo]").forEach(button=>button.addEventListener("click",()=>void deletePlannerTodo(button.dataset.deleteTodo!)));
   document.querySelector<HTMLElement>("#calendar-scroll")?.addEventListener("wheel", (event) => {
+    if (event.ctrlKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      const scroll = document.querySelector<HTMLElement>("#calendar-scroll");
+      const ratio = scroll ? scroll.scrollTop / Math.max(1, scroll.scrollHeight) : 0;
+      const direction = Math.sign(event.deltaY || event.deltaX);
+      if (!direction) return;
+      slotHeight = Math.max(SLOT_HEIGHT_MIN, Math.min(SLOT_HEIGHT_MAX, Math.round(slotHeight - direction * 4)));
+      renderApp();
+      requestAnimationFrame(() => { if (scroll) scroll.scrollTop = ratio * scroll.scrollHeight; });
+      return;
+    }
     if (!event.shiftKey) return;
     event.preventDefault();
     const direction = Math.sign(event.deltaY || event.deltaX);
@@ -1625,14 +1666,14 @@ function bindTaskEvents() {
     plannerDate.setDate(plannerDate.getDate() + direction);
     plannerDate.setHours(0, 0, 0, 0);
     renderApp();
-  }, { passive: false });
+  }, { passive: false, capture: true });
   document.querySelectorAll<HTMLElement>("[data-task-tab]").forEach((tab) => tab.addEventListener("click", () => { plannerInboxTab = tab.dataset.taskTab as "inbox" | "scheduled"; renderApp(); }));
   if (taskMenuTodoId) requestAnimationFrame(() => document.querySelector<HTMLElement>(".planner-properties")?.focus());
   document.querySelectorAll<HTMLInputElement>("[data-edit-todo]").forEach((input) => { input.addEventListener("keydown", (event) => { if (event.key === "Enter") commitTodoEdit(input); if (event.key === "Escape") { editingTodoId = ""; renderApp(); } }); input.addEventListener("blur", () => { if (editingTodoId) commitTodoEdit(input); }); });
   document.querySelector("#toggle-completed")?.addEventListener("click", () => { completedCollapsed = !completedCollapsed; renderApp(); });
   document.querySelector("#clear-completed")?.addEventListener("click", async () => { const count = state.todos.filter((todo) => todo.completed).length; if (await confirmOdo("Clear completed tasks?", `${count} completed ${count === 1 ? "task" : "tasks"} will be permanently removed.`, "Clear completed", true)) { state.todos = state.todos.filter((todo) => !todo.completed); void saveState(false); renderApp(); } });
 }
-function addPlannerTodo(text:string) { const timestamp=now(); state.todos.unshift({id:uid("todo"),text,completed:false,created:timestamp,updated:timestamp,categoryId:"inbox",priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:30,status:"todo",content:""}); void saveState(false); renderApp(); requestAnimationFrame(()=>document.querySelector<HTMLInputElement>("#quick-task-input")?.focus()); }
+function addPlannerTodo(text:string) { const timestamp=now(); state.todos.unshift({id:uid("todo"),text,completed:false,created:timestamp,updated:timestamp,categoryId:"inbox",priority:"medium",effort:2,color:"",scheduledStart:null,durationMinutes:15,status:"todo",content:""}); void saveState(false); renderApp(); requestAnimationFrame(()=>document.querySelector<HTMLInputElement>("#quick-task-input")?.focus()); }
 function openPlannerProperties(id:string, trigger:HTMLElement) { const rect=trigger.getBoundingClientRect(); const width=285; const height=420; const x=Math.max(8,Math.min(rect.right+10,window.innerWidth-width-8)); const y=Math.max(8,Math.min(rect.top,window.innerHeight-height-8)); taskMenuTodoId=id; plannerPopover={x,y,returnId:id}; renderApp(); }
 function closePlannerProperties() { const returnId=plannerPopover?.returnId; taskMenuTodoId=""; plannerPopover=null; renderApp(); if(returnId) requestAnimationFrame(()=>document.querySelector<HTMLElement>(`[data-todo-id="${CSS.escape(returnId)}"]`)?.focus()); }
 function plannerDropAt(todoId: string, clientX: number, clientY: number, fromCalendar = false) {
@@ -1652,9 +1693,8 @@ function plannerDropAt(todoId: string, clientX: number, clientY: number, fromCal
   if (!target && !exact) return false;
   const date = exact?.date ?? target!.dataset.calendarDate!;
   const rect = target?.getBoundingClientRect();
-  const minute = exact?.minute ?? Math.max(0, Math.min(23 * 60 + 30, Math.round((clientY - (rect?.top ?? 0)) / slotHeight * 2) * 15));
+  const minute = exact?.minute ?? Math.max(0, Math.min(23 * 60 + 55, Math.round((clientY - (rect?.top ?? 0)) / slotHeight * 6) * 5));
   todo.scheduledStart = localStart(new Date(`${date}T00:00:00`), minute);
-  todo.durationMinutes = Math.max(30, todo.durationMinutes || 30);
   todo.updated = now();
   announcePlanner(`${todo.text} scheduled for ${new Date(todo.scheduledStart).toLocaleString()}.`);
   void saveState(false); renderApp(); return true;
@@ -1676,9 +1716,10 @@ function startPlannerPointerDrag(event:PointerEvent, source:HTMLElement) {
     }
     window.getSelection()?.removeAllRanges();
     if(preview) preview.style.transform=`translate3d(${moveEvent.clientX-grabX}px,${moveEvent.clientY-grabY}px,0)`;
+    const previewTopY=moveEvent.clientY-grabY;
     const hit=document.elementFromPoint(moveEvent.clientX,moveEvent.clientY); const slot=hit?.closest<HTMLElement>("[data-slot-minute]"); const column=slot?.closest<HTMLElement>(".calendar-column") ?? hit?.closest<HTMLElement>(".calendar-column");
     let minute=0;
-    if (column) { const rect=column.getBoundingClientRect(); minute=Math.max(0,Math.min(23*60+30,Math.round((moveEvent.clientY-rect.top)/slotHeight*2)*15)); }
+    if (column) { const rect=column.getBoundingClientRect(); minute=Math.max(0,Math.min(23*60+55,Math.round((previewTopY-rect.top)/slotHeight*6)*5)); }
     plannerPointerDrop=column ? { date:column.dataset.calendarDate!, minute } : null;
   };
   const finish=(finishEvent:PointerEvent,cancelled=false)=>{
@@ -1705,21 +1746,25 @@ function startResize(event: PointerEvent, source?: HTMLElement, edge?: "top" | "
   const anchor = edge ?? "bottom";
   plannerPointerDragging = true;
   const move = (moveEvent: PointerEvent) => {
-    const deltaRaw = Math.round(((moveEvent.clientY - startY) / slotHeight * 30) / 15) * 15;
+    const deltaRaw = Math.round(((moveEvent.clientY - startY) / slotHeight * 30) / 5) * 5;
+    let pxHeight = 26;
     if (anchor === "top" && start) {
-      const newStart = Math.max(0, Math.min(endMin - 30, startMin + deltaRaw));
+      const newStart = Math.max(0, Math.min(endMin - 5, startMin + deltaRaw));
       const newDuration = endMin - newStart;
       const base = new Date(start); base.setHours(0, 0, 0, 0);
       todo.scheduledStart = localStart(base, newStart);
       todo.durationMinutes = newDuration;
+      pxHeight = Math.max(26, newDuration / 30 * slotHeight);
       block.style.top = `${newStart / 30 * slotHeight}px`;
-      block.style.height = `${newDuration / 30 * slotHeight}px`;
+      block.style.height = `${pxHeight}px`;
     } else {
       const maxMinutes = 24 * 60 - startMin;
-      const next = Math.max(30, Math.min(maxMinutes, origin + deltaRaw));
+      const next = Math.max(5, Math.min(maxMinutes, origin + deltaRaw));
       todo.durationMinutes = next;
-      block.style.height = `${next / 30 * slotHeight}px`;
+      pxHeight = Math.max(26, next / 30 * slotHeight);
+      block.style.height = `${pxHeight}px`;
     }
+    applyTaskStage(block, pxHeight);
   };
   const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); todo.updated = now(); window.setTimeout(() => plannerPointerDragging = false, 0); void saveState(false); renderApp(); };
   window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
@@ -1735,6 +1780,7 @@ function handleTaskKeydown(event: KeyboardEvent) {
 }
 function bindSettingsEvents() {
   document.querySelector("#motion-toggle")?.addEventListener("change", (event) => { motionEnabled = (event.target as HTMLInputElement).checked; localStorage.setItem(MOTION_KEY, String(motionEnabled)); document.documentElement.classList.toggle("no-motion", !motionEnabled); });
+  document.querySelector("#dark-toggle")?.addEventListener("change", (event) => { darkMode = (event.target as HTMLInputElement).checked; localStorage.setItem(DARK_KEY, String(darkMode)); document.documentElement.classList.toggle("dark-mode", darkMode); });
   document.querySelector("#show-help")?.addEventListener("click", () => { helpOpen = true; renderApp(); requestAnimationFrame(() => document.querySelector<HTMLButtonElement>("#close-help")?.focus()); });
   document.querySelector("#create-backup")?.addEventListener("click", async (event) => { const button = event.currentTarget as HTMLButtonElement; button.disabled = true; button.innerHTML = '<i class="ph ph-circle-notch"></i>Creating…'; try { const path = await invoke<string>("create_backup"); await noticeOdo("Backup created", "Your SQLite workspace backup is ready.", path); } catch (error) { await noticeOdo("Backup failed", `Could not create a backup: ${String(error)}`); } finally { renderApp(); } });
   const readMcpForm = (): McpConfig | null => {
