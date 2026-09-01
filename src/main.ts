@@ -5,7 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "./styles.css";
 
 type NoteStatus = "active" | "archived" | "trash";
-type View = "notes" | "tasks" | "projects" | "journal" | "settings" | "archived" | "trash";
+type View = "notes" | "tasks" | "projects" | "journal" | "settings" | "archived" | "trash" | "ai" | "api" | "api-playground";
 type SortMode = "newest" | "oldest" | "manual";
 type Folder = { id: string; name: string; parentId: string | null; open: boolean; icon?: string };
 type Note = { id: string; folderId: string; title: string; content: string; updated: string; status: NoteStatus; pinned?: boolean; revision: number };
@@ -24,6 +24,11 @@ type StorageInfo = { databasePath: string; backupDirectory: string };
 type McpConfig = { enabled: boolean; host: string; port: number; authEnabled: boolean; token: string; permanentDeleteEnabled: boolean; startAtLogin: boolean };
 type McpStatus = { running: boolean; endpoint: string | null; error: string | null };
 type McpSettings = { config: McpConfig; status: McpStatus; maskedToken: string; httpSnippet: string; stdioSnippet: string };
+type AiConfig = { enabled: boolean; provider: string; model: string; webSearchEnabled: boolean; autoCreateTasks: boolean; defaultDurationMinutes: number };
+type AiSettings = { config: AiConfig; maskedKey: string };
+type AiMessage = { role: "user" | "assistant"; content: string };
+type AiMessageResponse = { response: string; createdTasks: unknown[]; usedSearch: boolean };
+type OpenApiSpec = { openapi: string; info: { title: string; version: string; description: string }; servers: { url: string }[]; paths: Record<string, unknown>; components?: { schemas?: Record<string, unknown> } };
 type SavePhase = "idle" | "saving" | "saved" | "error";
 type MenuItem = { label?: string; icon?: string; hint?: string; action?: string; disabled?: boolean; danger?: boolean; separator?: boolean };
 type MenuState = { items: MenuItem[]; x: number; y: number; trigger: HTMLElement | null } | null;
@@ -132,6 +137,15 @@ let storageError = "";
 let mcpSettings: McpSettings | null = null;
 let mcpSettingsError = "";
 let lastMcpChangeVersion = -1;
+let aiSettings: AiSettings | null = null;
+let aiSettingsError = "";
+let aiMessages: AiMessage[] = [];
+let aiLoading = false;
+let apiDocsSpec: OpenApiSpec | null = null;
+let apiDocsError = "";
+let apiPlaygroundResponse = "";
+let apiPlaygroundError = "";
+let calendarMode = localStorage.getItem("odo-calendar-mode") === "month";
 let reloadingWorkspace = false;
 let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
 let darkMode = localStorage.getItem(DARK_KEY) === "true";
@@ -292,7 +306,7 @@ function renderSidebar() {
     <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button><button class="primary-link ${currentView === "projects" ? "is-selected" : ""}" data-view="projects"><i class="ph ph-cube"></i><span>Projects</span><span class="nav-count">${state.projects.filter((project) => project.status !== "completed").length}</span></button><button class="primary-link ${currentView === "journal" ? "is-selected" : ""}" data-view="journal" aria-label="Journal"><i class="ph ph-book-open-text"></i><span>Journal</span></button></nav>
     <div class="pinned-section" data-drop-kind="pin"><div class="panel-label-row"><span>Pinned</span><button class="icon-button" id="pin-add" title="Pin a note, task, or project" aria-label="Pin a note, task, or project"><i class="ph ph-push-pin"></i></button></div><nav class="pin-list">${state.pins.map(renderPin).join("") || '<p class="pin-empty">Drag notes, tasks, or projects here</p>'}</nav>${pinPickerOpen ? renderPinPicker() : ""}</div>
     <div class="panel-label-row"><span>Folders</span><button class="icon-button" id="new-folder" title="New folder (${modLabel}+Shift+N)"><i class="ph ph-plus"></i></button></div><nav class="folder-tree" id="folder-tree">${state.folders.filter((folder) => folder.parentId === null && folder.id !== "inbox").map((folder) => renderFolder(folder)).join("")}</nav>
-    <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
+    <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class='primary-link ${currentView === "ai" ? "is-selected" : ""}' data-view='ai' aria-label='AI assistant'><i class='ph ph-sparkle'></i><span>AI</span></button><button class='primary-link ${currentView === "api" ? "is-selected" : ""}' data-view='api' aria-label='API docs'><i class='ph ph-plugs'></i><span>API</span></button><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
 }
 function renderMiniTodo(todo: Todo) { const category = categoryFor(todo); return `<article class="mini-task ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="mini-task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><span class="mini-task-text">${escapeHtml(todo.text)}</span><span class="mini-task-dot" style="--category:${attr(todo.color||category.color)}"></span><button class="mini-task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
 function renderTasksMini() {
@@ -580,7 +594,7 @@ function renderTasks() {
   const days = Number(state.plannerView); const active = state.todos.filter((todo) => !todo.completed && matchesInboxTab(todo)); const rangeEnd = dayStart(days - 1);
   const title = days === 1 ? plannerDate.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"}) : `${plannerDate.toLocaleDateString(undefined,{month:"short",day:"numeric"})} – ${rangeEnd.toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric"})}`;
   const taskList = `<form id="quick-task-form" class="planner-quick-add"><i class="ph ph-plus"></i><input id="quick-task-input" autocomplete="off" placeholder="Add a task…" aria-label="New task"><kbd>Enter</kbd></form><div class="planner-inbox-meta"><span>${active.length} open</span><span>${state.todos.filter(t=>t.scheduledStart && !t.completed).length} scheduled</span></div><div class="planner-categories">${state.todoCategories.map(category => { const tasks = state.todos.filter(todo=>todo.categoryId===category.id && matchesInboxTab(todo)); return `<section class="planner-category" data-category-id="${attr(category.id)}"><header><span class="category-dot" style="--category:${attr(category.color)}"></span><strong>${escapeHtml(category.name)}</strong><small>${tasks.filter(t=>!t.completed).length}</small><button data-category-add="${attr(category.id)}" aria-label="Add ${attr(category.name)} task"><i class="ph ph-plus"></i></button></header><div class="planner-task-list">${tasks.filter(todo=>!todo.completed).map(renderPlannerTodo).join("") || '<p class="planner-empty">No open tasks</p>'}</div></section>`; }).join("")}</div><section class="planner-complete"><button id="toggle-completed" aria-expanded="${!completedCollapsed}"><i class="ph ph-caret-${completedCollapsed?"right":"down"}"></i> Completed <small>${state.todos.filter(t=>t.completed).length}</small></button>${completedCollapsed?"":`<div>${state.todos.filter(t=>t.completed).map(renderPlannerTodo).join("")}</div>`}</section>`;
-  return `<main class="planner-view" aria-label="Task planner"><aside class="planner-inbox"><header><div><span class="eyebrow">Daily workspace</span><h1>Tasks</h1></div><button class="icon-button" id="add-category" title="Add category" aria-label="Add category"><i class="ph ph-plus"></i></button></header><nav class="planner-tabs" aria-label="Task views"><button class="${plannerInboxTab==="inbox"?"is-active":""}" data-task-tab="inbox">Inbox</button><button class="${plannerInboxTab==="scheduled"?"is-active":""}" data-task-tab="scheduled">Scheduled</button></nav>${taskList}</aside><section class="planner-calendar"><header class="planner-toolbar"><div><button class="icon-button" data-planner-nav="prev" aria-label="Previous dates"><i class="ph ph-caret-left"></i></button><button class="today-button" data-planner-nav="today">Today</button><button class="icon-button" data-planner-nav="next" aria-label="Next dates"><i class="ph ph-caret-right"></i></button><h2>${title}</h2></div><div><input id="planner-date" type="date" value="${dateKey(plannerDate)}" aria-label="Jump to date"><select id="planner-view" aria-label="Calendar view">${[["1","1 day"],["3","3 days"],["4","4 days"],["7","Week"]].map(([value,label])=>`<option value="${value}" ${state.plannerView===value?"selected":""}>${label}</option>`).join("")}</select></div></header><div class="calendar-scroll" id="calendar-scroll"><div class="calendar-grid" style="--days:${days};--slot-height:${slotHeight}px"><div class="calendar-days"><div class="time-gutter"></div>${Array.from({length:days},(_,index)=>renderCalendarDayHeader(dayStart(index))).join("")}</div><div class="calendar-body"><div class="time-axis">${Array.from({length:24},(_,hour)=>{const d=new Date();d.setHours(hour,0,0,0);return `<span style="top:${hour*2*slotHeight}px">${d.toLocaleTimeString([],{hour:"numeric",hour12:true})}</span>`;}).join("")}</div><div class="calendar-columns">${Array.from({length:days},(_,index)=>renderCalendarColumn(dayStart(index))).join("")}</div></div></div></div></section>${taskMenuTodoId ? renderPlannerProperties(state.todos.find(t=>t.id===taskMenuTodoId)!) : ""}<div class="planner-live" aria-live="polite"></div></main>`;
+  return `<main class="planner-view" aria-label="Task planner"><aside class="planner-inbox"><header><div><span class="eyebrow">Daily workspace</span><h1>Tasks</h1></div><button class="icon-button" id="add-category" title="Add category" aria-label="Add category"><i class="ph ph-plus"></i></button></header><nav class="planner-tabs" aria-label="Task views"><button class="${plannerInboxTab==="inbox"?"is-active":""}" data-task-tab="inbox">Inbox</button><button class="${plannerInboxTab==="scheduled"?"is-active":""}" data-task-tab="scheduled">Scheduled</button></nav>${taskList}</aside><section class="planner-calendar"><header class="planner-toolbar"><div><button class="icon-button" data-planner-nav="prev" aria-label="Previous dates"><i class="ph ph-caret-left"></i></button><button class="today-button" data-planner-nav="today">Today</button><button class="icon-button" data-planner-nav="next" aria-label="Next dates"><i class="ph ph-caret-right"></i></button><h2>${title}</h2></div><div><input id="planner-date" type="date" value="${dateKey(plannerDate)}" aria-label="Jump to date"><select id="planner-view" aria-label="Calendar view">${[["1","1 day"],["3","3 days"],["4","4 days"],["7","Week"]].map(([value,label])=>`<option value="${value}" ${state.plannerView===value?"selected":""}>${label}</option>`).join("")}</select><button data-calendar-mode='month' class='secondary-button' aria-label='Month view'><i class='ph ph-calendar-blank'></i>Month</button></div></header><div class="calendar-scroll" id="calendar-scroll"><div class="calendar-grid" style="--days:${days};--slot-height:${slotHeight}px"><div class="calendar-days"><div class="time-gutter"></div>${Array.from({length:days},(_,index)=>renderCalendarDayHeader(dayStart(index))).join("")}</div><div class="calendar-body"><div class="time-axis">${Array.from({length:24},(_,hour)=>{const d=new Date();d.setHours(hour,0,0,0);return `<span style="top:${hour*2*slotHeight}px">${d.toLocaleTimeString([],{hour:"numeric",hour12:true})}</span>`;}).join("")}</div><div class="calendar-columns">${Array.from({length:days},(_,index)=>renderCalendarColumn(dayStart(index))).join("")}</div></div></div></div></section>${taskMenuTodoId ? renderPlannerProperties(state.todos.find(t=>t.id===taskMenuTodoId)!) : ""}<div class="planner-live" aria-live="polite"></div></main>`;
 }
 function renderPlannerTodo(todo: Todo) { const category = categoryFor(todo); const time = taskTime(todo); const timeLabel = time ? ` · ${time.toLocaleDateString(undefined,{month:"short",day:"numeric"})} · ${time.toLocaleTimeString([],{hour:"numeric",minute:"2-digit",hour12:true})}` : " · Unscheduled"; return `<article class="planner-task-card ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><div><strong>${escapeHtml(todo.text)}</strong><small><span class="priority-dot ${todo.priority}"></span>${"•".repeat(todo.effort)}${"·".repeat(5-todo.effort)} ${timeLabel}</small></div><span class="task-chip" style="--category:${attr(todo.color||category.color)}">${escapeHtml(category.name)}</span><button class="task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
 function renderCalendarDayHeader(date: Date) {
@@ -689,7 +703,44 @@ function renderSettings() {
     ${renderMcpSettings()}
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-database"></i><div><h2>Storage & backups</h2><p>${isDesktopApp ? "Your workspace is stored locally on this computer." : "Browser mode stores this workspace in local storage."}</p></div></div>${isDesktopApp ? `<div class="path-grid"><span>Database</span><code>${escapeHtml(storageInfo?.databasePath ?? "Loading…")}</code><span>Backups</span><code>${escapeHtml(storageInfo?.backupDirectory ?? "Loading…")}</code></div><button class="secondary-button" id="create-backup" ${storageError ? "disabled" : ""}><i class="ph ph-cloud-arrow-up"></i>Create backup</button>${storageError ? `<p class="inline-error">${escapeHtml(storageError)}</p>` : ""}` : '<div class="browser-note"><i class="ph ph-info"></i>Install and open the desktop app to create file backups.</div>'}</section>
     <section class="settings-section"><div class="settings-copy"><i class="ph ph-sparkle"></i><div><h2>Appearance & motion</h2><p>Keep transitions calm, quick, and comfortable.</p></div></div><label class="switch-row"><span>Dark mode<small>Easier on the eyes in low light</small></span><input id="dark-toggle" type="checkbox" ${darkMode ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label><label class="switch-row"><span>Interface motion<small>Menus, panels, and task feedback</small></span><input id="motion-toggle" type="checkbox" ${motionEnabled ? "checked" : ""}><span class="switch" aria-hidden="true"></span></label></section>
-    <section class="settings-section"><div class="settings-copy"><i class="ph ph-keyboard"></i><div><h2>Keyboard shortcuts</h2><p>Everything important stays within reach.</p></div></div><div class="shortcut-grid">${[["New note",`${modLabel}+N`],["New folder",`${modLabel}+Shift+N`],["Search",`${modLabel}+K`],["Tasks",`${modLabel}+2`],["Next note",`${modLabel}+Tab`],["Previous note",`${modLabel}+Shift+Tab`],["Save",`${modLabel}+S`],["Focus mode",`${modLabel}+Shift+F`]].map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join("")}</div><button class="secondary-button" id="show-help"><i class="ph ph-question"></i>View all shortcuts</button></section></div></main>`;
+    <section class="settings-section"><div class="settings-copy"><i class="ph ph-keyboard"></i><div><h2>Keyboard shortcuts</h2><p>Everything important stays within reach.</p></div></div><div class="shortcut-grid">${[["New note",`${modLabel}+N`],["New folder",`${modLabel}+Shift+N`],["Search",`${modLabel}+K`],["Tasks",`${modLabel}+2`],["Next note",`${modLabel}+Tab`],["Previous note",`${modLabel}+Shift+Tab`],["Save",`${modLabel}+S`],["Focus mode",`${modLabel}+Shift+F`]].map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join("")}</div><button class="secondary-button" id="show-help"><i class="ph ph-question"></i>View all shortcuts</button>${renderAiSettings()}</section></div></main>`;
+}
+function renderAiSettings() {
+  if (!isDesktopApp) { return `<section class='settings-section'><div class='settings-copy'><i class='ph ph-sparkle'></i><div><h2>AI assistant</h2><p>Install the desktop app to enable the AI assistant.</p></div></div></section>`; }
+  if (aiSettingsError) { return `<section class='settings-section'><div class='settings-copy'><i class='ph ph-sparkle'></i><div><h2>AI assistant</h2><p class='inline-error'>${escapeHtml(aiSettingsError)}</p></div></div></section>`; }
+  const c = aiSettings?.config ?? { enabled: false, provider: 'openai', model: 'gpt-4o', webSearchEnabled: true, autoCreateTasks: false, defaultDurationMinutes: 60 };
+  const modelOptions = ['gpt-4o', 'gpt-4o-mini'].map((m) => `<option value='${m}' ${c.model === m ? 'selected' : ''}>${m}</option>`).join('');
+  return `<section class='settings-section' id='ai-settings-section'><div class='settings-copy'><i class='ph ph-sparkle'></i><div><h2>AI assistant</h2><p>Find events and add them to your schedule.</p></div></div>
+    <form id='ai-settings-form' class='ai-settings-form'>
+      <label class='switch-row'><span>Enable AI${aiSettings ? `<small>Key: ${escapeHtml(aiSettings.maskedKey)}</small>` : ''}</span><input id='ai-enabled' type='checkbox' name='enabled' ${c.enabled ? 'checked' : ''}><span class='switch' aria-hidden='true'></span></label>
+      <label class='field-row'><span>Model</span><select id='ai-model' name='model'>${modelOptions}</select></label>
+      <label class='field-row'><span>OpenAI API key</span><input id='ai-key' type='password' name='apiKey' placeholder='${escapeHtml(aiSettings?.maskedKey ?? 'Not set')}' autocomplete='off'></label>
+      <label class='switch-row'><span>Web search<span class='hint'>Let the assistant search the web for real-world events</span></span><input id='ai-web-search' type='checkbox' name='webSearchEnabled' ${c.webSearchEnabled ? 'checked' : ''}><span class='switch' aria-hidden='true'></span></label>
+      <label class='switch-row'><span>Auto-create tasks<span class='hint'>The assistant can add events to your schedule without asking each time</span></span><input id='ai-auto-tasks' type='checkbox' name='autoCreateTasks' ${c.autoCreateTasks ? 'checked' : ''}><span class='switch' aria-hidden='true'></span></label>
+      <label class='field-row'><span>Default duration (minutes)</span><input id='ai-duration' type='number' name='defaultDurationMinutes' min='15' max='1440' value='${c.defaultDurationMinutes}'></label>
+      <div class='form-actions'><button type='submit' class='primary-button' id='ai-save'>Save AI settings</button></div>
+    </form>
+  </section>`;
+}
+async function saveAiSettings(form: HTMLFormElement) {
+  const formData = new FormData(form);
+  const config: AiConfig = {
+    enabled: formData.get('enabled') === 'on',
+    provider: 'openai',
+    model: String(formData.get('model') || 'gpt-4o'),
+    webSearchEnabled: formData.get('webSearchEnabled') === 'on',
+    autoCreateTasks: formData.get('autoCreateTasks') === 'on',
+    defaultDurationMinutes: Number(formData.get('defaultDurationMinutes') || 60),
+  };
+  const apiKey = (document.querySelector<HTMLInputElement>('#ai-key')?.value || '').trim() || null;
+  try {
+    await invoke('update_ai_settings', { config, apiKey });
+    aiSettingsError = '';
+    await loadAiSettings();
+  } catch (error) {
+    aiSettingsError = `Could not save AI settings: ${String(error)}`;
+    renderApp();
+  }
 }
 function renderDialogLayer() {
   return `<dialog id="folder-dialog" class="create-dialog"><form id="folder-form"><div class="dialog-icon"><i class="ph ph-folder-plus"></i></div><div><h2>Create a new folder</h2><p>Add it inside the current location.</p></div><label>Folder name<input id="folder-name" autocomplete="off" placeholder="e.g. Research" required></label><div class="dialog-actions"><button type="button" class="secondary-button" data-close-dialog>Cancel</button><button type="submit" class="primary-button">Create</button></div></form></dialog>
@@ -725,9 +776,9 @@ function renderApp() {
   const projectScrollTop = previousProjectScroll?.scrollTop ?? null;
   const isInbox = currentView === "notes" && state.selectedFolderId === "inbox";
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}${isInbox ? " view-inbox" : ""}`;
-  const content = currentView === "tasks" ? renderTasks() : currentView === "projects" ? renderProjects() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
+  const content = currentView === "tasks" ? (calendarMode ? renderCalendar() : renderTasks()) : currentView === "projects" ? renderProjects() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : currentView === "ai" ? renderAi() : currentView === "api" ? renderApiDocs() : currentView === "api-playground" ? renderApiPlayground() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
   app.innerHTML = `${renderSidebar()}${content}${renderTaskDetail()}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
-  updateSaveStatus(); bindEvents(); bindOdoDialog();
+  updateSaveStatus(); bindEvents(); bindOdoDialog(); bindAi(); bindAiSettings(); bindApiDocs(); bindApiPlayground(); bindCalendar();
   if (currentView === "tasks") {
     const plannerScroll = document.querySelector<HTMLElement>("#calendar-scroll");
     if (plannerScrollPosition && plannerScroll) {
@@ -780,7 +831,10 @@ function setView(view: View) {
   if (view === "settings" && isDesktopApp) {
     if (!storageInfo) void loadStorageInfo();
     void loadMcpSettings();
+    if (!aiSettings) void loadAiSettings();
   }
+  if (view === "ai" && isDesktopApp) { if (!aiSettings) void loadAiSettings(); }
+  if (view === "api" && isDesktopApp) { if (!apiDocsSpec) void loadApiDocsSpec(); }
 }
 async function loadStorageInfo() {
   try { storageInfo = await invoke<StorageInfo>("get_storage_info"); storageError = ""; }
@@ -792,6 +846,29 @@ async function loadMcpSettings() {
   try { mcpSettings = await invoke<McpSettings>("get_mcp_settings"); mcpSettingsError = ""; }
   catch (error) { mcpSettingsError = `Could not load MCP settings: ${String(error)}`; }
   if (currentView === "settings") renderApp();
+}
+async function loadAiSettings() {
+  if (!isDesktopApp) { aiSettings = { config: { enabled: false, provider: "openai", model: "gpt-4o", webSearchEnabled: true, autoCreateTasks: false, defaultDurationMinutes: 60 }, maskedKey: "Not set" }; }
+  try { aiSettings = await invoke<AiSettings>("get_ai_settings"); aiSettingsError = ""; }
+  catch (error) { aiSettingsError = `Could not load AI settings: ${String(error)}`; }
+  if (currentView === "settings" || currentView === "ai") renderApp();
+}
+async function loadApiDocsSpec() {
+  if (!isDesktopApp) { apiDocsError = "API docs are only available in the desktop app."; return; }
+  try {
+    const settings = mcpSettings || await invoke<McpSettings>("get_mcp_settings");
+    const base = `http://${settings.config.host}:${settings.config.port}`;
+    const url = settings.config.authEnabled ? `${base}/api/v1/openapi.json?token=${encodeURIComponent(settings.config.token)}` : `${base}/api/v1/openapi.json`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    apiDocsSpec = await response.json() as OpenApiSpec;
+    apiDocsError = "";
+  } catch (error) { apiDocsError = `Could not load API docs: ${String(error)}`; }
+  if (currentView === "api") renderApp();
+}
+function apiBaseUrl(): string | null {
+  if (!mcpSettings) return null;
+  return `http://${mcpSettings.config.host}:${mcpSettings.config.port}`;
 }
 
 function noteMenuItems(note: Note): MenuItem[] {
@@ -1854,6 +1931,148 @@ async function renderDetachedEditor(noteId: string) {
   document.title = `${note.title || "Untitled"} — Odo`; app.innerHTML = shell(); bindDetached();
   document.addEventListener("keydown", (event) => { if (event.isComposing) return; const command = event.metaKey || event.ctrlKey; if (command && event.key.toLowerCase() === "s") { event.preventDefault(); clearTimeout(saveTimerId); void queueSave(); } if (command && event.key.toLowerCase() === "w") { event.preventDefault(); clearTimeout(saveTimerId); void queueSave().then((saved) => { if (saved) window.close(); }); } });
   window.addEventListener("beforeunload", () => { clearTimeout(saveTimerId); void queueSave(); });
+}
+
+async function sendAiMessage(text: string) {
+  if (!text.trim() || !isDesktopApp || aiLoading) return;
+  aiMessages.push({ role: 'user', content: text.trim() });
+  aiLoading = true; renderApp();
+  try {
+    const history = aiMessages.slice(0, -1).map((message) => ({ role: message.role, content: message.content }));
+    const result = await invoke<AiMessageResponse>('send_ai_message', { request: { text: text.trim(), history } });
+    aiMessages.push({ role: 'assistant', content: result.response });
+    if (result.createdTasks?.length) {
+      result.createdTasks.forEach((task: unknown) => {
+        const t = task as Record<string, unknown>;
+        aiMessages.push({ role: 'assistant', content: `Added to schedule: **${t.text}** at ${t.scheduledStart}` });
+      });
+    }
+  } catch (error) {
+    aiMessages.push({ role: 'assistant', content: `Sorry, something went wrong: ${String(error)}` });
+  }
+  aiLoading = false; renderApp();
+}
+function renderAi() {
+  if (!isDesktopApp) {
+    return `<main class='wide-view ai-view'><header class='wide-header'><div><h1>AI assistant</h1><p>Install the desktop app to use the AI assistant.</p></div></header></main>`;
+  }
+  if (aiSettingsError) {
+    return `<main class='wide-view ai-view'><header class='wide-header'><div><h1>AI assistant</h1><p class='inline-error'>${escapeHtml(aiSettingsError)}</p></div></header></main>`;
+  }
+  const missingKey = !aiSettings || aiSettings.maskedKey === 'Not set' || aiSettings.maskedKey.startsWith('Error');
+  const messages = aiMessages.map((message, index) => `<div class='ai-message ${message.role}' data-message-index='${index}'>${escapeHtml(message.content).split('**').map((part, i) => i % 2 === 1 ? `<strong>${part}</strong>` : part).join('')}</div>`).join('');
+  const input = missingKey
+    ? `<p class='ai-key-hint'>Add an OpenAI API key in <a href='#' data-view='settings'>Settings → AI assistant</a> to start chatting.</p>`
+    : `<form id='ai-message-form' class='ai-message-form'><input id='ai-message-input' autocomplete='off' placeholder='Ask about events, your schedule, or anything else…' aria-label='Message' ${aiLoading ? 'disabled' : ''}><button type='submit' class='primary-button' ${aiLoading ? 'disabled' : ''}><i class='ph ph-paper-plane-right'></i></button></form>`;
+  return `<main class='wide-view ai-view'><header class='wide-header'><div><span class='eyebrow'>Assistant</span><h1>AI</h1><p>Find events, search your workspace, and add things to your schedule.</p></div><button class='icon-button close-wide' data-go-inbox title='Back to notes'><i class='ph ph-x'></i></button></header><div class='ai-chat'><div class='ai-messages'>${messages || '<div class=\'ai-empty\'>Ask the assistant to find events or manage your schedule.</div>'}${aiLoading ? '<div class=\'ai-message assistant ai-loading\'>Thinking…</div>' : ''}</div>${input}</div></main>`;
+}
+function bindAi() {
+  const form = document.querySelector<HTMLFormElement>('#ai-message-form');
+  const input = document.querySelector<HTMLInputElement>('#ai-message-input');
+  if (!form || !input) return;
+  form.addEventListener('submit', (event) => { event.preventDefault(); const value = input.value.trim(); if (!value) return; input.value = ''; void sendAiMessage(value); });
+}
+
+function renderApiDocs() {
+  if (apiDocsError) {
+    return `<main class='wide-view api-view'><header class='wide-header'><div><h1>API docs</h1><p class='inline-error'>${escapeHtml(apiDocsError)}</p></div></header></main>`;
+  }
+  if (!apiDocsSpec) {
+    return `<main class='wide-view api-view'><header class='wide-header'><div><h1>API docs</h1><p>Loading the OpenAPI specification…</p></div></header></main>`;
+  }
+  const paths = Object.entries(apiDocsSpec.paths).map(([path, methods]) => {
+    const m = methods as Record<string, Record<string, unknown>>;
+    const methodsList = Object.entries(m).map(([method, details]) => {
+      const summary = (details.summary as string) || '';
+      return `<li><span class='api-method ${method}'>${method.toUpperCase()}</span> <code>${path}</code> — ${escapeHtml(summary)}</li>`;
+    }).join('');
+    return `<ul class='api-path-list'>${methodsList}</ul>`;
+  }).join('');
+  const schemas = Object.entries(apiDocsSpec.components?.schemas || {}).map(([name, schema]) => `<details class='api-schema'><summary>${escapeHtml(name)}</summary><pre><code>${escapeHtml(JSON.stringify(schema, null, 2))}</code></pre></details>`).join('');
+  const base = apiBaseUrl();
+  const httpSnippet = `curl ${base}/tasks -H 'Authorization: Bearer <token>'`;
+  return `<main class='wide-view api-view'><header class='wide-header'><div><span class='eyebrow'>Agents</span><h1>API docs</h1><p>Devin CLI, Codex CLI, and other agents can talk to Odo over this REST API.</p></div><div class='wide-actions'><button class='secondary-button' data-view='api-playground'><i class='ph ph-play'></i>Try it</button><button class='icon-button close-wide' data-go-inbox title='Back to notes'><i class='ph ph-x'></i></button></div></header><div class='api-docs-body'><section class='settings-section'><h2>Base URL</h2><code class='api-base-url'>${base}/api/v1</code><p class='api-copy'>Example call:</p><pre class='api-code'><code>${escapeHtml(httpSnippet)}</code></pre></section><section class='settings-section'><h2>Endpoints</h2>${paths}</section><section class='settings-section'><h2>Schemas</h2>${schemas || '<p>No schemas defined.</p>'}</section></div></main>`;
+}
+function bindApiDocs() {}
+function renderApiPlayground() {
+  const base = apiBaseUrl();
+  if (!base) {
+    return `<main class='wide-view api-view'><header class='wide-header'><div><h1>API playground</h1><p>API playground is only available in the desktop app.</p></div></header></main>`;
+  }
+  const defaultBody = JSON.stringify({ text: 'Example task', scheduledStart: new Date().toISOString().slice(0, 16) }, null, 2);
+  return `<main class='wide-view api-view'><header class='wide-header'><div><span class='eyebrow'>Agents</span><h1>API playground</h1><p>Send requests to the Odo API and see the response.</p></div><div class='wide-actions'><button class='secondary-button' data-view='api'><i class='ph ph-book-open'></i>Docs</button><button class='icon-button close-wide' data-go-inbox title='Back to notes'><i class='ph ph-x'></i></button></div></header><div class='api-playground-body'><div class='api-playground-row'><label class='api-playground-field'><span>Method</span><select id='api-playground-method'><option>GET</option><option>POST</option><option>PATCH</option><option>DELETE</option></select></label><label class='api-playground-field api-playground-path'><span>Path</span><input id='api-playground-path' value='/tasks' autocomplete='off'></label></div><label class='api-playground-field'><span>Body (JSON, for POST/PATCH)</span><textarea id='api-playground-body' rows='6'>${escapeHtml(defaultBody)}</textarea></label><button id='api-playground-send' class='primary-button'><i class='ph ph-paper-plane-right'></i>Send request</button><div id='api-playground-result' class='api-playground-result' aria-live='polite'>${apiPlaygroundResponse ? `<pre><code>${escapeHtml(apiPlaygroundResponse)}</code></pre>` : '<p>Response will appear here.</p>'}</div>${apiPlaygroundError ? `<p class='inline-error'>${escapeHtml(apiPlaygroundError)}</p>` : ''}</div></main>`;
+}
+async function apiPlaygroundSend() {
+  const base = apiBaseUrl(); if (!base) return;
+  const method = (document.querySelector<HTMLSelectElement>('#api-playground-method')?.value || 'GET').toUpperCase();
+  const path = document.querySelector<HTMLInputElement>('#api-playground-path')?.value.trim() || '/tasks';
+  const bodyText = document.querySelector<HTMLTextAreaElement>('#api-playground-body')?.value || '';
+  const result = document.querySelector<HTMLElement>('#api-playground-result'); if (!result) return;
+  apiPlaygroundError = '';
+  try {
+    const url = `${base}/api/v1${path.startsWith('/') ? path : `/${path}`}`;
+    const options: RequestInit = { method, headers: {} };
+    const settings = mcpSettings || await invoke<McpSettings>('get_mcp_settings');
+    if (settings.config.authEnabled) options.headers = { ...(options.headers || {}), Authorization: `Bearer ${settings.config.token}` };
+    if (method === 'POST' || method === 'PATCH') { options.body = bodyText; options.headers = { ...(options.headers || {}), 'Content-Type': 'application/json' }; }
+    const response = await fetch(url, options);
+    const text = await response.text();
+    const pretty = (() => { try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; } })();
+    apiPlaygroundResponse = `${response.status} ${response.statusText}\n\n${pretty}`;
+  } catch (error) {
+    apiPlaygroundError = String(error);
+  }
+  renderApp();
+}
+function bindApiPlayground() {
+  document.querySelector<HTMLButtonElement>('#api-playground-send')?.addEventListener('click', () => void apiPlaygroundSend());
+}
+function daysInMonth(year: number, month: number) {
+  return new Date(year, month + 1, 0).getDate();
+}
+function renderCalendar() {
+  const year = plannerDate.getFullYear();
+  const month = plannerDate.getMonth();
+  const firstDay = new Date(year, month, 1).getDay();
+  const totalDays = daysInMonth(year, month);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const dayHeaders = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const scheduledTasks = state.todos.filter((todo) => !todo.completed && todo.scheduledStart);
+  const cells: string[] = [];
+  for (let i = 0; i < firstDay; i++) cells.push(`<div class='calendar-cell calendar-empty' aria-hidden='true'></div>`);
+  for (let day = 1; day <= totalDays; day++) {
+    const date = new Date(year, month, day);
+    const isToday = date.getTime() === today.getTime();
+    const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const tasks = scheduledTasks.filter((todo) => todo.scheduledStart && todo.scheduledStart.slice(0, 10) === dateKey);
+    const dots = tasks.map((todo) => `<span class='calendar-dot' style='--category:${todo.color || state.todoCategories.find((c) => c.id === todo.categoryId)?.color || '#7b8e7c'}'></span>`).join('');
+    const labels = tasks.map((todo) => `<span class='calendar-task' data-task-id='${attr(todo.id)}'>${escapeHtml(todo.text)}</span>`).join('');
+    cells.push(`<div class='calendar-cell ${isToday ? 'is-today' : ''}' data-calendar-day='${dateKey}'><div class='calendar-date'>${day}</div><div class='calendar-dots'>${dots}</div><div class='calendar-tasks'>${labels}</div></div>`);
+  }
+  const title = plannerDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  return `<main class='planner-view'><header class='planner-topbar'><h2>${title}</h2><div class='planner-view-toggle'><button class='secondary-button' data-calendar-prev><i class='ph ph-caret-left'></i></button><button class='secondary-button' data-calendar-today>Today</button><button class='secondary-button' data-calendar-next><i class='ph ph-caret-right'></i></button><button class='secondary-button' data-calendar-mode='planner'>Planner</button></div></header><div class='calendar-grid' role='grid'><div class='calendar-row calendar-header'>${dayHeaders.map((day) => `<div class='calendar-cell' role='columnheader'>${day}</div>`).join('')}</div><div class='calendar-row calendar-body'>${cells.join('')}</div></div></main>`;
+}
+function bindCalendar() {
+  document.querySelector<HTMLButtonElement>('[data-calendar-mode=month]')?.addEventListener('click', () => { calendarMode = true; localStorage.setItem('odo-calendar-mode', 'month'); renderApp(); });
+  document.querySelector<HTMLButtonElement>('[data-calendar-prev]')?.addEventListener('click', () => { plannerDate.setMonth(plannerDate.getMonth() - 1); renderApp(); });
+  document.querySelector<HTMLButtonElement>('[data-calendar-next]')?.addEventListener('click', () => { plannerDate.setMonth(plannerDate.getMonth() + 1); renderApp(); });
+  document.querySelector<HTMLButtonElement>('[data-calendar-today]')?.addEventListener('click', () => { plannerDate = new Date(); plannerDate.setHours(0, 0, 0, 0); renderApp(); });
+  document.querySelector<HTMLButtonElement>("[data-calendar-mode='planner']")?.addEventListener('click', () => { calendarMode = false; localStorage.removeItem('odo-calendar-mode'); renderApp(); });
+  document.querySelectorAll<HTMLElement>('[data-calendar-day]').forEach((cell) => {
+    cell.addEventListener('click', (event) => {
+      const target = event.target as HTMLElement;
+      const taskId = target.closest<HTMLElement>('[data-task-id]')?.dataset.taskId;
+      if (taskId) { openTaskDetail(taskId); return; }
+      const day = cell.dataset.calendarDay;
+      if (day) { plannerDate = new Date(day); plannerDate.setHours(0, 0, 0, 0); currentView = 'tasks'; renderApp(); }
+    });
+  });
+}
+
+function bindAiSettings() {
+  const form = document.querySelector<HTMLFormElement>('#ai-settings-form');
+  if (!form) return;
+  form.addEventListener('submit', (event) => { event.preventDefault(); void saveAiSettings(form); });
 }
 
 async function bootstrap() {

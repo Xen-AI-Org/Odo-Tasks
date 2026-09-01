@@ -1,0 +1,19 @@
+Add 5-minute task granularity, dark mode, and rich animations
+
+- Tasks now support 5-minute durations with live multi-stage text sizing
+  that adapts as you resize (normal, medium, short, tiny)
+- Drag and drop snaps to 5-minute intervals and drops where the task's
+  top edge shows, not where the cursor is
+- Overlapping tasks display side by side; boundary-sharing tasks stack
+- Ctrl+scroll zooms the calendar vertically (16px to 120px slot height)
+- Time labels switched from 24-hour to AM/PM throughout
+- Full dark mode with a settings toggle — every surface, dialog, and
+  control themed for comfortable low-light use
+- Comprehensive animations across the whole app: page transitions,
+  staggered list entries, hover lifts, button springs, drag scaling,
+  dialog bounce-ins, pulse glows on the now-line and drop targets
+- Native Ctrl+scroll zoom disabled in Tauri so the app owns the gesture
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>

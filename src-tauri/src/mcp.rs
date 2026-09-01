@@ -90,7 +90,7 @@ pub fn normalize_folder_icon(icon: Option<&str>) -> &'static str {
     .unwrap_or(DEFAULT_FOLDER_ICON)
 }
 
-fn validate_folder_icon(icon: Option<String>) -> Result<String, String> {
+pub(crate) fn validate_folder_icon(icon: Option<String>) -> Result<String, String> {
     match icon {
         Some(icon) if ALLOWED_FOLDER_ICONS.contains(&icon.as_str()) => Ok(icon),
         Some(icon) => Err(format!(
@@ -175,7 +175,7 @@ fn repair_folder_hierarchy(connection: &Connection) -> Result<usize, String> {
     Ok(invalid_ids.len())
 }
 
-fn validate_folder_parent(
+pub(crate) fn validate_folder_parent(
     connection: &Connection,
     folder_id: Option<&str>,
     parent_id: Option<&str>,
@@ -221,7 +221,7 @@ fn validate_folder_parent(
     Ok(())
 }
 
-fn normalize_folder_parent_for_create(
+pub(crate) fn normalize_folder_parent_for_create(
     connection: &Connection,
     parent_id: Option<String>,
 ) -> Result<Option<String>, String> {
@@ -245,7 +245,7 @@ const MAX_NOTE_TITLE_CHARS: usize = 1_000;
 const MAX_FOLDER_NAME_CHARS: usize = 1_000;
 const MAX_TASK_DURATION_MINUTES: i64 = 24 * 60;
 
-fn validate_note_title(title: &str) -> Result<(), String> {
+pub(crate) fn validate_note_title(title: &str) -> Result<(), String> {
     if title.trim().is_empty() {
         return Err("Note title cannot be empty".into());
     }
@@ -257,7 +257,7 @@ fn validate_note_title(title: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_folder_name(name: &str) -> Result<&str, String> {
+pub(crate) fn validate_folder_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("Folder name cannot be empty".into());
@@ -270,7 +270,7 @@ fn validate_folder_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
-fn validate_journal_date_key(date_key: &str) -> Result<(), String> {
+pub(crate) fn validate_journal_date_key(date_key: &str) -> Result<(), String> {
     let bytes = date_key.as_bytes();
     let exact_shape = bytes.len() == 10
         && bytes[4] == b'-'
@@ -285,14 +285,14 @@ fn validate_journal_date_key(date_key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_task_text(text: &str) -> Result<(), String> {
+pub(crate) fn validate_task_text(text: &str) -> Result<(), String> {
     if text.trim().is_empty() {
         return Err("Task text cannot be empty".into());
     }
     Ok(())
 }
 
-fn validate_task_priority(priority: Option<String>) -> Result<String, String> {
+pub(crate) fn validate_task_priority(priority: Option<String>) -> Result<String, String> {
     let priority = priority.unwrap_or_else(|| "medium".into());
     if !matches!(priority.as_str(), "low" | "medium" | "high") {
         return Err("Task priority must be one of: low, medium, high".into());
@@ -300,7 +300,7 @@ fn validate_task_priority(priority: Option<String>) -> Result<String, String> {
     Ok(priority)
 }
 
-fn validate_task_color(color: Option<String>) -> Result<String, String> {
+pub(crate) fn validate_task_color(color: Option<String>) -> Result<String, String> {
     let Some(color) = color else {
         return Ok(String::new());
     };
@@ -313,7 +313,7 @@ fn validate_task_color(color: Option<String>) -> Result<String, String> {
     Ok(color)
 }
 
-fn validate_scheduled_start(scheduled_start: Option<String>) -> Result<Option<String>, String> {
+pub(crate) fn validate_scheduled_start(scheduled_start: Option<String>) -> Result<Option<String>, String> {
     let Some(scheduled_start) = scheduled_start else {
         return Ok(None);
     };
@@ -323,7 +323,7 @@ fn validate_scheduled_start(scheduled_start: Option<String>) -> Result<Option<St
     Ok(Some(scheduled_start))
 }
 
-fn normalize_task_duration(duration_minutes: Option<i64>) -> Result<i64, String> {
+pub(crate) fn normalize_task_duration(duration_minutes: Option<i64>) -> Result<i64, String> {
     let duration = duration_minutes.unwrap_or(30);
     if duration <= 0 {
         return Err("Task durationMinutes must be greater than zero".into());
@@ -355,11 +355,11 @@ fn journal_date_schema(generator: &mut SchemaGenerator) -> Schema {
     schema
 }
 
-fn backup_identifier(timestamp: i64) -> String {
+pub(crate) fn backup_identifier(timestamp: i64) -> String {
     format!("workspace-mcp-{timestamp}.sqlite3")
 }
 
-fn empty_paginated(collection: &str, offset: u32) -> Value {
+pub(crate) fn empty_paginated(collection: &str, offset: u32) -> Value {
     let mut value = json!({
         "limit": 0,
         "offset": offset,
@@ -370,7 +370,7 @@ fn empty_paginated(collection: &str, offset: u32) -> Value {
     value
 }
 
-fn delete_folder_tree(connection: &mut Connection, id: &str) -> Result<usize, String> {
+pub(crate) fn delete_folder_tree(connection: &mut Connection, id: &str) -> Result<usize, String> {
     let transaction = connection
         .transaction()
         .map_err(|error| format!("Could not start folder deletion: {error}"))?;
@@ -449,14 +449,14 @@ pub fn default_database_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "Could not locate the operating system data directory".into())
 }
 
-fn now_epoch() -> i64 {
+pub(crate) fn now_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     // SQLite creates an RFC3339-compatible UTC timestamp without requiring another clock crate.
     let connection = Connection::open_in_memory().expect("open timestamp database");
     connection
@@ -466,7 +466,7 @@ fn now_iso() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".into())
 }
 
-fn open(path: &Path) -> Result<Connection, String> {
+pub(crate) fn open(path: &Path) -> Result<Connection, String> {
     let connection = Connection::open(path).map_err(|error| {
         format!(
             "Could not open the Odo database at {}: {error}",
@@ -611,7 +611,7 @@ pub fn change_version(path: &Path) -> Result<i64, String> {
         .map_err(|error| format!("Could not read the MCP change version: {error}"))
 }
 
-fn bump_change(connection: &Connection) -> Result<(), String> {
+pub(crate) fn bump_change(connection: &Connection) -> Result<(), String> {
     connection
         .execute(
             "UPDATE mcp_changes SET version = version + 1 WHERE id = 1",
@@ -621,7 +621,7 @@ fn bump_change(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn audit(
+pub(crate) fn audit(
     connection: &Connection,
     transport: &str,
     operation: &str,
@@ -920,7 +920,7 @@ impl OdoMcp {
         }
     }
 
-    fn note_json(connection: &Connection, id: &str) -> Result<Value, String> {
+    pub(crate) fn note_json(connection: &Connection, id: &str) -> Result<Value, String> {
         connection.query_row(
             "SELECT id, folder_id, title, content, updated, status, pinned, revision FROM notes WHERE id = ?1",
             [id],
@@ -933,7 +933,7 @@ impl OdoMcp {
             .ok_or_else(|| format!("Note '{id}' was not found"))
     }
 
-    fn note_json_by_title(connection: &Connection, title: &str) -> Result<Value, String> {
+    pub(crate) fn note_json_by_title(connection: &Connection, title: &str) -> Result<Value, String> {
         let mut statement = connection
             .prepare(
                 "SELECT id FROM notes WHERE title = ?1 COLLATE NOCASE ORDER BY updated DESC LIMIT 2",
@@ -954,7 +954,7 @@ impl OdoMcp {
         }
     }
 
-    fn task_json(connection: &Connection, id: &str) -> Result<Value, String> {
+    pub(crate) fn task_json(connection: &Connection, id: &str) -> Result<Value, String> {
         connection
             .query_row(
                 "SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes FROM todos WHERE id=?1",
@@ -971,7 +971,7 @@ impl OdoMcp {
             .ok_or_else(|| format!("Task '{id}' was not found"))
     }
 
-    fn folder_json(connection: &Connection, id: &str) -> Result<Value, String> {
+    pub(crate) fn folder_json(connection: &Connection, id: &str) -> Result<Value, String> {
         connection
             .query_row(
                 "SELECT f.id,f.name,f.parent_id,f.icon,f.position,COUNT(n.id) FROM folders f LEFT JOIN notes n ON n.folder_id=f.id WHERE f.id=?1 GROUP BY f.id",
@@ -995,7 +995,7 @@ impl OdoMcp {
             .ok_or_else(|| format!("Folder '{id}' was not found"))
     }
 
-    fn category_json(connection: &Connection, id: &str) -> Result<Value, String> {
+    pub(crate) fn category_json(connection: &Connection, id: &str) -> Result<Value, String> {
         connection
             .query_row(
                 "SELECT id,name,color,icon,position FROM todo_categories WHERE id=?1",
@@ -2720,6 +2720,18 @@ struct SecurityState {
     allowed_host: String,
 }
 
+fn token_from_query(request: &axum::extract::Request, token: &str) -> bool {
+    request
+        .uri()
+        .query()
+        .map_or(false, |query| {
+            query.split('&').any(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                parts.next() == Some("token") && parts.next() == Some(token)
+            })
+        })
+}
+
 async fn security_middleware(
     axum::extract::State(state): axum::extract::State<SecurityState>,
     request: axum::extract::Request,
@@ -2743,12 +2755,12 @@ async fn security_middleware(
     }
     if let Some(token) = &state.token {
         let expected = format!("Bearer {token}");
-        if request
+        let header_ok = request
             .headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            != Some(expected.as_str())
-        {
+            == Some(expected.as_str());
+        if !header_ok && !token_from_query(&request, token) {
             return (StatusCode::UNAUTHORIZED, "Missing or invalid Odo MCP token").into_response();
         }
     }
@@ -2765,7 +2777,7 @@ pub async fn run_http(
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
-    let prototype = OdoMcp::new(path, "http", notifier);
+    let prototype = OdoMcp::new(path.clone(), "http", notifier.clone());
     let service = StreamableHttpService::new(
         move || Ok(prototype.clone()),
         LocalSessionManager::default().into(),
@@ -2777,9 +2789,14 @@ pub async fn run_http(
         token: config.auth_enabled.then_some(config.token.clone()),
         allowed_host: config.host.clone(),
     };
-    let router = axum::Router::new().nest_service("/mcp", service).layer(
-        axum::middleware::from_fn_with_state(security, security_middleware),
-    );
+    let api_state = crate::api::ApiState {
+        db_path: path,
+        notifier,
+    };
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .nest("/api/v1", crate::api::router(api_state))
+        .layer(axum::middleware::from_fn_with_state(security, security_middleware));
     let mut listener = None;
     for candidate in config.port..=config.port.saturating_add(20) {
         if let Ok(bound) = tokio::net::TcpListener::bind((config.host.as_str(), candidate)).await {

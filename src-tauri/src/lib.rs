@@ -16,6 +16,8 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 
 pub mod mcp;
+pub mod api;
+pub mod ai;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1138,6 +1140,37 @@ fn get_mcp_change_version(runtime: tauri::State<'_, McpRuntime>) -> Result<i64, 
     mcp::change_version(&runtime.database_path)
 }
 
+#[tauri::command]
+fn get_ai_settings(runtime: tauri::State<'_, McpRuntime>) -> Result<ai::AiSettings, String> {
+    ai::ai_settings(&runtime.database_path)
+}
+
+#[tauri::command]
+fn update_ai_settings(
+    runtime: tauri::State<'_, McpRuntime>,
+    config: ai::AiConfig,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    ai::update_ai_settings(&runtime.database_path, config, api_key)
+}
+
+#[tauri::command]
+async fn send_ai_message(
+    runtime: tauri::State<'_, McpRuntime>,
+    app: tauri::AppHandle,
+    request: ai::AiMessageRequest,
+) -> Result<ai::AiMessageResponse, String> {
+    let config = ai::load_ai_config(&runtime.database_path)?;
+    let api_key = ai::load_api_key()?.ok_or_else(|| {
+        "An OpenAI API key is required. Add it in Settings → AI assistant.".to_string()
+    })?;
+    let result = ai::send_message(request, &config, &api_key).await?;
+    if !result.created_tasks.is_empty() {
+        let _ = app.emit("workspace-changed", ());
+    }
+    Ok(result)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -1226,7 +1259,10 @@ pub fn run() {
             get_mcp_settings,
             update_mcp_settings,
             generate_mcp_token,
-            get_mcp_change_version
+            get_mcp_change_version,
+            get_ai_settings,
+            update_ai_settings,
+            send_ai_message
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
