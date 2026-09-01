@@ -1160,9 +1160,9 @@ async fn send_ai_message(
     app: tauri::AppHandle,
     request: ai::AiMessageRequest,
 ) -> Result<ai::AiMessageResponse, String> {
-    let config = ai::load_ai_config(&runtime.database_path)?;
-    let api_key = ai::load_api_key()?.ok_or_else(|| {
-        "An OpenAI API key is required. Add it in Settings → AI assistant.".to_string()
+    let config = ai::resolve_config(&ai::load_ai_config(&runtime.database_path)?);
+    let api_key = ai::load_api_key(&config.provider)?.ok_or_else(|| {
+        "An AI provider API key is required. Add it in Settings → AI assistant.".to_string()
     })?;
     let result = ai::send_message(request, &config, &api_key).await?;
     if !result.created_tasks.is_empty() {

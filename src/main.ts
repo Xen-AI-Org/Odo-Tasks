@@ -24,7 +24,7 @@ type StorageInfo = { databasePath: string; backupDirectory: string };
 type McpConfig = { enabled: boolean; host: string; port: number; authEnabled: boolean; token: string; permanentDeleteEnabled: boolean; startAtLogin: boolean };
 type McpStatus = { running: boolean; endpoint: string | null; error: string | null };
 type McpSettings = { config: McpConfig; status: McpStatus; maskedToken: string; httpSnippet: string; stdioSnippet: string };
-type AiConfig = { enabled: boolean; provider: string; model: string; webSearchEnabled: boolean; autoCreateTasks: boolean; defaultDurationMinutes: number };
+type AiConfig = { enabled: boolean; provider: "openai" | "openrouter"; apiBaseUrl: string; model: string; webSearchEnabled: boolean; autoCreateTasks: boolean; defaultDurationMinutes: number };
 type AiSettings = { config: AiConfig; maskedKey: string };
 type AiMessage = { role: "user" | "assistant"; content: string };
 type AiMessageResponse = { response: string; createdTasks: unknown[]; usedSearch: boolean };
@@ -708,13 +708,20 @@ function renderSettings() {
 function renderAiSettings() {
   if (!isDesktopApp) { return `<section class='settings-section'><div class='settings-copy'><i class='ph ph-sparkle'></i><div><h2>AI assistant</h2><p>Install the desktop app to enable the AI assistant.</p></div></div></section>`; }
   if (aiSettingsError) { return `<section class='settings-section'><div class='settings-copy'><i class='ph ph-sparkle'></i><div><h2>AI assistant</h2><p class='inline-error'>${escapeHtml(aiSettingsError)}</p></div></div></section>`; }
-  const c = aiSettings?.config ?? { enabled: false, provider: 'openai', model: 'gpt-4o', webSearchEnabled: true, autoCreateTasks: false, defaultDurationMinutes: 60 };
-  const modelOptions = ['gpt-4o', 'gpt-4o-mini'].map((m) => `<option value='${m}' ${c.model === m ? 'selected' : ''}>${m}</option>`).join('');
+  const c = aiSettings?.config ?? { enabled: false, provider: 'openrouter', apiBaseUrl: '', model: 'openrouter/free', webSearchEnabled: true, autoCreateTasks: false, defaultDurationMinutes: 60 };
+  const providerOptions = [
+    { value: 'openrouter', label: 'OpenRouter (free)' },
+    { value: 'openai', label: 'OpenAI' },
+  ].map((o) => `<option value='${attr(o.value)}' ${c.provider === o.value ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('');
+  const modelList = ['openrouter/free', 'google/gemma-3-27b-it:free', 'openai/gpt-4o', 'openai/gpt-4o-mini'].map((m) => `<option value='${attr(m)}'></option>`).join('');
   return `<section class='settings-section' id='ai-settings-section'><div class='settings-copy'><i class='ph ph-sparkle'></i><div><h2>AI assistant</h2><p>Find events and add them to your schedule.</p></div></div>
     <form id='ai-settings-form' class='ai-settings-form'>
       <label class='switch-row'><span>Enable AI${aiSettings ? `<small>Key: ${escapeHtml(aiSettings.maskedKey)}</small>` : ''}</span><input id='ai-enabled' type='checkbox' name='enabled' ${c.enabled ? 'checked' : ''}><span class='switch' aria-hidden='true'></span></label>
-      <label class='field-row'><span>Model</span><select id='ai-model' name='model'>${modelOptions}</select></label>
-      <label class='field-row'><span>OpenAI API key</span><input id='ai-key' type='password' name='apiKey' placeholder='${escapeHtml(aiSettings?.maskedKey ?? 'Not set')}' autocomplete='off'></label>
+      <label class='field-row'><span>Provider</span><select id='ai-provider' name='provider'>${providerOptions}</select></label>
+      <label class='field-row'><span>Model</span><input id='ai-model' name='model' list='ai-model-list' value='${attr(c.model)}' autocomplete='off'></label>
+      <datalist id='ai-model-list'>${modelList}</datalist>
+      <label class='field-row'><span>API base URL</span><input id='ai-base-url' name='apiBaseUrl' placeholder='Default for provider' value='${attr(c.apiBaseUrl)}' autocomplete='off'></label>
+      <label class='field-row'><span>API key (OpenRouter or OpenAI)</span><input id='ai-key' type='password' name='apiKey' placeholder='${escapeHtml(aiSettings?.maskedKey ?? 'Not set')}' autocomplete='off'></label>
       <label class='switch-row'><span>Web search<span class='hint'>Let the assistant search the web for real-world events</span></span><input id='ai-web-search' type='checkbox' name='webSearchEnabled' ${c.webSearchEnabled ? 'checked' : ''}><span class='switch' aria-hidden='true'></span></label>
       <label class='switch-row'><span>Auto-create tasks<span class='hint'>The assistant can add events to your schedule without asking each time</span></span><input id='ai-auto-tasks' type='checkbox' name='autoCreateTasks' ${c.autoCreateTasks ? 'checked' : ''}><span class='switch' aria-hidden='true'></span></label>
       <label class='field-row'><span>Default duration (minutes)</span><input id='ai-duration' type='number' name='defaultDurationMinutes' min='15' max='1440' value='${c.defaultDurationMinutes}'></label>
@@ -724,10 +731,14 @@ function renderAiSettings() {
 }
 async function saveAiSettings(form: HTMLFormElement) {
   const formData = new FormData(form);
+  const provider = formData.get('provider') === 'openai' ? 'openai' : 'openrouter';
+  const apiBaseUrl = String(formData.get('apiBaseUrl') || '');
+  const model = String(formData.get('model') || 'openrouter/free');
   const config: AiConfig = {
     enabled: formData.get('enabled') === 'on',
-    provider: 'openai',
-    model: String(formData.get('model') || 'gpt-4o'),
+    provider,
+    apiBaseUrl,
+    model,
     webSearchEnabled: formData.get('webSearchEnabled') === 'on',
     autoCreateTasks: formData.get('autoCreateTasks') === 'on',
     defaultDurationMinutes: Number(formData.get('defaultDurationMinutes') || 60),
@@ -848,7 +859,7 @@ async function loadMcpSettings() {
   if (currentView === "settings") renderApp();
 }
 async function loadAiSettings() {
-  if (!isDesktopApp) { aiSettings = { config: { enabled: false, provider: "openai", model: "gpt-4o", webSearchEnabled: true, autoCreateTasks: false, defaultDurationMinutes: 60 }, maskedKey: "Not set" }; }
+  if (!isDesktopApp) { aiSettings = { config: { enabled: false, provider: "openrouter", apiBaseUrl: "", model: "openrouter/free", webSearchEnabled: true, autoCreateTasks: false, defaultDurationMinutes: 60 }, maskedKey: "Not set" }; }
   try { aiSettings = await invoke<AiSettings>("get_ai_settings"); aiSettingsError = ""; }
   catch (error) { aiSettingsError = `Could not load AI settings: ${String(error)}`; }
   if (currentView === "settings" || currentView === "ai") renderApp();

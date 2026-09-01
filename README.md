@@ -42,13 +42,15 @@ Open **API** in the sidebar to browse the docs, or **API playground** to send re
 
 ## AI assistant
 
-Open **AI** in the sidebar to chat with an OpenAI-powered assistant. The assistant can:
+Open **AI** in the sidebar to chat with an AI assistant. The assistant can:
 
 - Search the web for real-world events
 - List and search your existing tasks and notes
 - Add events it finds to your schedule as scheduled tasks
 
-Add an OpenAI API key in **Settings → AI assistant** to enable it. The key is stored in the OS credential store (Windows Credential Manager / macOS Keychain / Linux Secret Service). Web search and automatic task creation are controlled by separate toggles.
+It uses OpenRouter by default with the `openrouter/free` model router, and also supports OpenAI directly. Add an API key in **Settings → AI assistant** to enable it. The key is stored in the OS credential store (Windows Credential Manager / macOS Keychain / Linux Secret Service). Web search and automatic task creation are controlled by separate toggles.
+
+For local development you can set `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ODO_AI_PROVIDER`, `ODO_AI_MODEL`, or `ODO_AI_BASE_URL` instead of saving a key in the UI.
 
 ## Prerequisites
 

@@ -1,3 +1,4 @@
+use std::env;
 use std::path::PathBuf;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -9,8 +10,8 @@ use crate::mcp;
 
 const AI_CONFIG_KEY: &str = "ai_config_v1";
 const KEYRING_SERVICE: &str = "Odo Tasks";
-const KEYRING_ACCOUNT: &str = "openai-api-key";
-const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
+const KEYRING_ACCOUNT: &str = "ai-api-key";
+const LEGACY_KEYRING_ACCOUNT: &str = "openai-api-key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +22,8 @@ pub struct AiConfig {
     pub provider: String,
     #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default)]
+    pub api_base_url: String,
     #[serde(default)]
     pub web_search_enabled: bool,
     #[serde(default)]
@@ -35,6 +38,7 @@ impl Default for AiConfig {
             enabled: false,
             provider: default_provider(),
             model: default_model(),
+            api_base_url: String::new(),
             web_search_enabled: true,
             auto_create_tasks: false,
             default_duration_minutes: default_duration_minutes(),
@@ -43,11 +47,11 @@ impl Default for AiConfig {
 }
 
 fn default_provider() -> String {
-    "openai".into()
+    "openrouter".into()
 }
 
 fn default_model() -> String {
-    "gpt-4o".into()
+    "openrouter/free".into()
 }
 
 fn default_duration_minutes() -> i64 {
@@ -122,39 +126,85 @@ fn open_keyring_entry() -> Result<keyring::Entry, String> {
         .map_err(|error| format!("Could not open the OS credential store: {error}"))
 }
 
-pub fn load_api_key() -> Result<Option<String>, String> {
-    match open_keyring_entry() {
-        Ok(entry) => match entry.get_password() {
-            Ok(key) if !key.trim().is_empty() => Ok(Some(key)),
-            Ok(_) => Ok(None),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(format!("Could not read the OpenAI API key: {error}")),
-        },
-        Err(error) => Err(error),
+fn keyring_get(account: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, account)
+        .map_err(|error| format!("Could not open the OS credential store: {error}"))?;
+    match entry.get_password() {
+        Ok(key) if !key.trim().is_empty() => Ok(Some(key)),
+        Ok(_) => Ok(None),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("Could not read the AI provider API key: {error}")),
     }
+}
+
+fn keyring_api_key(provider: &str) -> Result<Option<String>, String> {
+    if let Some(key) = keyring_get(KEYRING_ACCOUNT)? {
+        return Ok(Some(key));
+    }
+    if provider == "openai" {
+        if let Some(key) = keyring_get(LEGACY_KEYRING_ACCOUNT)? {
+            return Ok(Some(key));
+        }
+    }
+    Ok(None)
+}
+
+fn env_api_key_for_provider(provider: &str) -> Option<String> {
+    if provider == "openrouter" {
+        if let Ok(key) = env::var("OPENROUTER_API_KEY") {
+            if !key.trim().is_empty() {
+                return Some(key);
+            }
+        }
+    } else if provider == "openai" {
+        if let Ok(key) = env::var("OPENAI_API_KEY") {
+            if !key.trim().is_empty() {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_api_key(provider: &str) -> Result<(Option<String>, bool), String> {
+    if let Some(key) = keyring_api_key(provider)? {
+        return Ok((Some(key), false));
+    }
+    if let Some(key) = env_api_key_for_provider(provider) {
+        return Ok((Some(key), true));
+    }
+    Ok((None, false))
+}
+
+pub fn load_api_key(provider: &str) -> Result<Option<String>, String> {
+    resolve_api_key(provider).map(|(key, _)| key)
 }
 
 pub fn save_api_key(key: &str) -> Result<(), String> {
     let entry = open_keyring_entry()?;
     entry
         .set_password(key)
-        .map_err(|error| format!("Could not save the OpenAI API key: {error}"))
+        .map_err(|error| format!("Could not save the AI provider API key: {error}"))
 }
 
 pub fn delete_api_key() -> Result<(), String> {
-    match open_keyring_entry() {
-        Ok(entry) => match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(format!("Could not remove the OpenAI API key: {error}")),
-        },
-        Err(_) => Ok(()),
+    for account in [KEYRING_ACCOUNT, LEGACY_KEYRING_ACCOUNT] {
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, account) {
+            let _ = entry.delete_credential();
+        }
     }
+    Ok(())
 }
 
-pub fn masked_api_key() -> String {
-    match load_api_key() {
+pub fn masked_api_key(provider: &str, from_env: bool) -> String {
+    if from_env {
+        return "Set via environment variable".into();
+    }
+    match keyring_api_key(provider) {
         Ok(Some(key)) if key.len() > 8 => {
-            format!("{}••••{}", &key[..4], &key[key.len() - 4..])
+            let prefix: String = key.chars().take(4).collect();
+            let suffix: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+            format!("{prefix}••••{suffix}")
         }
         Ok(Some(_)) => "••••••".into(),
         Ok(None) => "Not set".into(),
@@ -164,7 +214,8 @@ pub fn masked_api_key() -> String {
 
 pub fn ai_settings(path: &PathBuf) -> Result<AiSettings, String> {
     let config = load_ai_config(path)?;
-    let masked_key = masked_api_key();
+    let (_, from_env) = resolve_api_key(&config.provider)?;
+    let masked_key = masked_api_key(&config.provider, from_env);
     Ok(AiSettings {
         config,
         masked_key,
@@ -184,6 +235,38 @@ pub fn update_ai_settings(
         }
     }
     save_ai_config(path, &config)
+}
+
+pub fn resolve_config(config: &AiConfig) -> AiConfig {
+    let mut resolved = config.clone();
+    if let Ok(value) = env::var("ODO_AI_PROVIDER") {
+        if !value.trim().is_empty() {
+            resolved.provider = value;
+        }
+    }
+    if let Ok(value) = env::var("ODO_AI_MODEL") {
+        if !value.trim().is_empty() {
+            resolved.model = value;
+        }
+    }
+    if let Ok(value) = env::var("ODO_AI_BASE_URL") {
+        if !value.trim().is_empty() {
+            resolved.api_base_url = value;
+        }
+    }
+    resolved
+}
+
+fn resolve_api_base(config: &AiConfig) -> Result<String, String> {
+    let trimmed = config.api_base_url.trim();
+    if !trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    match config.provider.as_str() {
+        "openai" => Ok("https://api.openai.com/v1".into()),
+        "openrouter" => Ok("https://openrouter.ai/api/v1".into()),
+        other => Err(format!("Unknown AI provider: {other}. Use 'openai' or 'openrouter'.")),
+    }
 }
 
 // TODO(user): customize this system prompt. It shapes how the AI talks to you,
@@ -475,10 +558,21 @@ fn build_input(request: &AiMessageRequest) -> Vec<Value> {
 }
 
 fn build_tools(config: &AiConfig) -> Vec<Value> {
-    let mut tools = odo_tool_definitions();
+    let mut tools = Vec::new();
     if config.web_search_enabled {
-        tools.insert(0, json!({"type": "web_search"}));
+        if config.provider == "openai" {
+            tools.push(json!({"type": "web_search"}));
+        } else {
+            tools.push(json!({
+                "type": "openrouter:web_search",
+                "parameters": {
+                    "max_results": 5,
+                    "engine": "auto"
+                }
+            }));
+        }
     }
+    tools.extend(odo_tool_definitions());
     tools
 }
 
@@ -497,26 +591,42 @@ async fn call_openai_responses(
         "store": false,
     });
 
-    let response = client
-        .post(OPENAI_RESPONSES_URL)
+    let url = format!("{}/responses", resolve_api_base(config)?);
+    let mut request = client
+        .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+
+    if config.provider == "openrouter" {
+        request = request
+            .header("HTTP-Referer", "https://odo.local")
+            .header("X-Title", "Odo Tasks");
+    }
+
+    let response = request
         .json(&body)
         .send()
         .await
-        .map_err(|error| format!("Could not reach OpenAI: {error}"))?;
+        .map_err(|error| format!("Could not reach the AI provider: {error}"))?;
 
     let status = response.status();
     let body_text = response
         .text()
         .await
-        .map_err(|error| format!("Could not read OpenAI response: {error}"))?;
+        .map_err(|error| format!("Could not read the AI provider response: {error}"))?;
     if !status.is_success() {
-        return Err(format!("OpenAI returned {status}: {body_text}"));
+        return Err(format!("The AI provider returned {status}: {body_text}"));
     }
 
     serde_json::from_str(&body_text)
-        .map_err(|error| format!("OpenAI response was not valid JSON: {error}"))
+        .map_err(|error| format!("The AI provider response was not valid JSON: {error}"))
+}
+
+fn item_uses_web_search(item: &Value) -> bool {
+    let item_type = item.get("type").and_then(|v| v.as_str());
+    let name = item.get("name").and_then(|v| v.as_str());
+    item_type.map_or(false, |t| t.contains("web_search"))
+        || name.map_or(false, |n| n.contains("web_search"))
 }
 
 pub async fn send_message(
@@ -524,24 +634,21 @@ pub async fn send_message(
     config: &AiConfig,
     api_key: &str,
 ) -> Result<AiMessageResponse, String> {
+    let config = resolve_config(config);
     let client = reqwest::Client::new();
     let mut input = build_input(&request);
     let mut created_tasks: Vec<Value> = Vec::new();
     let mut used_search = false;
 
     for _turn in 0..5 {
-        let response = call_openai_responses(&client, api_key, config, &input).await?;
+        let response = call_openai_responses(&client, api_key, &config, &input).await?;
 
         if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
             // Append all output items to the input for the next turn.
             input.extend(output.iter().cloned());
 
             // Track whether any web search happened.
-            if output.iter().any(|item| {
-                item.get("type")
-                    .and_then(|v| v.as_str())
-                    .map_or(false, |t| t == "web_search_call")
-            }) {
+            if output.iter().any(item_uses_web_search) {
                 used_search = true;
             }
 
@@ -565,7 +672,7 @@ pub async fn send_message(
                     .unwrap_or("{}");
 
                 if name.starts_with("odo_") {
-                    let result = execute_odo_function(name, arguments, config)?;
+                    let result = execute_odo_function(name, arguments, &config)?;
                     if name == "odo_create_scheduled_task" {
                         if let Some(task) = result.as_object() {
                             created_tasks.push(Value::Object(task.clone()));
