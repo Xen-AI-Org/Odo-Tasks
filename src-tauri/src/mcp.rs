@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, NaiveDate};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use rmcp::{
     handler::server::{
         router::{prompt::PromptRouter, tool::ToolRouter},
@@ -313,7 +313,9 @@ pub(crate) fn validate_task_color(color: Option<String>) -> Result<String, Strin
     Ok(color)
 }
 
-pub(crate) fn validate_scheduled_start(scheduled_start: Option<String>) -> Result<Option<String>, String> {
+pub(crate) fn validate_scheduled_start(
+    scheduled_start: Option<String>,
+) -> Result<Option<String>, String> {
     let Some(scheduled_start) = scheduled_start else {
         return Ok(None);
     };
@@ -329,6 +331,96 @@ pub(crate) fn normalize_task_duration(duration_minutes: Option<i64>) -> Result<i
         return Err("Task durationMinutes must be greater than zero".into());
     }
     Ok(duration.min(MAX_TASK_DURATION_MINUTES))
+}
+
+const MAX_PROJECT_NAME_CHARS: usize = 1_000;
+const MAX_MILESTONE_NAME_CHARS: usize = 1_000;
+const ALLOWED_PROJECT_STATUSES: [&str; 5] =
+    ["backlog", "active", "completed", "archived", "cancelled"];
+
+pub(crate) fn validate_project_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Project name cannot be empty".into());
+    }
+    if name.chars().count() > MAX_PROJECT_NAME_CHARS {
+        return Err(format!(
+            "Project name cannot exceed {MAX_PROJECT_NAME_CHARS} characters"
+        ));
+    }
+    Ok(name)
+}
+
+pub(crate) fn validate_project_status(status: Option<String>) -> Result<String, String> {
+    let status = status.unwrap_or_else(|| "backlog".into());
+    if !ALLOWED_PROJECT_STATUSES.contains(&status.as_str()) {
+        return Err(format!(
+            "Project status must be one of: {}",
+            ALLOWED_PROJECT_STATUSES.join(", ")
+        ));
+    }
+    Ok(status)
+}
+
+pub(crate) fn validate_milestone_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Milestone name cannot be empty".into());
+    }
+    if name.chars().count() > MAX_MILESTONE_NAME_CHARS {
+        return Err(format!(
+            "Milestone name cannot exceed {MAX_MILESTONE_NAME_CHARS} characters"
+        ));
+    }
+    Ok(name)
+}
+
+pub(crate) fn validate_target_date(target_date: Option<String>) -> Result<Option<String>, String> {
+    let Some(date) = target_date else {
+        return Ok(None);
+    };
+    let date = date.trim();
+    if date.is_empty() {
+        return Ok(None);
+    }
+    if NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+        return Err("targetDate must be a valid date in YYYY-MM-DD format".into());
+    }
+    Ok(Some(date.into()))
+}
+
+pub(crate) fn project_exists(connection: &Connection, id: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not look up project: {error}"))
+}
+
+pub(crate) fn milestone_exists(connection: &Connection, id: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM milestones WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not look up milestone: {error}"))
+}
+
+pub(crate) fn milestone_project_id(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<String>, String> {
+    connection
+        .query_row(
+            "SELECT project_id FROM milestones WHERE id = ?1",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Could not read milestone project: {error}"))
 }
 
 fn task_priority_schema(generator: &mut SchemaGenerator) -> Schema {
@@ -763,6 +855,10 @@ pub struct CreateTaskArgs {
     /// Positive duration in minutes. Values above 1,440 are clamped to one day.
     #[schemars(range(min = 1, max = 1440))]
     pub duration_minutes: Option<i64>,
+    /// Optional project ID to associate the task with.
+    pub project_id: Option<String>,
+    /// Optional milestone ID within the project.
+    pub milestone_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -780,6 +876,10 @@ pub struct UpdateTaskArgs {
     pub scheduled_start: Option<String>,
     pub clear_schedule: Option<bool>,
     pub duration_minutes: Option<i64>,
+    /// Optional project ID to associate the task with.
+    pub project_id: Option<String>,
+    /// Optional milestone ID within the project.
+    pub milestone_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -865,6 +965,90 @@ pub struct PromptArgs {
     pub focus: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListProjectsArgs {
+    pub status: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProjectArgs {
+    #[schemars(length(min = 1, max = 1000))]
+    pub name: String,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub target_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProjectArgs {
+    pub id: String,
+    #[schemars(length(min = 1, max = 1000))]
+    pub name: Option<String>,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub target_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProjectStatusArgs {
+    pub id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListMilestonesArgs {
+    pub project_id: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateMilestoneArgs {
+    pub project_id: String,
+    #[schemars(length(min = 1, max = 1000))]
+    pub name: String,
+    pub target_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMilestoneArgs {
+    pub id: String,
+    #[schemars(length(min = 1, max = 1000))]
+    pub name: Option<String>,
+    pub target_date: Option<String>,
+    pub completed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMilestoneCompletedArgs {
+    pub id: String,
+    pub completed: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarListArgs {
+    #[schemars(schema_with = "journal_date_schema")]
+    pub from_date: String,
+    #[schemars(schema_with = "journal_date_schema")]
+    pub to_date: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CalendarIcsArgs {}
+
 type ChangeNotifier = Arc<dyn Fn() + Send + Sync>;
 type Subscribers = Arc<AsyncMutex<HashMap<String, Vec<Peer<RoleServer>>>>>;
 
@@ -933,7 +1117,10 @@ impl OdoMcp {
             .ok_or_else(|| format!("Note '{id}' was not found"))
     }
 
-    pub(crate) fn note_json_by_title(connection: &Connection, title: &str) -> Result<Value, String> {
+    pub(crate) fn note_json_by_title(
+        connection: &Connection,
+        title: &str,
+    ) -> Result<Value, String> {
         let mut statement = connection
             .prepare(
                 "SELECT id FROM notes WHERE title = ?1 COLLATE NOCASE ORDER BY updated DESC LIMIT 2",
@@ -957,18 +1144,115 @@ impl OdoMcp {
     pub(crate) fn task_json(connection: &Connection, id: &str) -> Result<Value, String> {
         connection
             .query_row(
-                "SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes FROM todos WHERE id=?1",
+                "SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes,project_id,milestone_id FROM todos WHERE id=?1",
                 [id],
                 |row| Ok(json!({
                     "id":row.get::<_,String>(0)?,"text":row.get::<_,String>(1)?,"completed":row.get::<_,bool>(2)?,
                     "created":row.get::<_,String>(3)?,"updated":row.get::<_,String>(4)?,"categoryId":row.get::<_,String>(5)?,
                     "priority":row.get::<_,String>(6)?,"effort":row.get::<_,i64>(7)?,"color":row.get::<_,String>(8)?,
-                    "scheduledStart":row.get::<_,Option<String>>(9)?,"durationMinutes":row.get::<_,i64>(10)?
+                    "scheduledStart":row.get::<_,Option<String>>(9)?,"durationMinutes":row.get::<_,i64>(10)?,
+                    "projectId":row.get::<_,Option<String>>(11)?,"milestoneId":row.get::<_,Option<String>>(12)?
                 })),
             )
             .optional()
             .map_err(|error| format!("Could not read task: {error}"))?
             .ok_or_else(|| format!("Task '{id}' was not found"))
+    }
+
+    pub(crate) fn project_json(connection: &Connection, id: &str) -> Result<Value, String> {
+        connection
+            .query_row(
+                "SELECT id,name,summary,description,status,target_date,created,updated FROM projects WHERE id=?1",
+                [id],
+                |row| Ok(json!({
+                    "id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"summary":row.get::<_,String>(2)?,
+                    "description":row.get::<_,String>(3)?,"status":row.get::<_,String>(4)?,"targetDate":row.get::<_,Option<String>>(5)?,
+                    "created":row.get::<_,String>(6)?,"updated":row.get::<_,String>(7)?
+                })),
+            )
+            .optional()
+            .map_err(|error| format!("Could not read project: {error}"))?
+            .ok_or_else(|| format!("Project '{id}' was not found"))
+    }
+
+    pub(crate) fn milestone_json(connection: &Connection, id: &str) -> Result<Value, String> {
+        connection
+            .query_row(
+                "SELECT id,project_id,name,target_date,completed,created,updated FROM milestones WHERE id=?1",
+                [id],
+                |row| Ok(json!({
+                    "id":row.get::<_,String>(0)?,"projectId":row.get::<_,String>(1)?,"name":row.get::<_,String>(2)?,
+                    "targetDate":row.get::<_,Option<String>>(3)?,"completed":row.get::<_,bool>(4)?,
+                    "created":row.get::<_,String>(5)?,"updated":row.get::<_,String>(6)?
+                })),
+            )
+            .optional()
+            .map_err(|error| format!("Could not read milestone: {error}"))?
+            .ok_or_else(|| format!("Milestone '{id}' was not found"))
+    }
+
+    fn resolve_task_project_milestone(
+        connection: &Connection,
+        current_project: Option<String>,
+        current_milestone: Option<String>,
+        requested_project: Option<&str>,
+        requested_milestone: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        // Treat an explicitly empty string as a request to clear the value.
+        let project_input = requested_project.map(|s| s.trim().to_string());
+        let milestone_input = requested_milestone.map(|s| s.trim().to_string());
+
+        let want_project_empty = project_input.as_deref() == Some("");
+        let want_milestone_empty = milestone_input.as_deref() == Some("");
+
+        let requested_project = project_input.filter(|s| !s.is_empty());
+        let requested_milestone = milestone_input.filter(|s| !s.is_empty());
+
+        match (requested_project, requested_milestone) {
+            (Some(project), Some(milestone)) => {
+                let milestone_project = milestone_project_id(connection, &milestone)?
+                    .ok_or_else(|| format!("Milestone '{milestone}' was not found"))?;
+                if milestone_project != project {
+                    return Err(format!(
+                        "Milestone '{milestone}' belongs to project '{milestone_project}', not '{project}'"
+                    ));
+                }
+                if !project_exists(connection, &project)? {
+                    return Err(format!("Project '{project}' was not found"));
+                }
+                Ok((Some(project), Some(milestone)))
+            }
+            (None, Some(milestone)) => {
+                if want_project_empty {
+                    return Err("A milestone cannot be linked while clearing the project".into());
+                }
+                let milestone_project = milestone_project_id(connection, &milestone)?
+                    .ok_or_else(|| format!("Milestone '{milestone}' was not found"))?;
+                if !project_exists(connection, &milestone_project)? {
+                    return Err(format!("Project '{milestone_project}' was not found"));
+                }
+                Ok((Some(milestone_project), Some(milestone)))
+            }
+            (Some(project), None) => {
+                if !project_exists(connection, &project)? {
+                    return Err(format!("Project '{project}' was not found"));
+                }
+                let milestone = current_milestone.filter(|m| {
+                    milestone_project_id(connection, m)
+                        .map(|mp| mp.as_deref() == Some(&project))
+                        .unwrap_or(false)
+                });
+                Ok((Some(project), milestone))
+            }
+            (None, None) => {
+                if want_project_empty || want_milestone_empty {
+                    // If clearing project, also clear milestone to stay consistent.
+                    Ok((None, None))
+                } else {
+                    Ok((current_project, current_milestone))
+                }
+            }
+        }
     }
 
     pub(crate) fn folder_json(connection: &Connection, id: &str) -> Result<Value, String> {
@@ -1008,6 +1292,82 @@ impl OdoMcp {
             .optional()
             .map_err(|error| format!("Could not read category: {error}"))?
             .ok_or_else(|| format!("Category '{id}' was not found"))
+    }
+
+    fn ics_escape(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace(';', "\\;")
+            .replace(',', "\\,")
+            .replace('\n', "\\n")
+            .replace('\r', "")
+    }
+
+    fn format_ics_timestamp(dt: &DateTime<Utc>) -> String {
+        dt.format("%Y%m%dT%H%M%SZ").to_string()
+    }
+
+    fn build_ics(connection: &Connection) -> Result<String, String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT id,text,scheduled_start,duration_minutes FROM todos
+                 WHERE scheduled_start IS NOT NULL AND completed=0
+                 ORDER BY scheduled_start",
+            )
+            .map_err(|error| format!("Could not prepare calendar export: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| format!("Could not read scheduled tasks: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Could not decode scheduled tasks: {error}"))?;
+
+        let mut ics = String::new();
+        ics.push_str("BEGIN:VCALENDAR\r\n");
+        ics.push_str("VERSION:2.0\r\n");
+        ics.push_str("PRODID:-//Odo Tasks//EN\r\n");
+        ics.push_str("CALSCALE:GREGORIAN\r\n");
+        ics.push_str("METHOD:PUBLISH\r\n");
+        ics.push_str("X-WR-CALNAME:Odo Tasks\r\n");
+
+        let now = now_iso();
+        let dtstamp = DateTime::parse_from_rfc3339(&now)
+            .map(|dt: DateTime<chrono::FixedOffset>| {
+                Self::format_ics_timestamp(&dt.with_timezone(&Utc))
+            })
+            .unwrap_or_else(|_| "19700101T000000Z".into());
+
+        for (id, text, scheduled, duration) in rows {
+            let start = DateTime::parse_from_rfc3339(&scheduled)
+                .map_err(|error| format!("Could not parse scheduled start for {id}: {error}"))?;
+            let end = start + Duration::minutes(duration);
+            let start_utc = start.with_timezone(&Utc);
+            let end_utc = end.with_timezone(&Utc);
+
+            ics.push_str("BEGIN:VEVENT\r\n");
+            ics.push_str(&format!("UID:odo-task-{}@odo\r\n", id));
+            ics.push_str(&format!("DTSTAMP:{}\r\n", dtstamp));
+            ics.push_str(&format!(
+                "DTSTART:{}\r\n",
+                Self::format_ics_timestamp(&start_utc)
+            ));
+            ics.push_str(&format!(
+                "DTEND:{}\r\n",
+                Self::format_ics_timestamp(&end_utc)
+            ));
+            ics.push_str(&format!("SUMMARY:{}\r\n", Self::ics_escape(&text)));
+            ics.push_str("DESCRIPTION:\r\n");
+            ics.push_str("END:VEVENT\r\n");
+        }
+
+        ics.push_str("END:VCALENDAR\r\n");
+        Ok(ics)
     }
 
     fn update_note_inner(&self, args: UpdateNoteArgs) -> Result<Value, String> {
@@ -1070,7 +1430,7 @@ impl OdoMcp {
                     .map_err(|e| e.to_string())
             };
             Ok(
-                json!({"folders":count("folders")?,"notes":count("notes")?,"tasks":count("todos")?,"categories":count("todo_categories")?,"journalEntries":count("journal_entries")?}),
+                json!({"folders":count("folders")?,"notes":count("notes")?,"tasks":count("todos")?,"categories":count("todo_categories")?,"journalEntries":count("journal_entries")?,"projects":count("projects")?,"milestones":count("milestones")?}),
             )
         })())
     }
@@ -1756,7 +2116,7 @@ impl OdoMcp {
             if limit == 0 {
                 return Ok(empty_paginated("tasks", offset));
             }
-            let mut sql="SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes FROM todos WHERE 1=1".to_string();
+            let mut sql="SELECT id,text,completed,created,updated,category_id,priority,effort,color,scheduled_start,duration_minutes,project_id,milestone_id FROM todos WHERE 1=1".to_string();
             let mut values: Vec<String> = vec![];
             if let Some(completed) = args.completed {
                 sql.push_str(" AND completed=?");
@@ -1782,7 +2142,7 @@ impl OdoMcp {
             values.push((limit + 1).to_string());
             values.push(offset.to_string());
             let mut statement = c.prepare(&sql).map_err(|error| error.to_string())?;
-            let mut rows=statement.query_map(rusqlite::params_from_iter(values.iter()),|r|Ok(json!({"id":r.get::<_,String>(0)?,"text":r.get::<_,String>(1)?,"completed":r.get::<_,bool>(2)?,"created":r.get::<_,String>(3)?,"updated":r.get::<_,String>(4)?,"categoryId":r.get::<_,String>(5)?,"priority":r.get::<_,String>(6)?,"effort":r.get::<_,i64>(7)?,"color":r.get::<_,String>(8)?,"scheduledStart":r.get::<_,Option<String>>(9)?,"durationMinutes":r.get::<_,i64>(10)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+            let mut rows=statement.query_map(rusqlite::params_from_iter(values.iter()),|r|Ok(json!({"id":r.get::<_,String>(0)?,"text":r.get::<_,String>(1)?,"completed":r.get::<_,bool>(2)?,"created":r.get::<_,String>(3)?,"updated":r.get::<_,String>(4)?,"categoryId":r.get::<_,String>(5)?,"priority":r.get::<_,String>(6)?,"effort":r.get::<_,i64>(7)?,"color":r.get::<_,String>(8)?,"scheduledStart":r.get::<_,Option<String>>(9)?,"durationMinutes":r.get::<_,i64>(10)?,"projectId":r.get::<_,Option<String>>(11)?,"milestoneId":r.get::<_,Option<String>>(12)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
             let has_more = rows.len() > limit as usize;
             rows.truncate(limit as usize);
             Ok(
@@ -1805,9 +2165,16 @@ impl OdoMcp {
             let scheduled_start = validate_scheduled_start(args.scheduled_start)?;
             let duration_minutes = normalize_task_duration(args.duration_minutes)?;
             let c = self.connection()?;
+            let (project_id, milestone_id) = Self::resolve_task_project_milestone(
+                &c,
+                None,
+                None,
+                args.project_id.as_deref(),
+                args.milestone_id.as_deref(),
+            )?;
             let id = format!("todo-{}", uuid::Uuid::new_v4());
             let stamp = now_iso();
-            c.execute("INSERT INTO todos(id,text,completed,created,updated,position,category_id,priority,effort,color,scheduled_start,duration_minutes) VALUES(?1,?2,0,?3,?3,(SELECT COALESCE(MAX(position),-1)+1 FROM todos),?4,?5,?6,?7,?8,?9)",params![id,args.text,stamp,args.category_id.unwrap_or_else(||"inbox".into()),priority,args.effort.unwrap_or(2).clamp(1,5),color,scheduled_start,duration_minutes]).map_err(|e|e.to_string())?;
+            c.execute("INSERT INTO todos(id,text,completed,created,updated,position,category_id,priority,effort,color,scheduled_start,duration_minutes,project_id,milestone_id) VALUES(?1,?2,0,?3,?3,(SELECT COALESCE(MAX(position),-1)+1 FROM todos),?4,?5,?6,?7,?8,?9,?10,?11)",params![id,args.text,stamp,args.category_id.unwrap_or_else(||"inbox".into()),priority,args.effort.unwrap_or(2).clamp(1,5),color,scheduled_start,duration_minutes,project_id,milestone_id]).map_err(|e|e.to_string())?;
             bump_change(&c)?;
             audit(
                 &c,
@@ -1835,13 +2202,22 @@ impl OdoMcp {
     ) -> Result<CallToolResult, McpError> {
         let result = (|| {
             let c = self.connection()?;
-            let current:(String,bool,String,String,i64,String,Option<String>,i64)=c.query_row("SELECT text,completed,category_id,priority,effort,color,scheduled_start,duration_minutes FROM todos WHERE id=?1",[&args.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Task not found".to_string())?;
+            let current:(String,bool,String,String,i64,String,Option<String>,i64,Option<String>,Option<String>)=c.query_row("SELECT text,completed,category_id,priority,effort,color,scheduled_start,duration_minutes,project_id,milestone_id FROM todos WHERE id=?1",[&args.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Task not found".to_string())?;
             let scheduled = if args.clear_schedule.unwrap_or(false) {
                 None
             } else {
                 args.scheduled_start.or(current.6)
             };
-            c.execute("UPDATE todos SET text=?2,completed=?3,updated=?4,category_id=?5,priority=?6,effort=?7,color=?8,scheduled_start=?9,duration_minutes=?10 WHERE id=?1",params![args.id,args.text.unwrap_or(current.0),args.completed.unwrap_or(current.1),now_iso(),args.category_id.unwrap_or(current.2),args.priority.unwrap_or(current.3),args.effort.unwrap_or(current.4).clamp(1,5),args.color.unwrap_or(current.5),scheduled,args.duration_minutes.unwrap_or(current.7).max(30)]).map_err(|e|e.to_string())?;
+
+            let (project_id, milestone_id) = Self::resolve_task_project_milestone(
+                &c,
+                current.8.clone(),
+                current.9.clone(),
+                args.project_id.as_deref(),
+                args.milestone_id.as_deref(),
+            )?;
+
+            c.execute("UPDATE todos SET text=?2,completed=?3,updated=?4,category_id=?5,priority=?6,effort=?7,color=?8,scheduled_start=?9,duration_minutes=?10,project_id=?11,milestone_id=?12 WHERE id=?1",params![args.id,args.text.unwrap_or(current.0),args.completed.unwrap_or(current.1),now_iso(),args.category_id.unwrap_or(current.2),args.priority.unwrap_or(current.3),args.effort.unwrap_or(current.4).clamp(1,5),args.color.unwrap_or(current.5),scheduled,args.duration_minutes.unwrap_or(current.7).max(30),project_id,milestone_id]).map_err(|e|e.to_string())?;
             bump_change(&c)?;
             audit(
                 &c,
@@ -2160,6 +2536,566 @@ impl OdoMcp {
             )
         })())
     }
+
+    #[tool(
+        description = "List all projects with id, name, summary, description, status, targetDate, created, and updated. Optionally filter by status and paginate with limit (default 100, max 500) and offset (default 0)."
+    )]
+    async fn projects_list(
+        &self,
+        Parameters(args): Parameters<ListProjectsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_result((|| {
+            let c = self.connection()?;
+            let limit = args.limit.unwrap_or(100).min(500);
+            let offset = args.offset.unwrap_or(0);
+            if limit == 0 {
+                return Ok(empty_paginated("projects", offset));
+            }
+            let mut sql = "SELECT id,name,summary,description,status,target_date,created,updated FROM projects WHERE 1=1".to_string();
+            let mut values: Vec<String> = vec![];
+            if let Some(status) = args.status {
+                sql.push_str(" AND status=?");
+                values.push(status);
+            }
+            sql.push_str(" ORDER BY position LIMIT ? OFFSET ?");
+            values.push((limit + 1).to_string());
+            values.push(offset.to_string());
+            let mut s = c.prepare(&sql).map_err(|e| e.to_string())?;
+            let mut rows = s
+                .query_map(rusqlite::params_from_iter(values.iter()), |r| {
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "name": r.get::<_, String>(1)?,
+                        "summary": r.get::<_, String>(2)?,
+                        "description": r.get::<_, String>(3)?,
+                        "status": r.get::<_, String>(4)?,
+                        "targetDate": r.get::<_, Option<String>>(5)?,
+                        "created": r.get::<_, String>(6)?,
+                        "updated": r.get::<_, String>(7)?
+                    }))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            let has_more = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            Ok(json!({
+                "projects": rows,
+                "limit": limit,
+                "offset": offset,
+                "hasMore": has_more,
+                "nextOffset": if has_more { Some(offset + limit) } else { None }
+            }))
+        })())
+    }
+
+    #[tool(
+        description = "Create a project and return the complete project object. project status defaults to backlog."
+    )]
+    async fn projects_create(
+        &self,
+        Parameters(args): Parameters<CreateProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = (|| {
+            let name = validate_project_name(&args.name)?;
+            let status = validate_project_status(args.status)?;
+            let target_date = validate_target_date(args.target_date)?;
+            let c = self.connection()?;
+            let id = format!("project-{}", uuid::Uuid::new_v4());
+            let stamp = now_iso();
+            c.execute(
+                "INSERT INTO projects(id,name,summary,description,status,target_date,created,updated,position) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,(SELECT COALESCE(MAX(position),-1)+1 FROM projects))",
+                params![
+                    id,
+                    name,
+                    args.summary.unwrap_or_default(),
+                    args.description.unwrap_or_default(),
+                    status,
+                    target_date,
+                    stamp
+                ],
+            )
+            .map_err(|e| format!("Could not create project: {e}"))?;
+            bump_change(&c)?;
+            audit(
+                &c,
+                &self.transport,
+                "projects.create",
+                Some(&id),
+                "success",
+                "",
+            );
+            Self::project_json(&c, &id)
+        })();
+        if result.is_ok() {
+            self.changed(&["odo://projects".into(), "odo://workspace".into()])
+                .await;
+        }
+        tool_result(result)
+    }
+
+    #[tool(
+        description = "Update any provided project fields and return the complete updated project object."
+    )]
+    async fn projects_update(
+        &self,
+        Parameters(args): Parameters<UpdateProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = (|| {
+            let c = self.connection()?;
+            let current: (String, String, String, String, Option<String>) = c
+                .query_row(
+                    "SELECT name,summary,description,status,target_date FROM projects WHERE id=?1",
+                    [&args.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "Project not found".to_string())?;
+            let name = match args.name {
+                Some(name) => validate_project_name(&name)?.to_string(),
+                None => current.0,
+            };
+            let summary = args.summary.unwrap_or(current.1);
+            let description = args.description.unwrap_or(current.2);
+            let status = match args.status {
+                Some(status) => validate_project_status(Some(status))?,
+                None => current.3,
+            };
+            let target_date = match args.target_date {
+                Some(date) if date.trim().is_empty() => None,
+                Some(date) => validate_target_date(Some(date))?,
+                None => current.4,
+            };
+            c.execute(
+                "UPDATE projects SET name=?2,summary=?3,description=?4,status=?5,target_date=?6,updated=?7 WHERE id=?1",
+                params![args.id, name, summary, description, status, target_date, now_iso()],
+            )
+            .map_err(|e| e.to_string())?;
+            bump_change(&c)?;
+            audit(
+                &c,
+                &self.transport,
+                "projects.update",
+                Some(&args.id),
+                "success",
+                "",
+            );
+            Self::project_json(&c, &args.id)
+        })();
+        if result.is_ok() {
+            self.changed(&[
+                format!("odo://projects/{}", args.id),
+                "odo://projects".into(),
+                "odo://workspace".into(),
+            ])
+            .await;
+        }
+        tool_result(result)
+    }
+
+    #[tool(
+        description = "Delete a project. Linked milestones are deleted and any tasks linked to the project or those milestones have their project and milestone IDs cleared."
+    )]
+    async fn projects_delete(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = (|| {
+            let mut c = self.connection()?;
+            let tx = c.transaction().map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE todos SET project_id=NULL, milestone_id=NULL, updated=?1 WHERE project_id=?2 OR milestone_id IN (SELECT id FROM milestones WHERE project_id=?2)",
+                params![now_iso(), &args.id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM milestones WHERE project_id=?1", [&args.id])
+                .map_err(|e| e.to_string())?;
+            if tx
+                .execute("DELETE FROM projects WHERE id=?1", [&args.id])
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Err("Project not found".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            bump_change(&c)?;
+            audit(
+                &c,
+                &self.transport,
+                "projects.delete",
+                Some(&args.id),
+                "success",
+                "milestones deleted, tasks unlinked",
+            );
+            Ok(json!({"deleted": true, "id": args.id}))
+        })();
+        if result.is_ok() {
+            self.changed(&[
+                "odo://projects".into(),
+                "odo://milestones".into(),
+                "odo://tasks".into(),
+                "odo://workspace".into(),
+            ])
+            .await;
+        }
+        tool_result(result)
+    }
+
+    #[tool(
+        description = "Update a project's status and return the complete updated project object."
+    )]
+    async fn projects_set_status(
+        &self,
+        Parameters(args): Parameters<SetProjectStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = (|| {
+            let c = self.connection()?;
+            if !project_exists(&c, &args.id)? {
+                return Err("Project not found".into());
+            }
+            let status = validate_project_status(Some(args.status))?;
+            c.execute(
+                "UPDATE projects SET status=?2, updated=?3 WHERE id=?1",
+                params![args.id, status, now_iso()],
+            )
+            .map_err(|e| e.to_string())?;
+            bump_change(&c)?;
+            audit(
+                &c,
+                &self.transport,
+                "projects.set_status",
+                Some(&args.id),
+                "success",
+                "",
+            );
+            Self::project_json(&c, &args.id)
+        })();
+        if result.is_ok() {
+            self.changed(&[
+                format!("odo://projects/{}", args.id),
+                "odo://projects".into(),
+                "odo://workspace".into(),
+            ])
+            .await;
+        }
+        tool_result(result)
+    }
+
+    #[tool(
+        description = "List milestones, optionally filtered by projectId. Results are ordered by position and paginated with limit (default 100, max 500) and offset (default 0)."
+    )]
+    async fn milestones_list(
+        &self,
+        Parameters(args): Parameters<ListMilestonesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_result((|| {
+            let c = self.connection()?;
+            let limit = args.limit.unwrap_or(100).min(500);
+            let offset = args.offset.unwrap_or(0);
+            if limit == 0 {
+                return Ok(empty_paginated("milestones", offset));
+            }
+            let mut sql = "SELECT id,project_id,name,target_date,completed,created,updated FROM milestones WHERE 1=1".to_string();
+            let mut values: Vec<String> = vec![];
+            if let Some(project_id) = args.project_id {
+                sql.push_str(" AND project_id=?");
+                values.push(project_id);
+            }
+            sql.push_str(" ORDER BY position LIMIT ? OFFSET ?");
+            values.push((limit + 1).to_string());
+            values.push(offset.to_string());
+            let mut s = c.prepare(&sql).map_err(|e| e.to_string())?;
+            let mut rows = s
+                .query_map(rusqlite::params_from_iter(values.iter()), |r| {
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "projectId": r.get::<_, String>(1)?,
+                        "name": r.get::<_, String>(2)?,
+                        "targetDate": r.get::<_, Option<String>>(3)?,
+                        "completed": r.get::<_, bool>(4)?,
+                        "created": r.get::<_, String>(5)?,
+                        "updated": r.get::<_, String>(6)?
+                    }))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            let has_more = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            Ok(json!({
+                "milestones": rows,
+                "limit": limit,
+                "offset": offset,
+                "hasMore": has_more,
+                "nextOffset": if has_more { Some(offset + limit) } else { None }
+            }))
+        })())
+    }
+
+    #[tool(
+        description = "Create a milestone within an existing project and return the complete milestone object."
+    )]
+    async fn milestones_create(
+        &self,
+        Parameters(args): Parameters<CreateMilestoneArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = (|| {
+            let name = validate_milestone_name(&args.name)?;
+            let target_date = validate_target_date(args.target_date)?;
+            let c = self.connection()?;
+            if !project_exists(&c, &args.project_id)? {
+                return Err(format!("Project '{}' was not found", args.project_id));
+            }
+            let id = format!("milestone-{}", uuid::Uuid::new_v4());
+            let stamp = now_iso();
+            c.execute(
+                "INSERT INTO milestones(id,project_id,name,target_date,completed,created,updated,position) VALUES(?1,?2,?3,?4,0,?5,?5,(SELECT COALESCE(MAX(position),-1)+1 FROM milestones))",
+                params![id, args.project_id, name, target_date, stamp],
+            )
+            .map_err(|e| format!("Could not create milestone: {e}"))?;
+            bump_change(&c)?;
+            audit(
+                &c,
+                &self.transport,
+                "milestones.create",
+                Some(&id),
+                "success",
+                "",
+            );
+            Self::milestone_json(&c, &id)
+        })();
+        if result.is_ok() {
+            self.changed(&["odo://milestones".into(), "odo://workspace".into()])
+                .await;
+        }
+        tool_result(result)
+    }
+
+    #[tool(
+        description = "Update a milestone's name, target date, or completion status and return the complete updated milestone object."
+    )]
+    async fn milestones_update(
+        &self,
+        Parameters(args): Parameters<UpdateMilestoneArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = (|| {
+            let c = self.connection()?;
+            let current: (String, Option<String>, bool) = c
+                .query_row(
+                    "SELECT name,target_date,completed FROM milestones WHERE id=?1",
+                    [&args.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "Milestone not found".to_string())?;
+            let name = match args.name {
+                Some(name) => validate_milestone_name(&name)?.to_string(),
+                None => current.0,
+            };
+            let target_date = match args.target_date {
+                Some(date) if date.trim().is_empty() => None,
+                Some(date) => validate_target_date(Some(date))?,
+                None => current.1,
+            };
+            let completed = args.completed.unwrap_or(current.2);
+            c.execute(
+                "UPDATE milestones SET name=?2,target_date=?3,completed=?4,updated=?5 WHERE id=?1",
+                params![args.id, name, target_date, completed, now_iso()],
+            )
+            .map_err(|e| e.to_string())?;
+            bump_change(&c)?;
+            audit(
+                &c,
+                &self.transport,
+                "milestones.update",
+                Some(&args.id),
+                "success",
+                "",
+            );
+            Self::milestone_json(&c, &args.id)
+        })();
+        if result.is_ok() {
+            self.changed(&[
+                format!("odo://milestones/{}", args.id),
+                "odo://milestones".into(),
+                "odo://workspace".into(),
+            ])
+            .await;
+        }
+        tool_result(result)
+    }
+
+    #[tool(
+        description = "Delete a milestone. Any tasks linked to the milestone have their milestoneId cleared."
+    )]
+    async fn milestones_delete(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = (|| {
+            let mut c = self.connection()?;
+            let tx = c.transaction().map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE todos SET milestone_id=NULL, updated=?1 WHERE milestone_id=?2",
+                params![now_iso(), &args.id],
+            )
+            .map_err(|e| e.to_string())?;
+            if tx
+                .execute("DELETE FROM milestones WHERE id=?1", [&args.id])
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Err("Milestone not found".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            bump_change(&c)?;
+            audit(
+                &c,
+                &self.transport,
+                "milestones.delete",
+                Some(&args.id),
+                "success",
+                "tasks unlinked",
+            );
+            Ok(json!({"deleted": true, "id": args.id}))
+        })();
+        if result.is_ok() {
+            self.changed(&[
+                "odo://milestones".into(),
+                "odo://tasks".into(),
+                "odo://workspace".into(),
+            ])
+            .await;
+        }
+        tool_result(result)
+    }
+
+    #[tool(
+        description = "Set a milestone's completed flag and return the complete updated milestone object."
+    )]
+    async fn milestones_set_completed(
+        &self,
+        Parameters(args): Parameters<SetMilestoneCompletedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = (|| {
+            let c = self.connection()?;
+            if !milestone_exists(&c, &args.id)? {
+                return Err("Milestone not found".into());
+            }
+            c.execute(
+                "UPDATE milestones SET completed=?2, updated=?3 WHERE id=?1",
+                params![args.id, args.completed, now_iso()],
+            )
+            .map_err(|e| e.to_string())?;
+            bump_change(&c)?;
+            audit(
+                &c,
+                &self.transport,
+                "milestones.set_completed",
+                Some(&args.id),
+                "success",
+                "",
+            );
+            Self::milestone_json(&c, &args.id)
+        })();
+        if result.is_ok() {
+            self.changed(&[
+                format!("odo://milestones/{}", args.id),
+                "odo://milestones".into(),
+                "odo://workspace".into(),
+            ])
+            .await;
+        }
+        tool_result(result)
+    }
+
+    #[tool(
+        description = "Export an iCalendar (.ics) string of all scheduled, uncompleted planner tasks."
+    )]
+    async fn calendar_ics(
+        &self,
+        _parameters: Parameters<CalendarIcsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_result((|| {
+            let c = self.connection()?;
+            let ics = Self::build_ics(&c)?;
+            Ok(json!({"ics": ics}))
+        })())
+    }
+
+    #[tool(
+        description = "Return scheduled tasks grouped by date for a YYYY-MM-DD range. Each date contains the tasks scheduled on that day."
+    )]
+    async fn calendar_list(
+        &self,
+        Parameters(args): Parameters<CalendarListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_result((|| {
+            validate_journal_date_key(&args.from_date)?;
+            validate_journal_date_key(&args.to_date)?;
+            let from = NaiveDate::parse_from_str(&args.from_date, "%Y-%m-%d")
+                .map_err(|_| "fromDate is not a valid date".to_string())?;
+            let to = NaiveDate::parse_from_str(&args.to_date, "%Y-%m-%d")
+                .map_err(|_| "toDate is not a valid date".to_string())?;
+            if from > to {
+                return Err("fromDate cannot be after toDate".into());
+            }
+            let c = self.connection()?;
+            let mut s = c.prepare(
+                "SELECT id,text,completed,category_id,priority,effort,color,scheduled_start,duration_minutes,project_id,milestone_id, date(scheduled_start) AS day
+                 FROM todos
+                 WHERE scheduled_start IS NOT NULL AND date(scheduled_start) >= ?1 AND date(scheduled_start) <= ?2
+                 ORDER BY day, scheduled_start"
+            ).map_err(|e| e.to_string())?;
+            let rows = s
+                .query_map(params![args.from_date, args.to_date], |r| {
+                    let day: String = r.get(11)?;
+                    Ok((
+                        day,
+                        json!({
+                            "id": r.get::<_, String>(0)?,
+                            "text": r.get::<_, String>(1)?,
+                            "completed": r.get::<_, bool>(2)?,
+                            "categoryId": r.get::<_, String>(3)?,
+                            "priority": r.get::<_, String>(4)?,
+                            "effort": r.get::<_, i64>(5)?,
+                            "color": r.get::<_, String>(6)?,
+                            "scheduledStart": r.get::<_, Option<String>>(7)?,
+                            "durationMinutes": r.get::<_, i64>(8)?,
+                            "projectId": r.get::<_, Option<String>>(9)?,
+                            "milestoneId": r.get::<_, Option<String>>(10)?
+                        }),
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            let mut grouped: Vec<Value> = vec![];
+            let mut current_day: Option<String> = None;
+            let mut current_tasks: Vec<Value> = vec![];
+            for (day, task) in rows {
+                if current_day.as_deref() != Some(&day) {
+                    if let Some(d) = current_day.take() {
+                        grouped.push(json!({"date": d, "tasks": current_tasks}));
+                    }
+                    current_day = Some(day);
+                    current_tasks = vec![];
+                }
+                current_tasks.push(task);
+            }
+            if let Some(d) = current_day {
+                grouped.push(json!({"date": d, "tasks": current_tasks}));
+            }
+            Ok(json!({
+                "fromDate": args.from_date,
+                "toDate": args.to_date,
+                "dates": grouped
+            }))
+        })())
+    }
 }
 
 #[prompt_router]
@@ -2273,7 +3209,7 @@ impl ServerHandler for OdoMcp {
                     .map_err(|e| e.to_string())
                 };
                 return Ok(
-                    json!({"folders":count("folders")?,"notes":count("notes")?,"tasks":count("todos")?,"journalEntries":count("journal_entries")?}),
+                    json!({"folders":count("folders")?,"notes":count("notes")?,"tasks":count("todos")?,"journalEntries":count("journal_entries")?,"projects":count("projects")?,"milestones":count("milestones")?}),
                 );
             }
             if uri == "odo://folders" {
@@ -2292,8 +3228,8 @@ impl ServerHandler for OdoMcp {
             }
             if uri == "odo://tasks" {
                 let c = self.connection()?;
-                let mut s=c.prepare("SELECT id,text,completed,category_id,priority,effort,scheduled_start,duration_minutes FROM todos ORDER BY position").map_err(|e|e.to_string())?;
-                let rows=s.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"text":r.get::<_,String>(1)?,"completed":r.get::<_,bool>(2)?,"categoryId":r.get::<_,String>(3)?,"priority":r.get::<_,String>(4)?,"effort":r.get::<_,i64>(5)?,"scheduledStart":r.get::<_,Option<String>>(6)?,"durationMinutes":r.get::<_,i64>(7)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+                let mut s=c.prepare("SELECT id,text,completed,category_id,priority,effort,scheduled_start,duration_minutes,project_id,milestone_id FROM todos ORDER BY position").map_err(|e|e.to_string())?;
+                let rows=s.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"text":r.get::<_,String>(1)?,"completed":r.get::<_,bool>(2)?,"categoryId":r.get::<_,String>(3)?,"priority":r.get::<_,String>(4)?,"effort":r.get::<_,i64>(5)?,"scheduledStart":r.get::<_,Option<String>>(6)?,"durationMinutes":r.get::<_,i64>(7)?,"projectId":r.get::<_,Option<String>>(8)?,"milestoneId":r.get::<_,Option<String>>(9)?}))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
                 return Ok(json!(rows));
             }
             if uri == "odo://journal" {
@@ -2721,15 +3657,12 @@ struct SecurityState {
 }
 
 fn token_from_query(request: &axum::extract::Request, token: &str) -> bool {
-    request
-        .uri()
-        .query()
-        .map_or(false, |query| {
-            query.split('&').any(|pair| {
-                let mut parts = pair.splitn(2, '=');
-                parts.next() == Some("token") && parts.next() == Some(token)
-            })
+    request.uri().query().map_or(false, |query| {
+        query.split('&').any(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            parts.next() == Some("token") && parts.next() == Some(token)
         })
+    })
 }
 
 async fn security_middleware(
@@ -2777,7 +3710,7 @@ pub async fn run_http(
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
-    let prototype = OdoMcp::new(path.clone(), "http", notifier.clone());
+    let prototype = OdoMcp::new(path, "http", notifier);
     let service = StreamableHttpService::new(
         move || Ok(prototype.clone()),
         LocalSessionManager::default().into(),
@@ -2789,14 +3722,9 @@ pub async fn run_http(
         token: config.auth_enabled.then_some(config.token.clone()),
         allowed_host: config.host.clone(),
     };
-    let api_state = crate::api::ApiState {
-        db_path: path,
-        notifier,
-    };
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .nest("/api/v1", crate::api::router(api_state))
-        .layer(axum::middleware::from_fn_with_state(security, security_middleware));
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(security, security_middleware),
+    );
     let mut listener = None;
     for candidate in config.port..=config.port.saturating_add(20) {
         if let Ok(bound) = tokio::net::TcpListener::bind((config.host.as_str(), candidate)).await {

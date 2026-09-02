@@ -15,9 +15,8 @@ use tauri::{
 };
 use tauri_plugin_autostart::ManagerExt;
 
-pub mod mcp;
-pub mod api;
 pub mod ai;
+pub mod mcp;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

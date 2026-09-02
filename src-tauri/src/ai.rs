@@ -203,7 +203,14 @@ pub fn masked_api_key(provider: &str, from_env: bool) -> String {
     match keyring_api_key(provider) {
         Ok(Some(key)) if key.len() > 8 => {
             let prefix: String = key.chars().take(4).collect();
-            let suffix: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+            let suffix: String = key
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
             format!("{prefix}••••{suffix}")
         }
         Ok(Some(_)) => "••••••".into(),
@@ -216,10 +223,7 @@ pub fn ai_settings(path: &PathBuf) -> Result<AiSettings, String> {
     let config = load_ai_config(path)?;
     let (_, from_env) = resolve_api_key(&config.provider)?;
     let masked_key = masked_api_key(&config.provider, from_env);
-    Ok(AiSettings {
-        config,
-        masked_key,
-    })
+    Ok(AiSettings { config, masked_key })
 }
 
 pub fn update_ai_settings(
@@ -265,7 +269,9 @@ fn resolve_api_base(config: &AiConfig) -> Result<String, String> {
     match config.provider.as_str() {
         "openai" => Ok("https://api.openai.com/v1".into()),
         "openrouter" => Ok("https://openrouter.ai/api/v1".into()),
-        other => Err(format!("Unknown AI provider: {other}. Use 'openai' or 'openrouter'.")),
+        other => Err(format!(
+            "Unknown AI provider: {other}. Use 'openai' or 'openrouter'."
+        )),
     }
 }
 
@@ -430,7 +436,8 @@ fn odo_create_scheduled_task(args: &Value, _config: &AiConfig) -> Result<Value, 
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let scheduled_start = mcp::validate_scheduled_start(scheduled_start)?;
-    let duration = mcp::normalize_task_duration(args.get("durationMinutes").and_then(|v| v.as_i64()))?;
+    let duration =
+        mcp::normalize_task_duration(args.get("durationMinutes").and_then(|v| v.as_i64()))?;
     let priority = mcp::validate_task_priority(
         args.get("priority")
             .and_then(|v| v.as_str())
@@ -518,18 +525,16 @@ fn odo_get_current_time() -> Result<Value, String> {
     Ok(json!({ "now": mcp::now_iso() }))
 }
 
-fn execute_odo_function(
-    name: &str,
-    arguments: &str,
-    config: &AiConfig,
-) -> Result<Value, String> {
+fn execute_odo_function(name: &str, arguments: &str, config: &AiConfig) -> Result<Value, String> {
     let args: Value = serde_json::from_str(arguments)
         .map_err(|e| format!("Could not parse function arguments: {e}"))?;
     match name {
         "odo_list_tasks" => odo_list_tasks(&args),
         "odo_create_scheduled_task" => {
             if !config.auto_create_tasks {
-                return Ok(json!({"error": "auto-creation of tasks is disabled. Ask the user to enable it in AI settings or confirm before adding."}));
+                return Ok(
+                    json!({"error": "auto-creation of tasks is disabled. Ask the user to enable it in AI settings or confirm before adding."}),
+                );
             }
             odo_create_scheduled_task(&args, config)
         }
@@ -658,14 +663,8 @@ pub async fn send_message(
                 if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
                     continue;
                 }
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = item
                     .get("arguments")
                     .and_then(|v| v.as_str())
