@@ -2,10 +2,11 @@ import "@phosphor-icons/web/regular/style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./styles.css";
 
 type NoteStatus = "active" | "archived" | "trash";
-type View = "notes" | "tasks" | "projects" | "journal" | "settings" | "archived" | "trash" | "ai" | "api" | "api-playground";
+type View = "notes" | "tasks" | "projects" | "journal" | "settings" | "archived" | "trash" | "ai";
 type SortMode = "newest" | "oldest" | "manual";
 type Folder = { id: string; name: string; parentId: string | null; open: boolean; icon?: string };
 type Note = { id: string; folderId: string; title: string; content: string; updated: string; status: NoteStatus; pinned?: boolean; revision: number };
@@ -28,7 +29,7 @@ type AiConfig = { enabled: boolean; provider: "openai" | "openrouter"; apiBaseUr
 type AiSettings = { config: AiConfig; maskedKey: string };
 type AiMessage = { role: "user" | "assistant"; content: string };
 type AiMessageResponse = { response: string; createdTasks: unknown[]; usedSearch: boolean };
-type OpenApiSpec = { openapi: string; info: { title: string; version: string; description: string }; servers: { url: string }[]; paths: Record<string, unknown>; components?: { schemas?: Record<string, unknown> } };
+
 type SavePhase = "idle" | "saving" | "saved" | "error";
 type MenuItem = { label?: string; icon?: string; hint?: string; action?: string; disabled?: boolean; danger?: boolean; separator?: boolean };
 type MenuState = { items: MenuItem[]; x: number; y: number; trigger: HTMLElement | null } | null;
@@ -87,6 +88,7 @@ const starterWorkspace = (): Workspace => ({ folders: structuredClone(starterFol
 
 const escapeHtml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#039;");
 const attr = escapeHtml;
+const countBadge = (count: number) => count > 0 ? `<span class="nav-count has-items">${count}</span>` : "";
 function normalizeWorkspace(input: Partial<Workspace> | null | undefined): Workspace {
   const fallback = starterWorkspace();
   const folders = (Array.isArray(input?.folders) ? input.folders : fallback.folders).map((folder) => ({ ...folder, icon: safeFolderIcon(folder.icon, folder.id === "inbox") }));
@@ -141,13 +143,9 @@ let aiSettings: AiSettings | null = null;
 let aiSettingsError = "";
 let aiMessages: AiMessage[] = [];
 let aiLoading = false;
-let apiDocsSpec: OpenApiSpec | null = null;
-let apiDocsError = "";
-let apiPlaygroundResponse = "";
-let apiPlaygroundError = "";
 let calendarMode = localStorage.getItem("odo-calendar-mode") === "month";
 let reloadingWorkspace = false;
-let motionEnabled = localStorage.getItem(MOTION_KEY) !== "false";
+let motionEnabled = false;
 let darkMode = localStorage.getItem(DARK_KEY) === "true";
 let draggingNoteId = "";
 let draggingFolderId = "";
@@ -302,16 +300,17 @@ function renderPinPicker() {
 }
 function renderSidebar() {
   const remaining = state.todos.filter((todo) => !todo.completed).length;
+  const projectCount = state.projects.filter((project) => project.status !== "completed").length;
   return `<aside class="folders-panel" aria-label="Workspace navigation"><header class="brand-row"><button class="wordmark" id="wordmark" title="Go to Inbox">Odo</button><button class="icon-button sidebar-toggle" title="${sidebarCollapsed ? "Show" : "Hide"} sidebar" aria-label="${sidebarCollapsed ? "Show" : "Hide"} sidebar"><i class="ph ph-sidebar-simple"></i></button></header>
-    <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span><span class="nav-count ${remaining ? "has-items" : ""}">${remaining}</span></button><button class="primary-link ${currentView === "projects" ? "is-selected" : ""}" data-view="projects"><i class="ph ph-cube"></i><span>Projects</span><span class="nav-count">${state.projects.filter((project) => project.status !== "completed").length}</span></button><button class="primary-link ${currentView === "journal" ? "is-selected" : ""}" data-view="journal" aria-label="Journal"><i class="ph ph-book-open-text"></i><span>Journal</span></button></nav>
+    <nav class="primary-nav"><button class="primary-link ${currentView === "notes" && state.selectedFolderId === "inbox" ? "is-selected" : ""}" data-go-inbox data-drop-kind="folder" data-drop-id="inbox" aria-dropeffect="move" aria-label="Move a note to Inbox"><i class="ph ph-tray"></i><span>Inbox</span><span class="drop-cue" aria-hidden="true">Move here</span><kbd>${modLabel}+1</kbd></button><button class="primary-link ${currentView === "tasks" ? "is-selected" : ""}" data-view="tasks"><i class="ph ph-check-square"></i><span>Tasks</span>${countBadge(remaining)}</button><button class="primary-link ${currentView === "projects" ? "is-selected" : ""}" data-view="projects"><i class="ph ph-cube"></i><span>Projects</span>${countBadge(projectCount)}</button><button class="primary-link ${currentView === "journal" ? "is-selected" : ""}" data-view="journal" aria-label="Journal"><i class="ph ph-book-open-text"></i><span>Journal</span></button></nav>
     <div class="pinned-section" data-drop-kind="pin"><div class="panel-label-row"><span>Pinned</span><button class="icon-button" id="pin-add" title="Pin a note, task, or project" aria-label="Pin a note, task, or project"><i class="ph ph-push-pin"></i></button></div><nav class="pin-list">${state.pins.map(renderPin).join("") || '<p class="pin-empty">Drag notes, tasks, or projects here</p>'}</nav>${pinPickerOpen ? renderPinPicker() : ""}</div>
     <div class="panel-label-row"><span>Folders</span><button class="icon-button" id="new-folder" title="New folder (${modLabel}+Shift+N)"><i class="ph ph-plus"></i></button></div><nav class="folder-tree" id="folder-tree">${state.folders.filter((folder) => folder.parentId === null && folder.id !== "inbox").map((folder) => renderFolder(folder)).join("")}</nav>
-    <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "archived").length}</span></button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span><span>${state.notes.filter((note) => note.status === "trash").length}</span></button></div><button class='primary-link ${currentView === "ai" ? "is-selected" : ""}' data-view='ai' aria-label='AI assistant'><i class='ph ph-sparkle'></i><span>AI</span></button><button class='primary-link ${currentView === "api" ? "is-selected" : ""}' data-view='api' aria-label='API docs'><i class='ph ph-plugs'></i><span>API</span></button><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
+    <div class="library-links"><button class="library-link archive-drop ${currentView === "archived" ? "is-selected" : ""}" data-view="archived" data-drop-kind="archive" aria-dropeffect="move" aria-label="Archive this note"><i class="ph ph-archive-tray"></i><span>Archive</span><span class="drop-cue" aria-hidden="true">Move here</span>${countBadge(state.notes.filter((note) => note.status === "archived").length)}</button><button class="library-link trash-drop ${currentView === "trash" ? "is-selected" : ""}" data-view="trash" data-drop-kind="trash" aria-dropeffect="move" aria-label="Move this note to Trash"><i class="ph ph-trash"></i><span>Trash</span><span class="drop-cue" aria-hidden="true">Move here</span>${countBadge(state.notes.filter((note) => note.status === "trash").length)}</button></div><button class='primary-link ${currentView === "ai" ? "is-selected" : ""}' data-view='ai' aria-label='AI assistant'><i class='ph ph-sparkle'></i><span>AI</span></button><button class="settings-link ${currentView === "settings" ? "is-selected" : ""}" data-view="settings"><i class="ph ph-gear"></i><span>Settings</span></button></aside>`;
 }
 function renderMiniTodo(todo: Todo) { const category = categoryFor(todo); return `<article class="mini-task ${todo.completed?"is-complete":""}" data-todo-id="${attr(todo.id)}" draggable="true" tabindex="0" role="button" aria-label="${attr(todo.text)}"><button class="mini-task-check" data-toggle-todo="${attr(todo.id)}" aria-label="${todo.completed?"Reopen":"Complete"}"><i class="ph ph-check"></i></button><span class="mini-task-text">${escapeHtml(todo.text)}</span><span class="mini-task-dot" style="--category:${attr(todo.color||category.color)}"></span><button class="mini-task-more" data-todo-menu="${attr(todo.id)}" aria-label="Task properties"><i class="ph ph-dots-three"></i></button></article>`; }
 function renderTasksMini() {
   const tasks = state.todos.filter((todo) => !todo.completed && !todo.scheduledStart);
-  return `<aside class="tasks-mini"><header class="tasks-mini-header"><h2>Tasks</h2><span>${tasks.length}</span></header><div class="tasks-mini-list">${tasks.length ? tasks.map(renderMiniTodo).join("") : '<p class="tasks-empty">No open tasks</p>'}</div></aside>`;
+  return `<aside class="tasks-mini"><header class="tasks-mini-header"><h2>Tasks</h2>${tasks.length ? `<span>${tasks.length}</span>` : ""}</header><div class="tasks-mini-list">${tasks.length ? tasks.map(renderMiniTodo).join("") : '<p class="tasks-empty">No open tasks</p>'}</div></aside>`;
 }
 function renderTaskDetail() {
   if (!taskDetailId) return "";
@@ -778,18 +777,20 @@ function renderApp() {
   if (detachedNoteId) return;
   if (!workspaceReady) { document.querySelector<HTMLElement>("#app")!.innerHTML = '<main class="loading-shell" aria-label="Loading Odo"><span class="loading-wordmark">Odo</span><span class="loading-line"></span><span>Opening your workspace…</span></main>'; return; }
   repairState(); closeMenu(false);
-  document.documentElement.classList.toggle("no-motion", !motionEnabled);
   document.documentElement.classList.toggle("dark-mode", darkMode);
+  document.documentElement.classList.add("no-motion");
   const app = document.querySelector<HTMLElement>("#app")!;
+  const previousNoteListScroll = currentView === "notes" ? document.querySelector<HTMLElement>("#note-list")?.scrollTop ?? null : null;
+  const previousFolderTreeScroll = document.querySelector<HTMLElement>("#folder-tree")?.scrollTop ?? null;
   const previousPlannerScroll = currentView === "tasks" ? document.querySelector<HTMLElement>("#calendar-scroll") : null;
   const plannerScrollPosition = previousPlannerScroll ? { top: previousPlannerScroll.scrollTop, left: previousPlannerScroll.scrollLeft } : null;
   const previousProjectScroll = currentView === "projects" ? document.querySelector<HTMLElement>(".project-detail-scroll") : null;
   const projectScrollTop = previousProjectScroll?.scrollTop ?? null;
   const isInbox = currentView === "notes" && state.selectedFolderId === "inbox";
   app.className = `${focusMode ? "focus-mode" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} view-${currentView}${isInbox ? " view-inbox" : ""}`;
-  const content = currentView === "tasks" ? (calendarMode ? renderCalendar() : renderTasks()) : currentView === "projects" ? renderProjects() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : currentView === "ai" ? renderAi() : currentView === "api" ? renderApiDocs() : currentView === "api-playground" ? renderApiPlayground() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
+  const content = currentView === "tasks" ? (calendarMode ? renderCalendar() : renderTasks()) : currentView === "projects" ? renderProjects() : currentView === "journal" ? renderJournal() : currentView === "settings" ? renderSettings() : currentView === "ai" ? renderAi() : renderNotesPanel() + renderEditor() + (isInbox ? renderTasksMini() : "");
   app.innerHTML = `${renderSidebar()}${content}${renderTaskDetail()}${renderDialogLayer()}${renderHelp()}<div id="menu-layer">${renderMenu()}</div><div id="drag-live" class="drag-live" role="status" aria-live="polite" aria-atomic="true"></div>`;
-  updateSaveStatus(); bindEvents(); bindOdoDialog(); bindAi(); bindAiSettings(); bindApiDocs(); bindApiPlayground(); bindCalendar();
+  updateSaveStatus(); bindEvents(); bindOdoDialog(); bindAi(); bindAiSettings(); bindCalendar();
   if (currentView === "tasks") {
     const plannerScroll = document.querySelector<HTMLElement>("#calendar-scroll");
     if (plannerScrollPosition && plannerScroll) {
@@ -801,7 +802,14 @@ function renderApp() {
     const projectScroll = document.querySelector<HTMLElement>(".project-detail-scroll");
     if (projectScroll) projectScroll.scrollTop = projectScrollTop;
   }
+  if (currentView === "notes") {
+    const noteList = document.querySelector<HTMLElement>("#note-list");
+    if (noteList && previousNoteListScroll !== null) noteList.scrollTop = previousNoteListScroll;
+  }
+  const folderTree = document.querySelector<HTMLElement>("#folder-tree");
+  if (folderTree && previousFolderTreeScroll !== null) folderTree.scrollTop = previousFolderTreeScroll;
   if (newRowId) requestAnimationFrame(() => { document.querySelector(`[data-note-id="${CSS.escape(newRowId)}"]`)?.classList.remove("is-new"); newRowId = ""; });
+  requestAnimationFrame(() => { document.documentElement.classList.toggle("no-motion", !motionEnabled); });
 }
 window.setInterval(() => {
   if (currentView !== "tasks") return;
@@ -845,7 +853,6 @@ function setView(view: View) {
     if (!aiSettings) void loadAiSettings();
   }
   if (view === "ai" && isDesktopApp) { if (!aiSettings) void loadAiSettings(); }
-  if (view === "api" && isDesktopApp) { if (!apiDocsSpec) void loadApiDocsSpec(); }
 }
 async function loadStorageInfo() {
   try { storageInfo = await invoke<StorageInfo>("get_storage_info"); storageError = ""; }
@@ -864,24 +871,6 @@ async function loadAiSettings() {
   catch (error) { aiSettingsError = `Could not load AI settings: ${String(error)}`; }
   if (currentView === "settings" || currentView === "ai") renderApp();
 }
-async function loadApiDocsSpec() {
-  if (!isDesktopApp) { apiDocsError = "API docs are only available in the desktop app."; return; }
-  try {
-    const settings = mcpSettings || await invoke<McpSettings>("get_mcp_settings");
-    const base = `http://${settings.config.host}:${settings.config.port}`;
-    const url = settings.config.authEnabled ? `${base}/api/v1/openapi.json?token=${encodeURIComponent(settings.config.token)}` : `${base}/api/v1/openapi.json`;
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-    apiDocsSpec = await response.json() as OpenApiSpec;
-    apiDocsError = "";
-  } catch (error) { apiDocsError = `Could not load API docs: ${String(error)}`; }
-  if (currentView === "api") renderApp();
-}
-function apiBaseUrl(): string | null {
-  if (!mcpSettings) return null;
-  return `http://${mcpSettings.config.host}:${mcpSettings.config.port}`;
-}
-
 function noteMenuItems(note: Note): MenuItem[] {
   const common: MenuItem[] = [
     { label: "Rename", icon: "ph-pencil-simple", hint: "F2", action: `note:rename:${note.id}` },
@@ -1466,7 +1455,7 @@ function bindEvents() {
   document.querySelectorAll<HTMLElement>("[data-toggle-folder]").forEach((toggle) => toggle.addEventListener("click", (event) => { event.stopPropagation(); const folder = state.folders.find((item) => item.id === toggle.dataset.toggleFolder); if (folder) { folder.open = !folder.open; void saveState(false); renderApp(); } }));
   document.querySelectorAll<HTMLElement>("[data-folder-menu]").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); const folder = state.folders.find((item) => item.id === button.dataset.folderMenu); if (folder) openMenu(folderMenuItems(folder), button); }));
   document.querySelector("#folder-tree")?.addEventListener("contextmenu", (rawEvent) => { const event = rawEvent as MouseEvent; if ((event.target as HTMLElement).closest("[data-folder-id]")) return; event.preventDefault(); openMenu([{ label: "New note", icon: "ph-note-pencil", action: "folder:new-note:inbox" }, { label: "New folder", icon: "ph-folder-plus", action: "folder:new-folder:inbox" }], event.currentTarget as HTMLElement, event.clientX, event.clientY); });
-  document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view as View)));
+  document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => button.addEventListener("click", (event) => { event.preventDefault(); setView(button.dataset.view as View); }));
   document.querySelectorAll<HTMLElement>("[data-go-inbox]").forEach((button) => button.addEventListener("click", () => { state.selectedFolderId = "inbox"; setView("notes"); }));
   document.querySelector("#wordmark")?.addEventListener("click", () => { state.selectedFolderId = "inbox"; setView("notes"); });
   document.querySelector("#new-note")?.addEventListener("click", () => createNoteAndFocusTitle());
@@ -1984,60 +1973,28 @@ function bindAi() {
   form.addEventListener('submit', (event) => { event.preventDefault(); const value = input.value.trim(); if (!value) return; input.value = ''; void sendAiMessage(value); });
 }
 
-function renderApiDocs() {
-  if (apiDocsError) {
-    return `<main class='wide-view api-view'><header class='wide-header'><div><h1>API docs</h1><p class='inline-error'>${escapeHtml(apiDocsError)}</p></div></header></main>`;
-  }
-  if (!apiDocsSpec) {
-    return `<main class='wide-view api-view'><header class='wide-header'><div><h1>API docs</h1><p>Loading the OpenAPI specification…</p></div></header></main>`;
-  }
-  const paths = Object.entries(apiDocsSpec.paths).map(([path, methods]) => {
-    const m = methods as Record<string, Record<string, unknown>>;
-    const methodsList = Object.entries(m).map(([method, details]) => {
-      const summary = (details.summary as string) || '';
-      return `<li><span class='api-method ${method}'>${method.toUpperCase()}</span> <code>${path}</code> — ${escapeHtml(summary)}</li>`;
-    }).join('');
-    return `<ul class='api-path-list'>${methodsList}</ul>`;
-  }).join('');
-  const schemas = Object.entries(apiDocsSpec.components?.schemas || {}).map(([name, schema]) => `<details class='api-schema'><summary>${escapeHtml(name)}</summary><pre><code>${escapeHtml(JSON.stringify(schema, null, 2))}</code></pre></details>`).join('');
-  const base = apiBaseUrl();
-  const httpSnippet = `curl ${base}/tasks -H 'Authorization: Bearer <token>'`;
-  return `<main class='wide-view api-view'><header class='wide-header'><div><span class='eyebrow'>Agents</span><h1>API docs</h1><p>Devin CLI, Codex CLI, and other agents can talk to Odo over this REST API.</p></div><div class='wide-actions'><button class='secondary-button' data-view='api-playground'><i class='ph ph-play'></i>Try it</button><button class='icon-button close-wide' data-go-inbox title='Back to notes'><i class='ph ph-x'></i></button></div></header><div class='api-docs-body'><section class='settings-section'><h2>Base URL</h2><code class='api-base-url'>${base}/api/v1</code><p class='api-copy'>Example call:</p><pre class='api-code'><code>${escapeHtml(httpSnippet)}</code></pre></section><section class='settings-section'><h2>Endpoints</h2>${paths}</section><section class='settings-section'><h2>Schemas</h2>${schemas || '<p>No schemas defined.</p>'}</section></div></main>`;
+async function updateMaximizeIcon() {
+  const icon = document.querySelector<HTMLElement>("#title-maximize i");
+  if (!icon) return;
+  const maximized = isDesktopApp ? await getCurrentWindow().isMaximized() : false;
+  icon.className = maximized ? "ph ph-corners-in" : "ph ph-square";
 }
-function bindApiDocs() {}
-function renderApiPlayground() {
-  const base = apiBaseUrl();
-  if (!base) {
-    return `<main class='wide-view api-view'><header class='wide-header'><div><h1>API playground</h1><p>API playground is only available in the desktop app.</p></div></header></main>`;
+function bindTitleBar() {
+  const controls = document.getElementById("window-controls");
+  if (!controls || detachedNoteId) {
+    controls?.classList.add("is-hidden");
+    return;
   }
-  const defaultBody = JSON.stringify({ text: 'Example task', scheduledStart: new Date().toISOString().slice(0, 16) }, null, 2);
-  return `<main class='wide-view api-view'><header class='wide-header'><div><span class='eyebrow'>Agents</span><h1>API playground</h1><p>Send requests to the Odo API and see the response.</p></div><div class='wide-actions'><button class='secondary-button' data-view='api'><i class='ph ph-book-open'></i>Docs</button><button class='icon-button close-wide' data-go-inbox title='Back to notes'><i class='ph ph-x'></i></button></div></header><div class='api-playground-body'><div class='api-playground-row'><label class='api-playground-field'><span>Method</span><select id='api-playground-method'><option>GET</option><option>POST</option><option>PATCH</option><option>DELETE</option></select></label><label class='api-playground-field api-playground-path'><span>Path</span><input id='api-playground-path' value='/tasks' autocomplete='off'></label></div><label class='api-playground-field'><span>Body (JSON, for POST/PATCH)</span><textarea id='api-playground-body' rows='6'>${escapeHtml(defaultBody)}</textarea></label><button id='api-playground-send' class='primary-button'><i class='ph ph-paper-plane-right'></i>Send request</button><div id='api-playground-result' class='api-playground-result' aria-live='polite'>${apiPlaygroundResponse ? `<pre><code>${escapeHtml(apiPlaygroundResponse)}</code></pre>` : '<p>Response will appear here.</p>'}</div>${apiPlaygroundError ? `<p class='inline-error'>${escapeHtml(apiPlaygroundError)}</p>` : ''}</div></main>`;
+  controls.classList.remove("is-hidden");
+  if (!isDesktopApp) { controls.classList.add("is-hidden"); return; }
+  const win = getCurrentWindow();
+  document.querySelector<HTMLButtonElement>("#title-minimize")?.addEventListener("click", () => void win.minimize());
+  document.querySelector<HTMLButtonElement>("#title-maximize")?.addEventListener("click", () => { void win.toggleMaximize().then(() => void updateMaximizeIcon()); });
+  document.querySelector<HTMLButtonElement>("#title-close")?.addEventListener("click", () => void win.close());
+  void win.onResized(() => void updateMaximizeIcon());
+  void updateMaximizeIcon();
 }
-async function apiPlaygroundSend() {
-  const base = apiBaseUrl(); if (!base) return;
-  const method = (document.querySelector<HTMLSelectElement>('#api-playground-method')?.value || 'GET').toUpperCase();
-  const path = document.querySelector<HTMLInputElement>('#api-playground-path')?.value.trim() || '/tasks';
-  const bodyText = document.querySelector<HTMLTextAreaElement>('#api-playground-body')?.value || '';
-  const result = document.querySelector<HTMLElement>('#api-playground-result'); if (!result) return;
-  apiPlaygroundError = '';
-  try {
-    const url = `${base}/api/v1${path.startsWith('/') ? path : `/${path}`}`;
-    const options: RequestInit = { method, headers: {} };
-    const settings = mcpSettings || await invoke<McpSettings>('get_mcp_settings');
-    if (settings.config.authEnabled) options.headers = { ...(options.headers || {}), Authorization: `Bearer ${settings.config.token}` };
-    if (method === 'POST' || method === 'PATCH') { options.body = bodyText; options.headers = { ...(options.headers || {}), 'Content-Type': 'application/json' }; }
-    const response = await fetch(url, options);
-    const text = await response.text();
-    const pretty = (() => { try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; } })();
-    apiPlaygroundResponse = `${response.status} ${response.statusText}\n\n${pretty}`;
-  } catch (error) {
-    apiPlaygroundError = String(error);
-  }
-  renderApp();
-}
-function bindApiPlayground() {
-  document.querySelector<HTMLButtonElement>('#api-playground-send')?.addEventListener('click', () => void apiPlaygroundSend());
-}
+
 function daysInMonth(year: number, month: number) {
   return new Date(year, month + 1, 0).getDate();
 }
@@ -2087,6 +2044,7 @@ function bindAiSettings() {
 }
 
 async function bootstrap() {
+  bindTitleBar();
   if (detachedNoteId) {
     if (isDesktopApp) await listen("workspace-changed", () => location.reload());
     await renderDetachedEditor(detachedNoteId); return;

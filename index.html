@@ -12,6 +12,11 @@
     <script type="module" src="/src/main.ts" defer></script>
   </head>
   <body>
+    <div id="window-controls" class="is-hidden" aria-label="Window controls">
+      <button type="button" id="title-minimize" aria-label="Minimize"><i class="ph ph-minus"></i></button>
+      <button type="button" id="title-maximize" aria-label="Maximize"><i class="ph ph-square"></i></button>
+      <button type="button" id="title-close" class="close" aria-label="Close"><i class="ph ph-x"></i></button>
+    </div>
     <div id="app"></div>
   </body>
 </html>

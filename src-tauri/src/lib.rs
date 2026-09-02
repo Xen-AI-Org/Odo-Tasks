@@ -860,6 +860,7 @@ async fn open_note_window(app: AppHandle, note_id: String, title: String) -> Res
     })
     .inner_size(760.0, 760.0)
     .min_inner_size(520.0, 420.0)
+    .decorations(false)
     .center()
     .build()
     .map_err(|error| format!("Could not open the note window: {error}"))?;
